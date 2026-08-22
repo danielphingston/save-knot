@@ -1,0 +1,10 @@
+/saveknot
+/dist/
+/coverage.out
+/.cache/
+/.idea/
+/.vscode/
+*.db
+*.db-shm
+*.db-wal
+

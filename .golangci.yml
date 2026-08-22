@@ -1,0 +1,92 @@
+version: "2"
+
+linters:
+  default: none
+
+  enable:
+    - govet
+    - staticcheck
+    - errcheck
+    - ineffassign
+    - unused
+
+    - errorlint
+    - nilerr
+    - nilnesserr
+    - nilnil
+
+    - iface
+    - interfacebloat
+    - unparam
+    - dupl
+    - gocritic
+    - revive
+
+    - contextcheck
+    - noctx
+    - fatcontext
+    - bodyclose
+
+    - exhaustive
+    - copyloopvar
+    - durationcheck
+
+    - gocognit
+    - nestif
+
+    - godox
+    - nolintlint
+    - forbidigo
+
+    - gosec
+
+  settings:
+    errcheck:
+      check-type-assertions: true
+      check-blank: true
+
+    dupl:
+      threshold: 100
+
+    interfacebloat:
+      max: 5
+
+    gocognit:
+      min-complexity: 20
+
+    nestif:
+      min-complexity: 5
+
+    godox:
+      keywords:
+        - TODO
+        - FIXME
+        - HACK
+        - XXX
+
+    forbidigo:
+      forbid:
+        - pattern: '^fmt\.Print.*$'
+          msg: "Do not commit debug printing."
+        - pattern: '^print(ln)?$'
+          msg: "Do not commit debug printing."
+
+    revive:
+      rules:
+        - name: exported
+          disabled: true
+        - name: package-comments
+          disabled: true
+
+  exclusions:
+    warn-unused: true
+    rules:
+      - path: '_test\.go'
+        linters:
+          - dupl
+          - gosec
+
+formatters:
+  enable:
+    - gofumpt
+    - goimports

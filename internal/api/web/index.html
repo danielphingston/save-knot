@@ -1,0 +1,32 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="dark">
+  <title>SaveKnot</title>
+  <link rel="stylesheet" href="/styles.css">
+</head>
+<body>
+  <div class="shell">
+    <aside class="rail">
+      <a class="brand" href="#/games" aria-label="SaveKnot home">
+        <span class="brand-mark" aria-hidden="true">S</span>
+        <span>SaveKnot</span>
+      </a>
+      <nav aria-label="Primary navigation">
+        <a href="#/games" data-route="games"><span aria-hidden="true">◫</span> Games</a>
+        <a href="#/activity" data-route="activity"><span aria-hidden="true">↻</span> Activity</a>
+        <a href="#/settings" data-route="settings"><span aria-hidden="true">⚙</span> Settings</a>
+      </nav>
+      <div class="rail-status">
+        <span id="connection-dot" class="dot warn"></span>
+        <div><strong id="connection-title">Local only</strong><small id="connection-detail">R2 not connected</small></div>
+      </div>
+    </aside>
+    <main id="app" tabindex="-1"></main>
+  </div>
+  <div id="toast-region" class="toasts" aria-live="polite"></div>
+  <script type="module" src="/app.js"></script>
+</body>
+</html>
