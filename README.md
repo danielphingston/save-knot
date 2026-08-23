@@ -117,6 +117,18 @@ Run the complete pinned quality gate (the first run downloads the linter into Go
 make check
 ```
 
+### Codex cloud environment
+
+The Codex universal image may offer an older Go preset than this repository's Go 1.26 requirement. In the Codex cloud environment settings, leave the preinstalled Go version at its default and use this for both the **Setup script** and **Maintenance script**:
+
+```sh
+bash scripts/setup-codex-cloud.sh
+```
+
+Paste only that one command, not the contents of the script. Codex checks out the repository before running environment setup, so the command executes the version tracked with the project.
+
+The script resolves and installs the latest official stable Go toolchain with checksum verification, rejects versions older than `go.mod`, clears stale `GOROOT` state from the preinstalled runtime, verifies that the compiler matches the selected Go release, installs the system compiler needed by `go test -race`, prefetches module dependencies, and installs the pinned `golangci-lint` release while setup networking is available. It also installs the latest `agent-browser` CLI, Chromium runtime, Linux browser dependencies, and bundled core browser skill so cloud agents can perform UI verification. It is safe to run again when Codex resumes a cached environment. Set `SAVEKNOT_GO_VERSION` or `SAVEKNOT_AGENT_BROWSER_VERSION` in the environment settings only when you intentionally want to pin a specific release. If the script body must be pasted directly, it can locate the checkout from the current working directory or `SAVEKNOT_REPO_ROOT`.
+
 The gate runs the curated correctness, error-handling, context, resource, complexity, hygiene, and security linters from [`GO_AI_CODE_QUALITY.md`](GO_AI_CODE_QUALITY.md), plus normal and race tests. CI also verifies formatting, coverage reporting, `go mod tidy`, and clean diffs.
 
 Dependencies are intentionally narrow and each owns a boundary the standard library does not cover:
