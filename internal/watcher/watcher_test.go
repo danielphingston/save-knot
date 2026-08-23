@@ -5,6 +5,8 @@ import (
 	"path/filepath"
 	"testing"
 	"time"
+
+	"github.com/saveknot/saveknot/internal/core"
 )
 
 func TestNearestExistingDirectoryForFutureSavePath(t *testing.T) {
@@ -35,5 +37,23 @@ func TestEarlierCapsContinuousWrites(t *testing.T) {
 	now := time.Now()
 	if got := earlier(now.Add(time.Minute), now.Add(time.Second)); !got.Equal(now.Add(time.Second)) {
 		t.Fatalf("unexpected earlier time: %v", got)
+	}
+}
+
+func TestSnapshotDueDebouncesAndEnforcesMinimumGap(t *testing.T) {
+	t.Parallel()
+	now := time.Unix(1_700_000_000, 0)
+	policy := core.DefaultBackupPolicy()
+	if got := snapshotDue(now, now, time.Time{}, policy); !got.Equal(now.Add(time.Duration(policy.QuietSeconds) * time.Second)) {
+		t.Fatalf("quiet debounce not applied: %v", got)
+	}
+	last := now.Add(-time.Minute)
+	if got := snapshotDue(now, now, last, policy); !got.Equal(last.Add(time.Duration(policy.MinGapSeconds) * time.Second)) {
+		t.Fatalf("minimum gap not applied: %v", got)
+	}
+	maximumDelay := time.Duration(policy.MaxDirtySeconds) * time.Second
+	first := now.Add(-maximumDelay)
+	if got := snapshotDue(now, first, last, policy); !got.Equal(first.Add(maximumDelay)) {
+		t.Fatalf("maximum dirty duration not applied: %v", got)
 	}
 }

@@ -47,6 +47,7 @@ func (s *Store) initialize(ctx context.Context) error {
 			image TEXT NOT NULL DEFAULT '',
 			notes TEXT NOT NULL DEFAULT '',
 			enabled INTEGER NOT NULL DEFAULT 1,
+			sync_enabled INTEGER NOT NULL DEFAULT 1,
 			last_seen INTEGER,
 			last_change INTEGER,
 			last_backup INTEGER
@@ -72,6 +73,26 @@ func (s *Store) initialize(ctx context.Context) error {
 			remote_state TEXT NOT NULL,
 			manifest BLOB NOT NULL
 		)`,
+		`CREATE TABLE IF NOT EXISTS game_registry (
+			id TEXT PRIMARY KEY,
+			game_id TEXT NOT NULL REFERENCES games(id) ON DELETE CASCADE,
+			source TEXT NOT NULL,
+			path TEXT NOT NULL,
+			enabled INTEGER NOT NULL DEFAULT 1,
+			UNIQUE(game_id, path)
+		)`,
+		`CREATE TABLE IF NOT EXISTS game_exclusions (
+			id TEXT PRIMARY KEY,
+			game_id TEXT NOT NULL REFERENCES games(id) ON DELETE CASCADE,
+			pattern TEXT NOT NULL,
+			UNIQUE(game_id, pattern)
+		)`,
+		`CREATE TABLE IF NOT EXISTS game_policies (
+			game_id TEXT PRIMARY KEY REFERENCES games(id) ON DELETE CASCADE,
+			quiet_seconds INTEGER NOT NULL,
+			min_gap_seconds INTEGER NOT NULL,
+			max_dirty_seconds INTEGER NOT NULL
+		)`,
 		`CREATE INDEX IF NOT EXISTS snapshots_game_created ON snapshots(game_id, created_at DESC)`,
 		`CREATE TABLE IF NOT EXISTS blobs (
 			hash TEXT PRIMARY KEY,
@@ -86,7 +107,152 @@ func (s *Store) initialize(ctx context.Context) error {
 			return fmt.Errorf("initialize state database: %w", err)
 		}
 	}
+	if err := s.ensureSyncEnabledColumn(ctx); err != nil {
+		return err
+	}
 	return nil
+}
+
+func (s *Store) ensureSyncEnabledColumn(ctx context.Context) (err error) {
+	rows, err := s.db.QueryContext(ctx, `PRAGMA table_info(games)`)
+	if err != nil {
+		return fmt.Errorf("inspect games columns: %w", err)
+	}
+	found := false
+	for rows.Next() {
+		var sequence, notNull, primaryKey int
+		var name, dataType string
+		var defaultValue any
+		if err := rows.Scan(&sequence, &name, &dataType, &notNull, &defaultValue, &primaryKey); err != nil {
+			return fmt.Errorf("scan games column: %w", errors.Join(err, rows.Close()))
+		}
+		if name == "sync_enabled" {
+			found = true
+		}
+	}
+	if err := errors.Join(rows.Err(), rows.Close()); err != nil {
+		return fmt.Errorf("inspect games columns: %w", err)
+	}
+	if found {
+		return nil
+	}
+	if _, err := s.db.ExecContext(ctx, `ALTER TABLE games ADD COLUMN sync_enabled INTEGER NOT NULL DEFAULT 1`); err != nil {
+		return fmt.Errorf("add games.sync_enabled: %w", err)
+	}
+	return nil
+}
+
+func (s *Store) GamePolicy(ctx context.Context, gameID string) (core.BackupPolicy, error) {
+	policy := core.DefaultBackupPolicy()
+	err := s.db.QueryRowContext(ctx, `SELECT quiet_seconds, min_gap_seconds, max_dirty_seconds FROM game_policies WHERE game_id = ?`, gameID).
+		Scan(&policy.QuietSeconds, &policy.MinGapSeconds, &policy.MaxDirtySeconds)
+	if errors.Is(err, sql.ErrNoRows) {
+		return policy, nil
+	}
+	if err != nil {
+		return core.BackupPolicy{}, fmt.Errorf("load backup policy for %q: %w", gameID, err)
+	}
+	return policy, nil
+}
+
+func (s *Store) UpdateGamePolicy(ctx context.Context, gameID string, policy core.BackupPolicy) error {
+	if policy.QuietSeconds < 1 || policy.MinGapSeconds < 0 || policy.MaxDirtySeconds < policy.QuietSeconds {
+		return errors.New("backup policy requires quiet >= 1 second, min gap >= 0, and max dirty >= quiet")
+	}
+	if _, err := s.db.ExecContext(ctx, `INSERT INTO game_policies (game_id, quiet_seconds, min_gap_seconds, max_dirty_seconds)
+		VALUES (?, ?, ?, ?) ON CONFLICT(game_id) DO UPDATE SET quiet_seconds = excluded.quiet_seconds,
+		min_gap_seconds = excluded.min_gap_seconds, max_dirty_seconds = excluded.max_dirty_seconds`,
+		gameID, policy.QuietSeconds, policy.MinGapSeconds, policy.MaxDirtySeconds); err != nil {
+		return fmt.Errorf("update backup policy for %q: %w", gameID, err)
+	}
+	return nil
+}
+
+func (s *Store) ListExclusions(ctx context.Context, gameID string) (exclusions []core.GameExclusion, err error) {
+	rows, err := s.db.QueryContext(ctx, `SELECT id, game_id, pattern FROM game_exclusions WHERE game_id = ? ORDER BY pattern`, gameID)
+	if err != nil {
+		return nil, fmt.Errorf("list exclusions for %q: %w", gameID, err)
+	}
+	defer func() { err = errors.Join(err, rows.Close()) }()
+	for rows.Next() {
+		var exclusion core.GameExclusion
+		if err := rows.Scan(&exclusion.ID, &exclusion.GameID, &exclusion.Pattern); err != nil {
+			return nil, fmt.Errorf("scan game exclusion: %w", err)
+		}
+		exclusions = append(exclusions, exclusion)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate game exclusions: %w", err)
+	}
+	return exclusions, nil
+}
+
+func (s *Store) AddExclusion(ctx context.Context, exclusion core.GameExclusion) error {
+	if _, err := s.db.ExecContext(ctx, `INSERT INTO game_exclusions (id, game_id, pattern) VALUES (?, ?, ?)`, exclusion.ID, exclusion.GameID, exclusion.Pattern); err != nil {
+		return fmt.Errorf("add game exclusion: %w", err)
+	}
+	return nil
+}
+
+func (s *Store) DeleteExclusion(ctx context.Context, gameID, exclusionID string) error {
+	result, err := s.db.ExecContext(ctx, `DELETE FROM game_exclusions WHERE id = ? AND game_id = ?`, exclusionID, gameID)
+	if err != nil {
+		return fmt.Errorf("delete game exclusion %q: %w", exclusionID, err)
+	}
+	count, err := result.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("check deleted game exclusion %q: %w", exclusionID, err)
+	}
+	if count == 0 {
+		return fmt.Errorf("game exclusion %q: %w", exclusionID, sql.ErrNoRows)
+	}
+	return nil
+}
+
+func (s *Store) ReplaceCatalogRegistry(ctx context.Context, gameID string, paths []core.RegistryPath) (err error) {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("begin registry path update: %w", err)
+	}
+	committed := false
+	defer func() {
+		if !committed {
+			err = errors.Join(err, tx.Rollback())
+		}
+	}()
+	if _, err := tx.ExecContext(ctx, `DELETE FROM game_registry WHERE game_id = ? AND source = 'catalog'`, gameID); err != nil {
+		return fmt.Errorf("clear catalog registry paths for %q: %w", gameID, err)
+	}
+	for _, registryPath := range paths {
+		if _, err := tx.ExecContext(ctx, `INSERT INTO game_registry (id, game_id, source, path, enabled) VALUES (?, ?, ?, ?, ?)
+			ON CONFLICT(game_id, path) DO NOTHING`, registryPath.ID, gameID, registryPath.Source, registryPath.Path, registryPath.Enabled); err != nil {
+			return fmt.Errorf("add registry path for %q: %w", gameID, err)
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("commit registry path update: %w", err)
+	}
+	committed = true
+	return nil
+}
+
+func (s *Store) GameRegistry(ctx context.Context, gameID string) (paths []core.RegistryPath, err error) {
+	rows, err := s.db.QueryContext(ctx, `SELECT id, game_id, source, path, enabled FROM game_registry WHERE game_id = ? ORDER BY path`, gameID)
+	if err != nil {
+		return nil, fmt.Errorf("list registry paths for %q: %w", gameID, err)
+	}
+	defer func() { err = errors.Join(err, rows.Close()) }()
+	for rows.Next() {
+		var registryPath core.RegistryPath
+		if err := rows.Scan(&registryPath.ID, &registryPath.GameID, &registryPath.Source, &registryPath.Path, &registryPath.Enabled); err != nil {
+			return nil, fmt.Errorf("scan registry path: %w", err)
+		}
+		paths = append(paths, registryPath)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate registry paths: %w", err)
+	}
+	return paths, nil
 }
 
 func (s *Store) Close() error {
@@ -95,8 +261,8 @@ func (s *Store) Close() error {
 
 func (s *Store) UpsertGame(ctx context.Context, game core.Game) error {
 	_, err := s.db.ExecContext(ctx, `INSERT INTO games (
-		id, catalog_id, catalog_name, display_name, store, store_id, install_path, image, notes, enabled, last_seen
-	) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		id, catalog_id, catalog_name, display_name, store, store_id, install_path, image, notes, enabled, sync_enabled, last_seen
+	) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 	ON CONFLICT(id) DO UPDATE SET
 		catalog_id = excluded.catalog_id,
 		catalog_name = excluded.catalog_name,
@@ -105,10 +271,23 @@ func (s *Store) UpsertGame(ctx context.Context, game core.Game) error {
 		install_path = excluded.install_path,
 		last_seen = excluded.last_seen`,
 		game.ID, game.CatalogID, game.CatalogName, game.DisplayName, game.Store, game.StoreID,
-		game.InstallPath, game.Image, game.Notes, game.Enabled, timeValue(game.LastSeen),
+		game.InstallPath, game.Image, game.Notes, game.Enabled, game.SyncEnabled, timeValue(game.LastSeen),
 	)
 	if err != nil {
 		return fmt.Errorf("upsert game %q: %w", game.ID, err)
+	}
+	return nil
+}
+
+func (s *Store) EnsureRemoteGame(ctx context.Context, game core.Game) error {
+	_, err := s.db.ExecContext(ctx, `INSERT INTO games (
+		id, catalog_id, catalog_name, display_name, store, store_id, install_path, image, notes, enabled, sync_enabled, last_seen
+	) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(id) DO NOTHING`,
+		game.ID, game.CatalogID, game.CatalogName, game.DisplayName, game.Store, game.StoreID,
+		game.InstallPath, game.Image, game.Notes, game.Enabled, game.SyncEnabled, timeValue(game.LastSeen),
+	)
+	if err != nil {
+		return fmt.Errorf("ensure remote game %q: %w", game.ID, err)
 	}
 	return nil
 }
@@ -124,20 +303,71 @@ func (s *Store) ReplaceCatalogPaths(ctx context.Context, gameID string, paths []
 			err = errors.Join(err, tx.Rollback())
 		}
 	}()
-	if _, err := tx.ExecContext(ctx, `DELETE FROM game_paths WHERE game_id = ? AND source = 'catalog'`, gameID); err != nil {
-		return fmt.Errorf("clear catalog paths for %q: %w", gameID, err)
-	}
+	desired := make(map[string]struct{}, len(paths))
 	for _, path := range paths {
+		desired[path.ID] = struct{}{}
 		if _, err := tx.ExecContext(ctx, `INSERT INTO game_paths (id, game_id, source, template, resolved, enabled)
-			VALUES (?, ?, ?, ?, ?, ?) ON CONFLICT(game_id, template, resolved) DO NOTHING`,
+			VALUES (?, ?, ?, ?, ?, ?) ON CONFLICT(game_id, template, resolved) DO UPDATE SET id = excluded.id`,
 			path.ID, gameID, path.Source, path.Template, filepath.Clean(path.Resolved), path.Enabled); err != nil {
 			return fmt.Errorf("add path for %q: %w", gameID, err)
+		}
+	}
+	rows, err := tx.QueryContext(ctx, `SELECT id FROM game_paths WHERE game_id = ? AND source = 'catalog'`, gameID)
+	if err != nil {
+		return fmt.Errorf("list stale catalog paths for %q: %w", gameID, err)
+	}
+	var stale []string
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			return fmt.Errorf("scan stale catalog path: %w", errors.Join(err, rows.Close()))
+		}
+		if _, ok := desired[id]; !ok {
+			stale = append(stale, id)
+		}
+	}
+	if err := errors.Join(rows.Err(), rows.Close()); err != nil {
+		return fmt.Errorf("list stale catalog paths: %w", err)
+	}
+	for _, id := range stale {
+		if _, err := tx.ExecContext(ctx, `DELETE FROM game_paths WHERE id = ?`, id); err != nil {
+			return fmt.Errorf("delete stale catalog path %q: %w", id, err)
 		}
 	}
 	if err := tx.Commit(); err != nil {
 		return fmt.Errorf("commit path update: %w", err)
 	}
 	committed = true
+	return nil
+}
+
+func (s *Store) UpdatePath(ctx context.Context, gameID, pathID string, enabled bool) error {
+	result, err := s.db.ExecContext(ctx, `UPDATE game_paths SET enabled = ? WHERE id = ? AND game_id = ?`, enabled, pathID, gameID)
+	if err != nil {
+		return fmt.Errorf("update save path %q: %w", pathID, err)
+	}
+	count, err := result.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("check updated save path %q: %w", pathID, err)
+	}
+	if count == 0 {
+		return fmt.Errorf("save path %q: %w", pathID, sql.ErrNoRows)
+	}
+	return nil
+}
+
+func (s *Store) DeletePath(ctx context.Context, gameID, pathID string) error {
+	result, err := s.db.ExecContext(ctx, `DELETE FROM game_paths WHERE id = ? AND game_id = ? AND source = 'custom'`, pathID, gameID)
+	if err != nil {
+		return fmt.Errorf("delete custom save path %q: %w", pathID, err)
+	}
+	count, err := result.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("check deleted save path %q: %w", pathID, err)
+	}
+	if count == 0 {
+		return errors.New("only custom save locations can be deleted; exclude catalog locations instead")
+	}
 	return nil
 }
 
@@ -153,7 +383,7 @@ func (s *Store) AddPath(ctx context.Context, path core.GamePath) error {
 func (s *Store) ListGames(ctx context.Context) (games []core.Game, err error) {
 	rows, err := s.db.QueryContext(ctx, `SELECT
 		g.id, g.catalog_id, g.catalog_name, g.display_name, g.store, g.store_id, g.install_path,
-		g.image, g.notes, g.enabled, g.last_seen, g.last_change, g.last_backup,
+		g.image, g.notes, g.enabled, g.sync_enabled, g.last_seen, g.last_change, g.last_backup,
 		COUNT(s.id), COALESCE(SUM(s.stored_size), 0)
 	FROM games g LEFT JOIN snapshots s ON s.game_id = g.id
 	GROUP BY g.id ORDER BY g.display_name COLLATE NOCASE`)
@@ -177,7 +407,7 @@ func (s *Store) ListGames(ctx context.Context) (games []core.Game, err error) {
 func (s *Store) Game(ctx context.Context, id string) (core.Game, error) {
 	row := s.db.QueryRowContext(ctx, `SELECT
 		g.id, g.catalog_id, g.catalog_name, g.display_name, g.store, g.store_id, g.install_path,
-		g.image, g.notes, g.enabled, g.last_seen, g.last_change, g.last_backup,
+		g.image, g.notes, g.enabled, g.sync_enabled, g.last_seen, g.last_change, g.last_backup,
 		COUNT(s.id), COALESCE(SUM(s.stored_size), 0)
 	FROM games g LEFT JOIN snapshots s ON s.game_id = g.id WHERE g.id = ? GROUP BY g.id`, id)
 	game, err := scanGame(row)
@@ -193,16 +423,17 @@ type scanner interface {
 
 func scanGame(row scanner) (core.Game, error) {
 	var game core.Game
-	var enabled bool
+	var enabled, syncEnabled bool
 	var lastSeen, lastChange, lastBackup sql.NullInt64
 	if err := row.Scan(
 		&game.ID, &game.CatalogID, &game.CatalogName, &game.DisplayName, &game.Store, &game.StoreID,
-		&game.InstallPath, &game.Image, &game.Notes, &enabled, &lastSeen, &lastChange, &lastBackup,
+		&game.InstallPath, &game.Image, &game.Notes, &enabled, &syncEnabled, &lastSeen, &lastChange, &lastBackup,
 		&game.SnapshotCount, &game.StoredSize,
 	); err != nil {
 		return core.Game{}, fmt.Errorf("scan game: %w", err)
 	}
 	game.Enabled = enabled
+	game.SyncEnabled = syncEnabled
 	game.LastSeen = timePointer(lastSeen)
 	game.LastChange = timePointer(lastChange)
 	game.LastBackup = timePointer(lastBackup)
@@ -246,8 +477,11 @@ func (s *Store) UpdateGame(ctx context.Context, id string, update core.GameUpdat
 	if update.Enabled != nil {
 		game.Enabled = *update.Enabled
 	}
-	_, err = s.db.ExecContext(ctx, `UPDATE games SET display_name = ?, image = ?, notes = ?, enabled = ? WHERE id = ?`,
-		game.DisplayName, game.Image, game.Notes, game.Enabled, id)
+	if update.SyncEnabled != nil {
+		game.SyncEnabled = *update.SyncEnabled
+	}
+	_, err = s.db.ExecContext(ctx, `UPDATE games SET display_name = ?, image = ?, notes = ?, enabled = ?, sync_enabled = ? WHERE id = ?`,
+		game.DisplayName, game.Image, game.Notes, game.Enabled, game.SyncEnabled, id)
 	if err != nil {
 		return fmt.Errorf("update game %q: %w", id, err)
 	}
@@ -277,13 +511,38 @@ func (s *Store) SaveSnapshot(ctx context.Context, snapshot core.Snapshot) (err e
 	if err != nil {
 		return fmt.Errorf("save snapshot %q: %w", snapshot.ID, err)
 	}
-	if _, err := tx.ExecContext(ctx, `UPDATE games SET last_backup = ? WHERE id = ?`, snapshot.CreatedAt.UnixMilli(), snapshot.GameID); err != nil {
+	if _, err := tx.ExecContext(ctx, `UPDATE games SET last_backup = ?, last_change = ? WHERE id = ?`, snapshot.CreatedAt.UnixMilli(), snapshot.CreatedAt.UnixMilli(), snapshot.GameID); err != nil {
 		return fmt.Errorf("update last backup: %w", err)
 	}
 	if err := tx.Commit(); err != nil {
 		return fmt.Errorf("commit snapshot: %w", err)
 	}
 	committed = true
+	return nil
+}
+
+func (s *Store) ImportSnapshot(ctx context.Context, snapshot core.Snapshot) error {
+	snapshot.RemoteState = "synced"
+	manifest, err := json.Marshal(snapshot)
+	if err != nil {
+		return fmt.Errorf("encode imported snapshot: %w", err)
+	}
+	_, err = s.db.ExecContext(ctx, `INSERT INTO snapshots
+		(id, game_id, device_id, created_at, file_count, original_size, stored_size, remote_state, manifest)
+		VALUES (?, ?, ?, ?, ?, ?, ?, 'synced', ?)
+		ON CONFLICT(id) DO UPDATE SET remote_state = 'synced', manifest = excluded.manifest`,
+		snapshot.ID, snapshot.GameID, snapshot.DeviceID, snapshot.CreatedAt.UnixMilli(), len(snapshot.Files),
+		snapshot.OriginalSize, snapshot.StoredSize, manifest)
+	if err != nil {
+		return fmt.Errorf("import remote snapshot %q: %w", snapshot.ID, err)
+	}
+	timestamp := snapshot.CreatedAt.UnixMilli()
+	if _, err := s.db.ExecContext(ctx, `UPDATE games SET
+		last_backup = CASE WHEN last_backup IS NULL OR last_backup < ? THEN ? ELSE last_backup END,
+		last_change = CASE WHEN last_change IS NULL OR last_change < ? THEN ? ELSE last_change END
+		WHERE id = ?`, timestamp, timestamp, timestamp, timestamp, snapshot.GameID); err != nil {
+		return fmt.Errorf("update remote game backup time %q: %w", snapshot.GameID, err)
+	}
 	return nil
 }
 
@@ -310,8 +569,48 @@ func (s *Store) ListSnapshots(ctx context.Context, gameID string) (snapshots []c
 	return snapshots, nil
 }
 
+func (s *Store) SnapshotsBeyond(ctx context.Context, gameID string, keep int) (snapshots []core.Snapshot, err error) {
+	rows, err := s.db.QueryContext(ctx, `SELECT manifest FROM snapshots WHERE game_id = ? ORDER BY created_at DESC LIMIT -1 OFFSET ?`, gameID, keep)
+	if err != nil {
+		return nil, fmt.Errorf("list snapshots beyond retention: %w", err)
+	}
+	defer func() { err = errors.Join(err, rows.Close()) }()
+	for rows.Next() {
+		var data []byte
+		if err := rows.Scan(&data); err != nil {
+			return nil, fmt.Errorf("scan retained snapshot: %w", err)
+		}
+		var snapshot core.Snapshot
+		if err := json.Unmarshal(data, &snapshot); err != nil {
+			return nil, fmt.Errorf("decode retained snapshot: %w", err)
+		}
+		snapshots = append(snapshots, snapshot)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate retained snapshots: %w", err)
+	}
+	return snapshots, nil
+}
+
 func (s *Store) PendingSnapshots(ctx context.Context) (snapshots []core.Snapshot, err error) {
-	rows, err := s.db.QueryContext(ctx, `SELECT manifest FROM snapshots WHERE remote_state != 'synced' ORDER BY created_at`)
+	return s.pendingSnapshots(ctx, "", false)
+}
+
+func (s *Store) PendingSnapshotsForGame(ctx context.Context, gameID string) ([]core.Snapshot, error) {
+	return s.pendingSnapshots(ctx, gameID, true)
+}
+
+func (s *Store) pendingSnapshots(ctx context.Context, gameID string, filterGame bool) (snapshots []core.Snapshot, err error) {
+	query := `SELECT s.manifest FROM snapshots s JOIN games g ON g.id = s.game_id WHERE s.remote_state != 'synced'`
+	arguments := []any{}
+	if filterGame {
+		query += ` AND s.game_id = ?`
+		arguments = append(arguments, gameID)
+	} else {
+		query += ` AND g.sync_enabled = 1`
+	}
+	query += ` ORDER BY s.created_at`
+	rows, err := s.db.QueryContext(ctx, query, arguments...)
 	if err != nil {
 		return nil, fmt.Errorf("list pending snapshots: %w", err)
 	}
@@ -333,14 +632,57 @@ func (s *Store) PendingSnapshots(ctx context.Context) (snapshots []core.Snapshot
 	return snapshots, nil
 }
 
+func (s *Store) DeleteSnapshot(ctx context.Context, id string) error {
+	result, err := s.db.ExecContext(ctx, `DELETE FROM snapshots WHERE id = ?`, id)
+	if err != nil {
+		return fmt.Errorf("delete snapshot %q: %w", id, err)
+	}
+	count, err := result.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("check deleted snapshot %q: %w", id, err)
+	}
+	if count == 0 {
+		return fmt.Errorf("snapshot %q: %w", id, sql.ErrNoRows)
+	}
+	return nil
+}
+
 func (s *Store) Snapshot(ctx context.Context, id string) (core.Snapshot, error) {
-	var data []byte
-	if err := s.db.QueryRowContext(ctx, `SELECT manifest FROM snapshots WHERE id = ?`, id).Scan(&data); err != nil {
+	snapshot, err := snapshotFromRow(s.db.QueryRowContext(ctx, `SELECT manifest FROM snapshots WHERE id = ?`, id))
+	if err != nil {
 		return core.Snapshot{}, fmt.Errorf("load snapshot %q: %w", id, err)
+	}
+	return snapshot, nil
+}
+
+func (s *Store) HasSnapshot(ctx context.Context, id string) (bool, error) {
+	var present int
+	err := s.db.QueryRowContext(ctx, `SELECT 1 FROM snapshots WHERE id = ?`, id).Scan(&present)
+	if errors.Is(err, sql.ErrNoRows) {
+		return false, nil
+	}
+	if err != nil {
+		return false, fmt.Errorf("check snapshot %q: %w", id, err)
+	}
+	return true, nil
+}
+
+func (s *Store) LatestSnapshot(ctx context.Context, gameID string) (core.Snapshot, error) {
+	snapshot, err := snapshotFromRow(s.db.QueryRowContext(ctx, `SELECT manifest FROM snapshots WHERE game_id = ? ORDER BY created_at DESC LIMIT 1`, gameID))
+	if err != nil {
+		return core.Snapshot{}, fmt.Errorf("load latest snapshot for %q: %w", gameID, err)
+	}
+	return snapshot, nil
+}
+
+func snapshotFromRow(row scanner) (core.Snapshot, error) {
+	var data []byte
+	if err := row.Scan(&data); err != nil {
+		return core.Snapshot{}, err
 	}
 	var snapshot core.Snapshot
 	if err := json.Unmarshal(data, &snapshot); err != nil {
-		return core.Snapshot{}, fmt.Errorf("decode snapshot %q: %w", id, err)
+		return core.Snapshot{}, fmt.Errorf("decode snapshot manifest: %w", err)
 	}
 	return snapshot, nil
 }

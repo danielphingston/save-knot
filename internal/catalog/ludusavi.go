@@ -22,7 +22,14 @@ type Definition struct {
 	InstallDir map[string]any      `yaml:"installDir"`
 	Steam      Store               `yaml:"steam"`
 	GOG        Store               `yaml:"gog"`
-	Aliases    []string            `yaml:"aliases"`
+	IDs        IDs                 `yaml:"id"`
+	Alias      string              `yaml:"alias"`
+}
+
+type IDs struct {
+	SteamExtra []string `yaml:"steamExtra"`
+	GOGExtra   []string `yaml:"gogExtra"`
+	Lutris     string   `yaml:"lutris"`
 }
 
 type FileRule struct {
@@ -58,6 +65,9 @@ func (s *Store) UnmarshalYAML(node *yaml.Node) error {
 type Manifest struct {
 	Games   map[string]Definition
 	BySteam map[string]string
+	ByGOG   map[string]string
+	ByName  map[string]string
+	ByDir   map[string]string
 }
 
 func Parse(data []byte) (*Manifest, error) {
@@ -66,14 +76,68 @@ func Parse(data []byte) (*Manifest, error) {
 		return nil, fmt.Errorf("decode Ludusavi manifest: %w", err)
 	}
 	bySteam := make(map[string]string)
+	byGOG := make(map[string]string)
+	byName := make(map[string]string)
+	byDir := make(map[string]string)
 	for name, definition := range definitions {
 		definition.Name = name
 		definitions[name] = definition
+		byName[normalize(name)] = name
+		for directory := range definition.InstallDir {
+			byDir[normalize(directory)] = name
+		}
 		if definition.Steam.ID != "" {
 			bySteam[definition.Steam.ID] = name
 		}
+		for _, id := range definition.IDs.SteamExtra {
+			bySteam[id] = name
+		}
+		if definition.GOG.ID != "" {
+			byGOG[definition.GOG.ID] = name
+		}
+		for _, id := range definition.IDs.GOGExtra {
+			byGOG[id] = name
+		}
 	}
-	return &Manifest{Games: definitions, BySteam: bySteam}, nil
+	return &Manifest{Games: definitions, BySteam: bySteam, ByGOG: byGOG, ByName: byName, ByDir: byDir}, nil
+}
+
+func (m *Manifest) MatchName(candidates ...string) (Definition, bool) {
+	for _, candidate := range candidates {
+		key := normalize(candidate)
+		name, ok := m.ByDir[key]
+		if !ok {
+			name, ok = m.ByName[key]
+		}
+		if ok {
+			return m.Resolve(name)
+		}
+	}
+	return Definition{}, false
+}
+
+func normalize(value string) string {
+	var normalized strings.Builder
+	for _, character := range strings.ToLower(value) {
+		if character >= 'a' && character <= 'z' || character >= '0' && character <= '9' {
+			normalized.WriteRune(character)
+		}
+	}
+	return normalized.String()
+}
+
+func (m *Manifest) Resolve(name string) (Definition, bool) {
+	for range 10 {
+		definition, ok := m.Games[name]
+		if !ok {
+			return Definition{}, false
+		}
+		if definition.Alias == "" {
+			return definition, true
+		}
+		name = definition.Alias
+	}
+	return Definition{}, false
 }
 
 func Load(path string) (*Manifest, error) {
@@ -91,8 +155,16 @@ func (m *Manifest) SteamGame(id string) (Definition, bool) {
 	if !ok {
 		return Definition{}, false
 	}
-	definition, ok := m.Games[name]
-	return definition, ok
+	return m.Resolve(name)
+}
+
+func LoadSecondary(path string) (*Manifest, error) {
+	//nolint:gosec // The path is a fixed filename under an installed game's detected directory.
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil, fmt.Errorf("read secondary Ludusavi manifest: %w", err)
+	}
+	return Parse(data)
 }
 
 type Fetcher struct {

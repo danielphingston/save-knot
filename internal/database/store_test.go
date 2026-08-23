@@ -2,6 +2,7 @@ package database
 
 import (
 	"context"
+	"database/sql"
 	"path/filepath"
 	"testing"
 	"time"
@@ -22,7 +23,7 @@ func TestStoreGamePathsAndSnapshots(t *testing.T) {
 		}
 	})
 	now := time.Unix(1_700_000_000, 0).UTC()
-	game := core.Game{ID: "game-a", DisplayName: "Game A", Store: "custom", Enabled: true, LastSeen: &now}
+	game := core.Game{ID: "game-a", DisplayName: "Game A", Store: "custom", Enabled: true, SyncEnabled: true, LastSeen: &now}
 	if err := store.UpsertGame(ctx, game); err != nil {
 		t.Fatal(err)
 	}
@@ -38,7 +39,7 @@ func TestStoreGamePathsAndSnapshots(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(games) != 1 || games[0].SnapshotCount != 1 || games[0].StoredSize != 8 || games[0].LastBackup == nil {
+	if len(games) != 1 || games[0].SnapshotCount != 1 || games[0].StoredSize != 8 || games[0].LastBackup == nil || games[0].LastChange == nil {
 		t.Fatalf("unexpected game summary: %#v", games)
 	}
 	snapshots, err := store.ListSnapshots(ctx, game.ID)
@@ -48,16 +49,25 @@ func TestStoreGamePathsAndSnapshots(t *testing.T) {
 	if len(snapshots) != 1 || snapshots[0].ID != snapshot.ID {
 		t.Fatalf("unexpected snapshots: %#v", snapshots)
 	}
+	present, err := store.HasSnapshot(ctx, snapshot.ID)
+	if err != nil || !present {
+		t.Fatalf("saved snapshot was not found: present=%v err=%v", present, err)
+	}
+	present, err = store.HasSnapshot(ctx, "missing")
+	if err != nil || present {
+		t.Fatalf("missing snapshot lookup was incorrect: present=%v err=%v", present, err)
+	}
 	name := "Custom Name"
 	enabled := false
-	if err := store.UpdateGame(ctx, game.ID, core.GameUpdate{DisplayName: &name, Enabled: &enabled}); err != nil {
+	syncEnabled := false
+	if err := store.UpdateGame(ctx, game.ID, core.GameUpdate{DisplayName: &name, Enabled: &enabled, SyncEnabled: &syncEnabled}); err != nil {
 		t.Fatal(err)
 	}
 	updated, err := store.Game(ctx, game.ID)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if updated.DisplayName != name || updated.Enabled {
+	if updated.DisplayName != name || updated.Enabled || updated.SyncEnabled {
 		t.Fatalf("game update was not saved: %#v", updated)
 	}
 }
@@ -74,7 +84,7 @@ func TestRemoteStateIsScopedToStorageTarget(t *testing.T) {
 			t.Error(err)
 		}
 	})
-	game := core.Game{ID: "game-a", DisplayName: "Game A", Store: "custom", Enabled: true}
+	game := core.Game{ID: "game-a", DisplayName: "Game A", Store: "custom", Enabled: true, SyncEnabled: true}
 	if err := store.UpsertGame(ctx, game); err != nil {
 		t.Fatal(err)
 	}
@@ -110,5 +120,73 @@ func TestRemoteStateIsScopedToStorageTarget(t *testing.T) {
 	pending, err = store.PendingSnapshots(ctx)
 	if err != nil || len(pending) != 0 {
 		t.Fatalf("synced snapshot remained pending: snapshots=%#v err=%v", pending, err)
+	}
+}
+
+func TestPendingSyncExcludesLocalOnlyGames(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	store, err := Open(ctx, filepath.Join(t.TempDir(), "state.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if err := store.Close(); err != nil {
+			t.Error(err)
+		}
+	})
+	game := core.Game{ID: "game-a", DisplayName: "Game A", Store: "custom", Enabled: true, SyncEnabled: false}
+	if err := store.UpsertGame(ctx, game); err != nil {
+		t.Fatal(err)
+	}
+	snapshot := core.Snapshot{Version: 1, ID: "snapshot-a", GameID: game.ID, CreatedAt: time.Now(), RemoteState: "local"}
+	if err := store.SaveSnapshot(ctx, snapshot); err != nil {
+		t.Fatal(err)
+	}
+	pending, err := store.PendingSnapshots(ctx)
+	if err != nil || len(pending) != 0 {
+		t.Fatalf("local-only game leaked into global sync queue: snapshots=%#v err=%v", pending, err)
+	}
+	pending, err = store.PendingSnapshotsForGame(ctx, game.ID)
+	if err != nil || len(pending) != 1 {
+		t.Fatalf("local-only pending snapshot was not retained: snapshots=%#v err=%v", pending, err)
+	}
+}
+
+func TestOpenAddsSyncSettingToExistingDatabase(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	path := filepath.Join(t.TempDir(), "state.db")
+	legacy, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := legacy.ExecContext(ctx, `CREATE TABLE games (
+		id TEXT PRIMARY KEY, catalog_id TEXT NOT NULL DEFAULT '', catalog_name TEXT NOT NULL DEFAULT '',
+		display_name TEXT NOT NULL, store TEXT NOT NULL, store_id TEXT NOT NULL DEFAULT '', install_path TEXT NOT NULL DEFAULT '',
+		image TEXT NOT NULL DEFAULT '', notes TEXT NOT NULL DEFAULT '', enabled INTEGER NOT NULL DEFAULT 1,
+		last_seen INTEGER, last_change INTEGER, last_backup INTEGER
+	)`); err != nil {
+		t.Fatal(err)
+	}
+	if err := legacy.Close(); err != nil {
+		t.Fatal(err)
+	}
+	store, err := Open(ctx, path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if err := store.Close(); err != nil {
+			t.Error(err)
+		}
+	})
+	game := core.Game{ID: "game-a", DisplayName: "Game A", Store: "custom", Enabled: true, SyncEnabled: true}
+	if err := store.UpsertGame(ctx, game); err != nil {
+		t.Fatal(err)
+	}
+	loaded, err := store.Game(ctx, game.ID)
+	if err != nil || !loaded.SyncEnabled {
+		t.Fatalf("sync setting was not added to existing database: game=%#v err=%v", loaded, err)
 	}
 }

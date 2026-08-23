@@ -73,7 +73,7 @@ h3 { font-size: 15px; }
 .detail-cover { border-radius: 18px; overflow: hidden; aspect-ratio: 16 / 10; background: var(--panel-raised); border: 1px solid var(--line); display: grid; place-items: center; }
 .detail-cover img { width: 100%; height: 100%; object-fit: cover; }
 .detail-copy { align-self: center; min-width: 0; }
-.stats { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 10px; margin-top: 22px; }
+.stats { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 10px; margin-top: 22px; }
 .stat { border-left: 1px solid var(--line); padding-left: 13px; }
 .stat:first-child { border-left: 0; padding-left: 0; }
 .stat strong, .stat small { display: block; }
@@ -91,6 +91,19 @@ h3 { font-size: 15px; }
 .row small { color: var(--muted); margin-top: 5px; font-size: 11px; }
 .state { color: var(--accent); font-size: 11px; font-weight: 750; text-transform: uppercase; letter-spacing: .07em; }
 .state.local { color: var(--warning); }
+.snapshot-entry { border-bottom: 1px solid var(--line); }
+.snapshot-entry:last-child { border-bottom: 0; }
+.snapshot-entry .row { border-bottom: 0; }
+.snapshot-details { padding: 0 17px 14px; }
+.snapshot-details summary { width: fit-content; color: var(--muted); cursor: pointer; font-size: 11px; }
+.file-list { display: grid; gap: 7px; margin-top: 12px; padding: 12px; border-radius: 9px; background: #11140f; }
+.file-list > div { display: grid; grid-template-columns: 70px minmax(0, 1fr) auto; align-items: center; gap: 9px; min-width: 0; }
+.file-list code { overflow: hidden; color: #d7ddcf; font-size: 11px; text-overflow: ellipsis; white-space: nowrap; }
+.file-list small { color: var(--muted); font-size: 10px; }
+.file-state { color: var(--muted); font-size: 9px; font-weight: 800; letter-spacing: .07em; text-transform: uppercase; }
+.file-state.added { color: var(--accent); }
+.file-state.changed { color: var(--warning); }
+.file-state.removed { color: var(--danger); }
 
 .settings-grid { display: grid; grid-template-columns: minmax(0, 1.3fr) minmax(230px, .7fr); gap: 20px; }
 .settings-card { border: 1px solid var(--line); background: var(--panel); border-radius: 15px; padding: 22px; }

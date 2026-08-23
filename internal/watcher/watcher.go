@@ -13,16 +13,13 @@ import (
 	"time"
 
 	"github.com/fsnotify/fsnotify"
-)
-
-const (
-	debounceDelay = 3 * time.Second
-	maximumDelay  = 30 * time.Second
+	"github.com/saveknot/saveknot/internal/core"
 )
 
 type Target struct {
 	GameID string
 	Path   string
+	Policy core.BackupPolicy
 }
 
 type pendingChange struct {
@@ -91,6 +88,7 @@ func (m *Manager) run(ctx context.Context) {
 	defer ticker.Stop()
 	targets := make(map[string][]Target)
 	pending := make(map[string]pendingChange)
+	lastQueued := make(map[string]time.Time)
 	for {
 		select {
 		case <-ctx.Done():
@@ -103,9 +101,9 @@ func (m *Manager) run(ctx context.Context) {
 			if !ok {
 				return
 			}
-			m.handleEvent(event, targets, pending)
+			m.handleEvent(event, targets, pending, lastQueued)
 		case <-ticker.C:
-			m.flushPending(time.Now(), pending)
+			m.flushPending(time.Now(), pending, lastQueued)
 		case err, ok := <-m.watcher.Errors:
 			if ok {
 				slog.Warn("filesystem watcher", "error", err)
@@ -114,7 +112,7 @@ func (m *Manager) run(ctx context.Context) {
 	}
 }
 
-func (m *Manager) handleEvent(event fsnotify.Event, targets map[string][]Target, pending map[string]pendingChange) {
+func (m *Manager) handleEvent(event fsnotify.Event, targets map[string][]Target, pending map[string]pendingChange, lastQueued map[string]time.Time) {
 	if event.Op&(fsnotify.Create|fsnotify.Write|fsnotify.Remove|fsnotify.Rename) == 0 {
 		return
 	}
@@ -135,23 +133,35 @@ func (m *Manager) handleEvent(event fsnotify.Event, targets map[string][]Target,
 			if !exists {
 				change.first = now
 			}
-			change.due = earlier(now.Add(debounceDelay), change.first.Add(maximumDelay))
+			change.due = snapshotDue(now, change.first, lastQueued[target.GameID], target.Policy)
 			pending[target.GameID] = change
 		}
 	}
 }
 
-func (m *Manager) flushPending(now time.Time, pending map[string]pendingChange) {
+func (m *Manager) flushPending(now time.Time, pending map[string]pendingChange, lastQueued map[string]time.Time) {
 	for gameID, change := range pending {
 		if now.Before(change.due) {
 			continue
 		}
 		select {
 		case m.jobs <- gameID:
+			lastQueued[gameID] = now
 		default:
 		}
 		delete(pending, gameID)
 	}
+}
+
+func snapshotDue(now, first, lastQueued time.Time, policy core.BackupPolicy) time.Time {
+	if policy.QuietSeconds < 1 || policy.MaxDirtySeconds < policy.QuietSeconds || policy.MinGapSeconds < 0 {
+		policy = core.DefaultBackupPolicy()
+	}
+	due := now.Add(time.Duration(policy.QuietSeconds) * time.Second)
+	if minimum := lastQueued.Add(time.Duration(policy.MinGapSeconds) * time.Second); !lastQueued.IsZero() && minimum.After(due) {
+		due = minimum
+	}
+	return earlier(due, first.Add(time.Duration(policy.MaxDirtySeconds)*time.Second))
 }
 
 func (m *Manager) applyTargets(revised []Target) map[string][]Target {

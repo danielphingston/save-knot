@@ -35,6 +35,7 @@ func (r *syncRepoFake) MarkSnapshotRemote(_ context.Context, id, state string) e
 	r.remoteID, r.remoteState = id, state
 	return nil
 }
+func (r *syncRepoFake) SaveBlob(context.Context, string, string, int64, int64) error { return nil }
 
 type objectWriterFake struct {
 	keys   []string
@@ -59,26 +60,26 @@ func TestSyncUploadsUniqueBlobsBeforeManifest(t *testing.T) {
 	if err := os.WriteFile(path, []byte("compressed"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	hash := "abcdef0123456789"
+	hash := "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789"
 	repository := &syncRepoFake{path: path}
 	writer := &objectWriterFake{}
 	snapshot := core.Snapshot{ID: "snapshot-a", GameID: "game-a", CreatedAt: time.Now(), Files: []core.SnapshotFile{{Hash: hash}, {Hash: hash}}, RemoteState: "local"}
 	if err := NewSyncer(repository).Upload(context.Background(), writer, snapshot); err != nil {
 		t.Fatal(err)
 	}
-	if len(writer.keys) != 2 || writer.keys[0] != "blobs/sha256/ab/"+hash+".zst" || writer.keys[1] != "games/game-a/snapshots/snapshot-a.json" {
+	if len(writer.keys) != 3 || writer.keys[0] != "blobs/sha256/ab/"+hash+".zst" || writer.keys[1] != "games/game-a/metadata.json" || writer.keys[2] != "games/game-a/snapshots/snapshot-a.json" {
 		t.Fatalf("unexpected upload order: %#v", writer.keys)
 	}
 	if len(repository.uploaded) != 1 || repository.remoteID != snapshot.ID || repository.remoteState != "synced" {
 		t.Fatalf("unexpected repository state: %#v", repository)
 	}
-	if !bytes.Contains(writer.bodies[1], []byte(`"remoteState":"synced"`)) {
+	if !bytes.Contains(writer.bodies[2], []byte(`"remoteState":"synced"`)) {
 		t.Fatal("remote manifest was not marked synced")
 	}
 	if err := NewSyncer(repository).Upload(context.Background(), writer, snapshot); err != nil {
 		t.Fatal(err)
 	}
-	if len(writer.keys) != 3 || writer.keys[2] != writer.keys[1] || len(repository.uploaded) != 1 {
+	if len(writer.keys) != 5 || writer.keys[3] != writer.keys[1] || writer.keys[4] != writer.keys[2] || len(repository.uploaded) != 1 {
 		t.Fatalf("already uploaded blob was sent again: keys=%#v uploads=%#v", writer.keys, repository.uploaded)
 	}
 }

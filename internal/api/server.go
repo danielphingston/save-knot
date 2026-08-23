@@ -12,15 +12,19 @@ import (
 	"mime/multipart"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
 	"regexp"
 	"strings"
 	"time"
 
+	"github.com/bmatcuk/doublestar/v4"
 	"github.com/saveknot/saveknot/internal/config"
 	"github.com/saveknot/saveknot/internal/core"
 	"github.com/saveknot/saveknot/internal/events"
+	"github.com/saveknot/saveknot/internal/platform"
+	"github.com/saveknot/saveknot/internal/remote"
 	"github.com/saveknot/saveknot/internal/settings"
 )
 
@@ -35,8 +39,14 @@ var webFiles embed.FS
 type gameReader interface {
 	ListGames(context.Context) ([]core.Game, error)
 	Game(context.Context, string) (core.Game, error)
-	GamePaths(context.Context, string) ([]core.GamePath, error)
 	ListSnapshots(context.Context, string) ([]core.Snapshot, error)
+}
+
+type sourceReader interface {
+	GamePaths(context.Context, string) ([]core.GamePath, error)
+	GameRegistry(context.Context, string) ([]core.RegistryPath, error)
+	ListExclusions(context.Context, string) ([]core.GameExclusion, error)
+	GamePolicy(context.Context, string) (core.BackupPolicy, error)
 }
 
 type gameWriter interface {
@@ -45,28 +55,58 @@ type gameWriter interface {
 	UpdateGame(context.Context, string, core.GameUpdate) error
 }
 
-type coordinator interface {
+type pathWriter interface {
+	UpdatePath(context.Context, string, string, bool) error
+	DeletePath(context.Context, string, string) error
+	AddExclusion(context.Context, core.GameExclusion) error
+	DeleteExclusion(context.Context, string, string) error
+	UpdateGamePolicy(context.Context, string, core.BackupPolicy) error
+}
+
+type backupCoordinator interface {
 	Backup(context.Context, string) (core.Snapshot, error)
 	Restore(context.Context, string, string) (core.Snapshot, error)
 	ReconcileWatches(context.Context)
+	DeleteSnapshot(context.Context, string, string, bool) error
+}
+
+type syncCoordinator interface {
 	SyncPending(context.Context) error
+	SyncGame(context.Context, string) error
+	ReconcileRemote(context.Context) (remote.ReconcileResult, error)
+}
+
+type discoveryCoordinator interface {
+	DiscoverNow(context.Context) core.Diagnostics
+	ConfigureLocal(context.Context, config.Local) error
+	Diagnostics() core.Diagnostics
+	SearchCatalog(string) ([]core.CatalogChoice, error)
+	RemapGame(context.Context, string, string) error
 }
 
 type Server struct {
-	reader      gameReader
-	writer      gameWriter
-	coordinator coordinator
-	settings    *settings.Manager
-	events      *events.Bus
-	artworkDir  string
-	http        *http.Server
+	reader     gameReader
+	sources    sourceReader
+	writer     gameWriter
+	pathWriter pathWriter
+	backups    backupCoordinator
+	sync       syncCoordinator
+	discovery  discoveryCoordinator
+	settings   *settings.Manager
+	events     *events.Bus
+	artworkDir string
+	http       *http.Server
 }
 
 func New(
 	listen string,
 	reader gameReader,
+	sources sourceReader,
 	writer gameWriter,
-	coordinator coordinator,
+	pathWriter pathWriter,
+	backup backupCoordinator,
+	sync syncCoordinator,
+	discovery discoveryCoordinator,
 	settings *settings.Manager,
 	eventBus *events.Bus,
 	artworkDir string,
@@ -75,13 +115,13 @@ func New(
 		return nil, err
 	}
 	server := &Server{
-		reader: reader, writer: writer, coordinator: coordinator, settings: settings,
+		reader: reader, sources: sources, writer: writer, pathWriter: pathWriter, backups: backup, sync: sync, discovery: discovery, settings: settings,
 		events: eventBus, artworkDir: artworkDir,
 	}
 	mux := http.NewServeMux()
 	server.routes(mux)
 	server.http = &http.Server{
-		Addr: listen, Handler: securityHeaders(mux), ReadHeaderTimeout: 5 * time.Second,
+		Addr: listen, Handler: securityHeaders(localRequestsOnly(mux)), ReadHeaderTimeout: 5 * time.Second,
 		ReadTimeout: 15 * time.Second, WriteTimeout: 60 * time.Second, IdleTimeout: 90 * time.Second,
 	}
 	return server, nil
@@ -110,10 +150,26 @@ func (s *Server) routes(mux *http.ServeMux) {
 	mux.HandleFunc("GET /api/games/{id}", s.game)
 	mux.HandleFunc("PATCH /api/games/{id}", s.updateGame)
 	mux.HandleFunc("POST /api/games/{id}/paths", s.addPath)
+	mux.HandleFunc("PATCH /api/games/{id}/paths/{path}", s.updatePath)
+	mux.HandleFunc("DELETE /api/games/{id}/paths/{path}", s.deletePath)
+	mux.HandleFunc("POST /api/games/{id}/exclusions", s.addExclusion)
+	mux.HandleFunc("DELETE /api/games/{id}/exclusions/{exclusion}", s.deleteExclusion)
+	mux.HandleFunc("PUT /api/games/{id}/policy", s.updatePolicy)
 	mux.HandleFunc("POST /api/games/{id}/image", s.uploadImage)
 	mux.HandleFunc("GET /api/games/{id}/snapshots", s.listSnapshots)
 	mux.HandleFunc("POST /api/games/{id}/backup", s.backup)
+	mux.HandleFunc("POST /api/games/{id}/sync", s.syncGame)
 	mux.HandleFunc("POST /api/games/{id}/restore/{snapshot}", s.restore)
+	mux.HandleFunc("DELETE /api/games/{id}/snapshots/{snapshot}", s.deleteSnapshot)
+	mux.HandleFunc("POST /api/discovery", s.discover)
+	mux.HandleFunc("GET /api/catalog", s.searchCatalog)
+	mux.HandleFunc("PUT /api/games/{id}/remap", s.remapGame)
+	mux.HandleFunc("POST /api/folder", s.selectFolder)
+	mux.HandleFunc("PUT /api/settings/local", s.configureLocal)
+	mux.HandleFunc("PUT /api/settings/autostart", s.configureAutostart)
+	mux.HandleFunc("PUT /api/settings/retention", s.configureRetention)
+	mux.HandleFunc("POST /api/sync", s.syncAll)
+	mux.HandleFunc("POST /api/r2/reconcile", s.reconcileRemote)
 	mux.HandleFunc("POST /api/r2", s.configureR2)
 	mux.HandleFunc("GET /api/events", s.eventStream)
 	mux.Handle("GET /artwork/", http.StripPrefix("/artwork/", http.FileServer(http.Dir(s.artworkDir))))
@@ -127,9 +183,16 @@ func (s *Server) routes(mux *http.ServeMux) {
 func (s *Server) status(writer http.ResponseWriter, request *http.Request) {
 	cfg := s.settings.Config()
 	writeJSON(writer, http.StatusOK, map[string]any{
-		"deviceId":     cfg.DeviceID,
-		"r2Configured": cfg.R2.CredentialID != "",
-		"r2":           map[string]string{"accountId": cfg.R2.AccountID, "bucket": cfg.R2.Bucket, "prefix": cfg.R2.Prefix, "accessKeyId": cfg.R2.AccessKeyID},
+		"deviceId":       cfg.DeviceID,
+		"r2Configured":   cfg.R2.CredentialID != "",
+		"r2":             map[string]string{"accountId": cfg.R2.AccountID, "bucket": cfg.R2.Bucket, "prefix": cfg.R2.Prefix, "accessKeyId": cfg.R2.AccessKeyID},
+		"localBackupDir": cfg.LocalBackupDir,
+		"steamRoots":     cfg.SteamRoots,
+		"epicManifests":  cfg.EpicManifests,
+		"gogRoots":       cfg.GOGRoots,
+		"launchAtLogin":  cfg.LaunchAtLogin,
+		"retentionKeep":  cfg.RetentionKeep,
+		"diagnostics":    s.discovery.Diagnostics(),
 	})
 }
 
@@ -151,12 +214,27 @@ func (s *Server) game(writer http.ResponseWriter, request *http.Request) {
 		writeError(writer, http.StatusNotFound, err)
 		return
 	}
-	paths, err := s.reader.GamePaths(request.Context(), game.ID)
+	paths, err := s.sources.GamePaths(request.Context(), game.ID)
 	if err != nil {
 		writeError(writer, http.StatusInternalServerError, err)
 		return
 	}
-	writeJSON(writer, http.StatusOK, map[string]any{"game": game, "paths": paths})
+	registryPaths, err := s.sources.GameRegistry(request.Context(), game.ID)
+	if err != nil {
+		writeError(writer, http.StatusInternalServerError, err)
+		return
+	}
+	exclusions, err := s.sources.ListExclusions(request.Context(), game.ID)
+	if err != nil {
+		writeError(writer, http.StatusInternalServerError, err)
+		return
+	}
+	policy, err := s.sources.GamePolicy(request.Context(), game.ID)
+	if err != nil {
+		writeError(writer, http.StatusInternalServerError, err)
+		return
+	}
+	writeJSON(writer, http.StatusOK, map[string]any{"game": game, "paths": paths, "registry": registryPaths, "exclusions": exclusions, "policy": policy})
 }
 
 func (s *Server) addGame(writer http.ResponseWriter, request *http.Request) {
@@ -184,7 +262,7 @@ func (s *Server) addGame(writer http.ResponseWriter, request *http.Request) {
 		writeError(writer, http.StatusInternalServerError, err)
 		return
 	}
-	game := core.Game{ID: gameID, DisplayName: input.Name, Store: "custom", Image: input.Image, Enabled: true, LastSeen: &now}
+	game := core.Game{ID: gameID, DisplayName: input.Name, Store: "custom", Image: input.Image, Enabled: true, SyncEnabled: true, LastSeen: &now}
 	if err := s.writer.UpsertGame(request.Context(), game); err != nil {
 		writeError(writer, http.StatusInternalServerError, err)
 		return
@@ -201,7 +279,7 @@ func (s *Server) addGame(writer http.ResponseWriter, request *http.Request) {
 			return
 		}
 	}
-	s.coordinator.ReconcileWatches(request.Context())
+	s.backups.ReconcileWatches(request.Context())
 	writeJSON(writer, http.StatusCreated, game)
 }
 
@@ -218,7 +296,7 @@ func (s *Server) updateGame(writer http.ResponseWriter, request *http.Request) {
 		writeError(writer, http.StatusBadRequest, err)
 		return
 	}
-	s.coordinator.ReconcileWatches(request.Context())
+	s.backups.ReconcileWatches(request.Context())
 	writer.WriteHeader(http.StatusNoContent)
 }
 
@@ -244,8 +322,82 @@ func (s *Server) addPath(writer http.ResponseWriter, request *http.Request) {
 		writeError(writer, http.StatusBadRequest, err)
 		return
 	}
-	s.coordinator.ReconcileWatches(request.Context())
+	s.backups.ReconcileWatches(request.Context())
 	writeJSON(writer, http.StatusCreated, path)
+}
+
+func (s *Server) updatePath(writer http.ResponseWriter, request *http.Request) {
+	var input struct {
+		Enabled bool `json:"enabled"`
+	}
+	if !decodeJSON(writer, request, &input) {
+		return
+	}
+	if err := s.pathWriter.UpdatePath(request.Context(), request.PathValue("id"), request.PathValue("path"), input.Enabled); err != nil {
+		writeError(writer, http.StatusBadRequest, err)
+		return
+	}
+	s.backups.ReconcileWatches(request.Context())
+	writer.WriteHeader(http.StatusNoContent)
+}
+
+func (s *Server) deletePath(writer http.ResponseWriter, request *http.Request) {
+	if err := s.pathWriter.DeletePath(request.Context(), request.PathValue("id"), request.PathValue("path")); err != nil {
+		writeError(writer, http.StatusBadRequest, err)
+		return
+	}
+	s.backups.ReconcileWatches(request.Context())
+	writer.WriteHeader(http.StatusNoContent)
+}
+
+func (s *Server) addExclusion(writer http.ResponseWriter, request *http.Request) {
+	var input struct {
+		Pattern string `json:"pattern"`
+	}
+	if !decodeJSON(writer, request, &input) {
+		return
+	}
+	input.Pattern = strings.TrimSpace(input.Pattern)
+	if input.Pattern == "" {
+		writeError(writer, http.StatusBadRequest, errors.New("exclusion pattern is required"))
+		return
+	}
+	if _, err := doublestar.Match(filepath.ToSlash(input.Pattern), "validation"); err != nil {
+		writeError(writer, http.StatusBadRequest, fmt.Errorf("invalid exclusion glob: %w", err))
+		return
+	}
+	id, err := core.NewID(time.Now().UTC())
+	if err != nil {
+		writeError(writer, http.StatusInternalServerError, err)
+		return
+	}
+	exclusion := core.GameExclusion{ID: id, GameID: request.PathValue("id"), Pattern: input.Pattern}
+	if err := s.pathWriter.AddExclusion(request.Context(), exclusion); err != nil {
+		writeError(writer, http.StatusBadRequest, err)
+		return
+	}
+	writeJSON(writer, http.StatusCreated, exclusion)
+}
+
+func (s *Server) deleteExclusion(writer http.ResponseWriter, request *http.Request) {
+	if err := s.pathWriter.DeleteExclusion(request.Context(), request.PathValue("id"), request.PathValue("exclusion")); err != nil {
+		writeError(writer, http.StatusBadRequest, err)
+		return
+	}
+	writer.WriteHeader(http.StatusNoContent)
+}
+
+func (s *Server) updatePolicy(writer http.ResponseWriter, request *http.Request) {
+	var policy core.BackupPolicy
+	if !decodeJSON(writer, request, &policy) {
+		return
+	}
+	if err := s.pathWriter.UpdateGamePolicy(request.Context(), request.PathValue("id"), policy); err != nil {
+		writeError(writer, http.StatusBadRequest, err)
+		return
+	}
+	s.backups.ReconcileWatches(request.Context())
+	writer.WriteHeader(http.StatusNoContent)
 }
 
 func (s *Server) listSnapshots(writer http.ResponseWriter, request *http.Request) {
@@ -261,7 +413,7 @@ func (s *Server) listSnapshots(writer http.ResponseWriter, request *http.Request
 }
 
 func (s *Server) backup(writer http.ResponseWriter, request *http.Request) {
-	snapshot, err := s.coordinator.Backup(request.Context(), request.PathValue("id"))
+	snapshot, err := s.backups.Backup(request.Context(), request.PathValue("id"))
 	if err != nil {
 		writeError(writer, http.StatusUnprocessableEntity, err)
 		return
@@ -269,8 +421,123 @@ func (s *Server) backup(writer http.ResponseWriter, request *http.Request) {
 	writeJSON(writer, http.StatusCreated, snapshot)
 }
 
+func (s *Server) syncGame(writer http.ResponseWriter, request *http.Request) {
+	if err := s.sync.SyncGame(request.Context(), request.PathValue("id")); err != nil {
+		writeError(writer, http.StatusUnprocessableEntity, err)
+		return
+	}
+	writer.WriteHeader(http.StatusNoContent)
+}
+
+func (s *Server) syncAll(writer http.ResponseWriter, request *http.Request) {
+	if err := s.sync.SyncPending(request.Context()); err != nil {
+		writeError(writer, http.StatusUnprocessableEntity, err)
+		return
+	}
+	writer.WriteHeader(http.StatusNoContent)
+}
+
+func (s *Server) reconcileRemote(writer http.ResponseWriter, request *http.Request) {
+	result, err := s.sync.ReconcileRemote(request.Context())
+	if err != nil {
+		writeError(writer, http.StatusUnprocessableEntity, err)
+		return
+	}
+	writeJSON(writer, http.StatusOK, result)
+}
+
+func (s *Server) deleteSnapshot(writer http.ResponseWriter, request *http.Request) {
+	remoteToo := request.URL.Query().Get("remote") != "false"
+	if err := s.backups.DeleteSnapshot(request.Context(), request.PathValue("id"), request.PathValue("snapshot"), remoteToo); err != nil {
+		writeError(writer, http.StatusUnprocessableEntity, err)
+		return
+	}
+	writer.WriteHeader(http.StatusNoContent)
+}
+
+func (s *Server) discover(writer http.ResponseWriter, request *http.Request) {
+	writeJSON(writer, http.StatusOK, s.discovery.DiscoverNow(request.Context()))
+}
+
+func (s *Server) searchCatalog(writer http.ResponseWriter, request *http.Request) {
+	choices, err := s.discovery.SearchCatalog(request.URL.Query().Get("q"))
+	if err != nil {
+		writeError(writer, http.StatusInternalServerError, err)
+		return
+	}
+	writeJSON(writer, http.StatusOK, choices)
+}
+
+func (s *Server) remapGame(writer http.ResponseWriter, request *http.Request) {
+	var input struct {
+		CatalogID string `json:"catalogId"`
+	}
+	if !decodeJSON(writer, request, &input) {
+		return
+	}
+	if err := s.discovery.RemapGame(request.Context(), request.PathValue("id"), strings.TrimSpace(input.CatalogID)); err != nil {
+		writeError(writer, http.StatusBadRequest, err)
+		return
+	}
+	writer.WriteHeader(http.StatusNoContent)
+}
+
+func (s *Server) selectFolder(writer http.ResponseWriter, request *http.Request) {
+	selected, err := platform.SelectFolder(request.Context())
+	if err != nil {
+		if errors.Is(err, platform.ErrCanceled) {
+			writer.WriteHeader(http.StatusNoContent)
+			return
+		}
+		writeError(writer, http.StatusUnprocessableEntity, err)
+		return
+	}
+	writeJSON(writer, http.StatusOK, map[string]string{"path": selected})
+}
+
+func (s *Server) configureLocal(writer http.ResponseWriter, request *http.Request) {
+	var input config.Local
+	if !decodeJSON(writer, request, &input) {
+		return
+	}
+	input.LocalBackupDir = strings.TrimSpace(input.LocalBackupDir)
+	if err := s.discovery.ConfigureLocal(request.Context(), input); err != nil {
+		writeError(writer, http.StatusBadRequest, err)
+		return
+	}
+	writer.WriteHeader(http.StatusNoContent)
+}
+
+func (s *Server) configureAutostart(writer http.ResponseWriter, request *http.Request) {
+	var input struct {
+		Enabled bool `json:"enabled"`
+	}
+	if !decodeJSON(writer, request, &input) {
+		return
+	}
+	if err := s.settings.ConfigureAutostart(input.Enabled); err != nil {
+		writeError(writer, http.StatusUnprocessableEntity, err)
+		return
+	}
+	writer.WriteHeader(http.StatusNoContent)
+}
+
+func (s *Server) configureRetention(writer http.ResponseWriter, request *http.Request) {
+	var input struct {
+		Keep int `json:"keep"`
+	}
+	if !decodeJSON(writer, request, &input) {
+		return
+	}
+	if err := s.settings.ConfigureRetention(input.Keep); err != nil {
+		writeError(writer, http.StatusBadRequest, err)
+		return
+	}
+	writer.WriteHeader(http.StatusNoContent)
+}
+
 func (s *Server) restore(writer http.ResponseWriter, request *http.Request) {
-	preRestore, err := s.coordinator.Restore(request.Context(), request.PathValue("id"), request.PathValue("snapshot"))
+	preRestore, err := s.backups.Restore(request.Context(), request.PathValue("id"), request.PathValue("snapshot"))
 	if err != nil {
 		writeError(writer, http.StatusUnprocessableEntity, err)
 		return
@@ -296,11 +563,7 @@ func (s *Server) configureR2(writer http.ResponseWriter, request *http.Request) 
 		writeError(writer, http.StatusBadRequest, err)
 		return
 	}
-	response := map[string]any{"connected": true}
-	if err := s.coordinator.SyncPending(ctx); err != nil {
-		response["syncWarning"] = err.Error()
-	}
-	writeJSON(writer, http.StatusOK, response)
+	writeJSON(writer, http.StatusOK, map[string]any{"connected": true})
 }
 
 func (s *Server) eventStream(writer http.ResponseWriter, request *http.Request) {
@@ -442,6 +705,7 @@ func writeJSON(writer http.ResponseWriter, status int, value any) {
 }
 
 func writeError(writer http.ResponseWriter, status int, err error) {
+	slog.Error("HTTP request failed", "status", status, "error", err)
 	writeJSON(writer, status, map[string]string{"error": err.Error()})
 }
 
@@ -466,6 +730,37 @@ func securityHeaders(next http.Handler) http.Handler {
 		writer.Header().Set("Referrer-Policy", "no-referrer")
 		next.ServeHTTP(writer, request)
 	})
+}
+
+func localRequestsOnly(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		if !loopbackHost(request.Host) || !localOrigin(request.Header.Get("Origin")) {
+			http.Error(writer, "SaveKnot only accepts requests from its local UI", http.StatusForbidden)
+			return
+		}
+		next.ServeHTTP(writer, request)
+	})
+}
+
+func localOrigin(origin string) bool {
+	if origin == "" {
+		return true
+	}
+	parsed, err := url.Parse(origin)
+	return err == nil && (parsed.Scheme == "http" || parsed.Scheme == "https") && loopbackHost(parsed.Host)
+}
+
+func loopbackHost(hostPort string) bool {
+	host := hostPort
+	if parsed, _, err := net.SplitHostPort(hostPort); err == nil {
+		host = parsed
+	}
+	host = strings.Trim(host, "[]")
+	if strings.EqualFold(host, "localhost") {
+		return true
+	}
+	ip := net.ParseIP(host)
+	return ip != nil && ip.IsLoopback()
 }
 
 func spaHandler(assets fs.FS) http.Handler {

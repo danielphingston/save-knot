@@ -12,11 +12,16 @@ import (
 const DefaultManifestURL = "https://raw.githubusercontent.com/mtkennerly/ludusavi-manifest/master/data/manifest.yaml"
 
 type Config struct {
-	Listen      string   `json:"listen"`
-	ManifestURL string   `json:"manifestUrl"`
-	SteamRoots  []string `json:"steamRoots,omitempty"`
-	DeviceID    string   `json:"deviceId"`
-	R2          R2       `json:"r2"`
+	Listen         string   `json:"listen"`
+	ManifestURL    string   `json:"manifestUrl"`
+	SteamRoots     []string `json:"steamRoots,omitempty"`
+	EpicManifests  []string `json:"epicManifests,omitempty"`
+	GOGRoots       []string `json:"gogRoots,omitempty"`
+	LocalBackupDir string   `json:"localBackupDir,omitempty"`
+	LaunchAtLogin  bool     `json:"launchAtLogin"`
+	RetentionKeep  int      `json:"retentionKeep"`
+	DeviceID       string   `json:"deviceId"`
+	R2             R2       `json:"r2"`
 }
 
 type R2 struct {
@@ -25,6 +30,13 @@ type R2 struct {
 	Prefix       string `json:"prefix"`
 	AccessKeyID  string `json:"accessKeyId"`
 	CredentialID string `json:"credentialId"`
+}
+
+type Local struct {
+	LocalBackupDir string   `json:"localBackupDir"`
+	SteamRoots     []string `json:"steamRoots"`
+	EpicManifests  []string `json:"epicManifests"`
+	GOGRoots       []string `json:"gogRoots"`
 }
 
 type Paths struct {
@@ -59,7 +71,7 @@ func Load(path string) (Config, error) {
 	//nolint:gosec // path is the application-owned config location chosen during bootstrap.
 	data, err := os.ReadFile(path)
 	if errors.Is(err, os.ErrNotExist) {
-		return Config{Listen: "127.0.0.1:32147", ManifestURL: DefaultManifestURL, R2: R2{Prefix: "saveknot"}}, nil
+		return Config{Listen: "127.0.0.1:32147", ManifestURL: DefaultManifestURL, RetentionKeep: 50, R2: R2{Prefix: "saveknot"}}, nil
 	}
 	if err != nil {
 		return Config{}, fmt.Errorf("read config: %w", err)
@@ -76,6 +88,9 @@ func Load(path string) (Config, error) {
 	}
 	if cfg.R2.Prefix == "" {
 		cfg.R2.Prefix = "saveknot"
+	}
+	if cfg.RetentionKeep == 0 {
+		cfg.RetentionKeep = 50
 	}
 	return cfg, nil
 }

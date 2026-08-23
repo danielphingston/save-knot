@@ -36,10 +36,16 @@ func SteamRoots(configured []string) []string {
 	seen := make(map[string]struct{})
 	var candidates []string
 	candidates = append(candidates, configured...)
+	candidates = append(candidates, platformSteamRoots()...)
 	home, homeErr := os.UserHomeDir()
 	switch runtime.GOOS {
 	case "windows":
-		candidates = append(candidates, `C:\Program Files (x86)\Steam`, `C:\Program Files\Steam`)
+		candidates = append(candidates,
+			filepath.Join(os.Getenv("ProgramFiles(x86)"), "Steam"),
+			filepath.Join(os.Getenv("ProgramFiles"), "Steam"),
+			`C:\Program Files (x86)\Steam`,
+			`C:\Program Files\Steam`,
+		)
 	case "darwin":
 		if homeErr == nil {
 			candidates = append(candidates, filepath.Join(home, "Library/Application Support/Steam"))
@@ -55,6 +61,9 @@ func SteamRoots(configured []string) []string {
 	}
 	var roots []string
 	for _, candidate := range candidates {
+		if strings.TrimSpace(candidate) == "" {
+			continue
+		}
 		candidate = filepath.Clean(candidate)
 		if _, ok := seen[candidate]; ok {
 			continue
@@ -148,43 +157,100 @@ func CatalogGame(installed SteamGame, definition catalog.Definition, now time.Ti
 		Store:       "steam",
 		StoreID:     installed.AppID,
 		InstallPath: base,
+		Image:       fmt.Sprintf("https://shared.cloudflare.steamstatic.com/store_item_assets/steam/apps/%s/library_600x900_2x.jpg", installed.AppID),
 		Enabled:     true,
+		SyncEnabled: true,
 		LastSeen:    &now,
 	}
-	paths, err := resolvePaths(identifier, installed, definition, base)
+	effective, err := mergeSecondaryManifest(definition, base)
+	if err != nil {
+		return core.Game{}, nil, err
+	}
+	paths, err := resolvePaths(identifier, installed, effective, base)
 	if err != nil {
 		return core.Game{}, nil, err
 	}
 	return game, paths, nil
 }
 
+func mergeSecondaryManifest(primary catalog.Definition, base string) (catalog.Definition, error) {
+	secondary, err := catalog.LoadSecondary(filepath.Join(base, ".ludusavi.yaml"))
+	if errors.Is(err, os.ErrNotExist) {
+		return primary, nil
+	}
+	if err != nil {
+		return catalog.Definition{}, err
+	}
+	var addition catalog.Definition
+	if named, ok := secondary.Resolve(primary.Name); ok {
+		addition = named
+	} else if len(secondary.Games) == 1 {
+		for _, only := range secondary.Games {
+			addition = only
+		}
+	} else {
+		return catalog.Definition{}, errors.New("secondary Ludusavi manifest does not identify one game")
+	}
+	files := make(map[string]catalog.FileRule, len(primary.Files)+len(addition.Files))
+	for template, rule := range primary.Files {
+		files[template] = rule
+	}
+	for template, rule := range addition.Files {
+		files[template] = rule
+	}
+	primary.Files = files
+	registryRules := make(map[string]catalog.FileRule, len(primary.Registry)+len(addition.Registry))
+	for key, rule := range primary.Registry {
+		registryRules[key] = rule
+	}
+	for key, rule := range addition.Registry {
+		registryRules[key] = rule
+	}
+	primary.Registry = registryRules
+	return primary, nil
+}
+
 func resolvePaths(gameID string, installed SteamGame, definition catalog.Definition, base string) ([]core.GamePath, error) {
+	return resolveDefinitionPaths(gameID, "steam", installed.Library, installed.InstallDir, installed.AppID, definition, base)
+}
+
+func CatalogInstalledGame(installed InstalledGame, definition catalog.Definition, now time.Time) (core.Game, []core.GamePath, error) {
+	storeID := installed.StoreID
+	if storeID == "" && installed.Store == "gog" {
+		storeID = definition.GOG.ID
+	}
+	identifier := stableID(installed.Store, firstNonEmpty(storeID, definition.Name))
+	game := core.Game{
+		ID: identifier, CatalogID: definition.Name, CatalogName: definition.Name, DisplayName: definition.Name,
+		Store: installed.Store, StoreID: storeID, InstallPath: installed.InstallPath, Enabled: true, SyncEnabled: true, LastSeen: &now,
+	}
+	effective, err := mergeSecondaryManifest(definition, installed.InstallPath)
+	if err != nil {
+		return core.Game{}, nil, err
+	}
+	paths, err := resolveDefinitionPaths(identifier, installed.Store, installed.Root, installed.GameDir, storeID, effective, installed.InstallPath)
+	if err != nil {
+		return core.Game{}, nil, err
+	}
+	return game, paths, nil
+}
+
+func resolveDefinitionPaths(gameID, store, root, gameDir, storeGameID string, definition catalog.Definition, base string) ([]core.GamePath, error) {
 	home, err := os.UserHomeDir()
 	if err != nil {
 		return nil, fmt.Errorf("locate home directory: %w", err)
 	}
-	replacements := map[string]string{
-		"<root>":            installed.Library,
-		"<game>":            installed.InstallDir,
-		"<base>":            base,
-		"<home>":            home,
-		"<storeGameId>":     installed.AppID,
-		"<osUserName>":      filepath.Base(home),
-		"<winAppData>":      os.Getenv("APPDATA"),
-		"<winLocalAppData>": os.Getenv("LOCALAPPDATA"),
-		"<winDocuments>":    filepath.Join(home, "Documents"),
-		"<winPublic>":       os.Getenv("PUBLIC"),
-		"<winProgramData>":  os.Getenv("PROGRAMDATA"),
-		"<winDir>":          os.Getenv("WINDIR"),
-		"<xdgData>":         xdgPath("XDG_DATA_HOME", filepath.Join(home, ".local", "share")),
-		"<xdgConfig>":       xdgPath("XDG_CONFIG_HOME", filepath.Join(home, ".config")),
-	}
+	replacements := userPathReplacements(home)
+	replacements["<root>"] = root
+	replacements["<game>"] = gameDir
+	replacements["<base>"] = base
+	replacements["<storeGameId>"] = storeGameID
 	var paths []core.GamePath
 	for template, rule := range definition.Files {
-		if !ruleApplies(rule, "steam") {
+		if !ruleApplies(rule, store) {
 			continue
 		}
-		resolved := filepath.FromSlash(template)
+		resolved := filepath.FromSlash(strings.ReplaceAll(template, "<storeUserId>", "*"))
 		for placeholder, value := range replacements {
 			if value != "" {
 				resolved = strings.ReplaceAll(resolved, placeholder, value)
@@ -206,6 +272,36 @@ func resolvePaths(gameID string, installed SteamGame, definition catalog.Definit
 				Template: template, Resolved: filepath.Clean(match), Enabled: true,
 			})
 		}
+	}
+	return paths, nil
+}
+
+func firstNonEmpty(values ...string) string {
+	for _, value := range values {
+		if value != "" {
+			return value
+		}
+	}
+	return ""
+}
+
+func RegistryPaths(gameID, store, storeID, base string, definition catalog.Definition) ([]core.RegistryPath, error) {
+	effective, err := mergeSecondaryManifest(definition, base)
+	if err != nil {
+		return nil, err
+	}
+	var paths []core.RegistryPath
+	for key, rule := range effective.Registry {
+		if !ruleApplies(rule, store) {
+			continue
+		}
+		resolved := strings.ReplaceAll(key, "<storeGameId>", storeID)
+		if strings.Contains(resolved, "<") {
+			continue
+		}
+		paths = append(paths, core.RegistryPath{
+			ID: stableID(gameID, "registry", key), GameID: gameID, Source: "catalog", Path: resolved, Enabled: true,
+		})
 	}
 	return paths, nil
 }

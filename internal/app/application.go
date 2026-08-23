@@ -39,6 +39,12 @@ func Build(ctx context.Context, dataDir, listenOverride string) (*Application, e
 	if listenOverride != "" {
 		cfg.Listen = listenOverride
 	}
+	if cfg.LocalBackupDir == "" {
+		cfg.LocalBackupDir = paths.Blobs
+	}
+	if err := os.MkdirAll(cfg.LocalBackupDir, 0o700); err != nil {
+		return nil, fmt.Errorf("create local backup directory %q: %w", cfg.LocalBackupDir, err)
+	}
 	settingsManager, err := settings.New(paths.Config, cfg, secrets.Keyring{})
 	if err != nil {
 		return nil, err
@@ -53,10 +59,11 @@ func Build(ctx context.Context, dataDir, listenOverride string) (*Application, e
 		return nil, errors.Join(err, closeErr)
 	}
 	eventBus := events.New()
-	snapshotService := snapshot.New(repository, paths.Blobs, settingsManager.Config().DeviceID)
+	snapshotService := snapshot.New(repository, repository, cfg.LocalBackupDir, settingsManager.Config().DeviceID)
 	syncer := remote.NewSyncer(repository)
-	coordinator := NewCoordinator(repository, repository, snapshotService, syncer, settingsManager, paths, eventBus, watchManager)
-	server, err := api.New(settingsManager.Config().Listen, repository, repository, coordinator, settingsManager, eventBus, filepath.Join(paths.Root, "artwork"))
+	reconciler := remote.NewReconciler(repository)
+	coordinator := NewCoordinator(repository, repository, repository, snapshotService, syncer, reconciler, settingsManager, paths, eventBus, watchManager)
+	server, err := api.New(settingsManager.Config().Listen, repository, repository, repository, repository, coordinator, coordinator, coordinator, settingsManager, eventBus, filepath.Join(paths.Root, "artwork"))
 	if err != nil {
 		return nil, errors.Join(err, watchManager.Close(), repository.Close())
 	}

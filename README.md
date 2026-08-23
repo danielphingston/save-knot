@@ -1,25 +1,30 @@
 # SaveKnot
 
-SaveKnot is a tiny, local-first game-save daemon. It discovers Steam games through the [Ludusavi manifest](https://github.com/mtkennerly/ludusavi-manifest), watches their save locations, creates immutable content-addressed snapshots, and sends them directly to your own Cloudflare R2 bucket.
+SaveKnot is a tiny, local-first game-save daemon. It uses the [Ludusavi manifest](https://github.com/mtkennerly/ludusavi-manifest) to discover game saves, watches their locations, creates immutable content-addressed snapshots, and sends them directly to your own Cloudflare R2 bucket.
 
 There is no SaveKnot account, hosted backend, central database, analytics service, or remote control plane.
 
 ## What works
 
 - Ludusavi manifest download with ETag caching and validation before activation
-- Steam library and installed-game discovery
+- Steam discovery from Windows registry entries, standard roots, and `libraryfolders.vdf`
+- Epic launcher manifest discovery, GOG root discovery, and a bounded deep scan for existing local saves
+- Ludusavi aliases, extra store IDs, secondary `.ludusavi.yaml` manifests, registry rules, placeholders, constraints, and globs
 - Manual games and arbitrary absolute save paths
-- Filesystem notifications with a three-second debounce and a maximum delay
+- Filesystem notifications with configurable quiet debounce, minimum snapshot gap, and maximum dirty duration
 - Stable-read checks to avoid half-written game saves
 - SHA-256 content addressing and zstd compression
 - Immutable local snapshot history in SQLite
 - Direct, bucket-scoped R2 uploads; blobs publish before snapshot manifests
-- Conservative restores with a pre-restore snapshot and hash verification
-- Custom titles, notes, enable/disable state, extra save locations, and uploaded artwork
-- Embedded localhost UI and server-sent activity events
+- Startup/manual R2 history reconciliation with lazy, integrity-checked blob downloads
+- Separate local backup, remote sync, restore, and local/remote delete actions
+- Conservative restores with a pre-restore snapshot and SHA-256 verification
+- Recursive Windows registry backup and restore
+- Custom titles, notes, catalog remapping, pictures, save locations, file exclusions, and per-game backup policy
+- Configurable local backup location, per-game retention, and per-user launch at login
+- Embedded localhost UI, native folder picker, discovery diagnostics, and server-sent activity events
+- Persistent rotating logs at `<data directory>/logs/saveknot.log`
 - OS credential-vault storage for the R2 secret access key
-
-Windows registry saves and non-Steam store discovery are intentionally not claimed as supported yet. Catalog entries containing registry data are retained by the parser, but this release only snapshots files.
 
 ## Run it
 
@@ -43,7 +48,22 @@ make build-windows
 
 The executable is written to `dist/saveknot-windows-amd64.exe`.
 
+The Windows release is linked as a GUI/background executable, so it does not leave a console window open. Run it, then open <http://127.0.0.1:32147>. For troubleshooting, inspect `%APPDATA%\SaveKnot\logs\saveknot.log`; use `-log-level debug` from PowerShell for more detail.
+
 SaveKnot deliberately rejects non-loopback listen addresses.
+
+## If your game list is empty
+
+Open **Settings → Discovery diagnostics**, then select **Scan now**. The panel separates the stages so an empty list is actionable:
+
+- **Catalog** confirms that the Ludusavi manifest downloaded and shows the parsed game count.
+- **Steam roots** shows every detected/configured Steam installation.
+- **Installed** counts launcher manifests found for Steam, Epic, and GOG.
+- **Matched in Ludusavi** shows how many launcher entries mapped to catalog definitions.
+- **Found from local save data** reports the bounded deep scan for saves from games not found through a launcher.
+- **Unmatched** names and persistent logs explain remaining misses; add a non-standard launcher root or create a manual game when necessary.
+
+Ludusavi is the save-definition catalog, not a rich store-metadata API. SaveKnot consumes its canonical title, aliases, store IDs, installation aliases, file/registry rules, constraints, and path placeholders. Steam cover art is derived separately from a matched Steam app ID; custom pictures always override it. Ludusavi does not supply descriptions or cover images.
 
 ## Connect R2
 
@@ -51,7 +71,7 @@ SaveKnot deliberately rejects non-loopback listen addresses.
 2. Create an S3 API token with **Object Read & Write** access scoped to that bucket.
 3. Open **Settings** in SaveKnot.
 4. Enter the account ID, bucket, access key ID, secret access key, and optional object prefix.
-5. Select **Test & connect**. Settings are only committed after `HeadBucket` succeeds.
+5. Select **Test & connect**. Settings are only committed after SaveKnot verifies bucket access plus list, put, get, and delete using a temporary capability object.
 
 The secret is stored with Windows Credential Manager, macOS Keychain, or the Linux Secret Service through the OS keyring. Non-secret connection metadata lives in `config.json` with user-only permissions.
 
@@ -65,13 +85,15 @@ R2 objects use this layout:
 
 Blobs are immutable by their SHA-256 name. A snapshot becomes visible remotely only after all of its blobs have uploaded successfully.
 
+`ListObjectsV2` is not used by the watcher or periodic five-minute discovery loop. The connection test makes one `MaxKeys=1` capability-list request under its temporary probe prefix. SaveKnot lists snapshot manifests only at startup when R2 is configured or when you explicitly select **Refresh from R2**. Already-known immutable snapshot IDs are not downloaded again. Blob uploads use the local SQLite hash index during normal operation.
+
 ## Architecture
 
 SaveKnot borrows Cordis's strongest architectural idea: runtime capabilities have explicit owners and lifetimes. It does not reproduce Cordis's dynamic context, proxy, or service-location machinery.
 
 ```text
 Application lifecycle
-├── catalog + Steam discovery coordinator
+├── catalog + store/local-save discovery coordinator
 ├── filesystem watcher
 ├── snapshot and restore service
 ├── R2 sync service
@@ -86,7 +108,7 @@ The database is local operational state. The immutable objects in R2 are the dur
 
 ## Quality gate
 
-Install `golangci-lint` v2.12 or newer, then run:
+Run the complete pinned quality gate (the first run downloads the linter into Go's module cache):
 
 ```sh
 make check
@@ -103,12 +125,13 @@ Dependencies are intentionally narrow and each owns a boundary the standard libr
 - doublestar: Ludusavi-compatible recursive glob expansion
 - klauspost/compress: zstd blob encoding
 - go-keyring: native operating-system credential storage
+- x/sys: Windows registry discovery, backup/restore, and per-user startup integration
 
-## Current scope and tradeoffs
+## Scope and tradeoffs
 
 - The embedded UI uses plain HTML, CSS, and JavaScript. This keeps the release to one Go build and avoids a Node production toolchain; a framework can be introduced when UI complexity justifies it.
-- Discovery is Steam-first to avoid expanding glob trees for every catalog entry. Manual games cover unsupported stores today.
+- Discovery checks store manifests first. The deeper catalog scan is bounded and only evaluates user-anchored rules whose literal parent directory exists; install-root rules are not expanded blindly across the full catalog.
 - Snapshot manifests reference logical source keys, not absolute catalog paths. A restore requires the corresponding save location to be configured on that device.
-- Automatic launch-at-login packaging is operating-system-specific and is not installed implicitly by `go run`; release installers should add a per-user startup entry.
+- R2 reconciliation intentionally lists snapshot manifests only at startup/manual boundaries. This minimizes Class A operations while still allowing a fresh device to recover remote history.
 
 See [`IDEA.MD`](IDEA.MD) for the complete product direction.

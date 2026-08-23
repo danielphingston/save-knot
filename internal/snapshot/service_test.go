@@ -39,17 +39,17 @@ func TestCreateDeduplicatesAndRestorePreservesCurrentState(t *testing.T) {
 	if err := store.AddPath(ctx, core.GamePath{ID: "path-a", GameID: game.ID, Source: "custom", Template: saveDirectory, Resolved: saveDirectory, Enabled: true}); err != nil {
 		t.Fatal(err)
 	}
-	service := New(store, filepath.Join(root, "blobs"), "device-a")
+	service := New(store, store, filepath.Join(root, "blobs"), "device-a")
 	first, err := service.Create(ctx, game)
 	if err != nil {
 		t.Fatal(err)
 	}
-	second, err := service.Create(ctx, game)
-	if err != nil {
-		t.Fatal(err)
+	if _, err := service.Create(ctx, game); !errors.Is(err, ErrUnchanged) {
+		t.Fatalf("identical content created a redundant snapshot: %v", err)
 	}
-	if first.Files[0].Hash != second.Files[0].Hash || first.StoredSize != second.StoredSize {
-		t.Fatal("identical content was not deduplicated")
+	game.Notes = "portable metadata changed"
+	if _, err := service.Create(ctx, game); err != nil {
+		t.Fatalf("metadata-only change did not create a portable snapshot: %v", err)
 	}
 	if err := os.WriteFile(savePath, []byte("later version"), 0o600); err != nil {
 		t.Fatal(err)
@@ -91,7 +91,7 @@ func TestCreateReturnsNoFilesForMissingPath(t *testing.T) {
 	if err := store.AddPath(ctx, core.GamePath{ID: "path-a", GameID: game.ID, Source: "custom", Template: missing, Resolved: missing, Enabled: true}); err != nil {
 		t.Fatal(err)
 	}
-	_, err = New(store, filepath.Join(root, "blobs"), "device-a").Create(ctx, game)
+	_, err = New(store, store, filepath.Join(root, "blobs"), "device-a").Create(ctx, game)
 	if !errors.Is(err, ErrNoFiles) {
 		t.Fatalf("expected ErrNoFiles, got %v", err)
 	}

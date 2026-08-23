@@ -10,6 +10,7 @@ import (
 type Bus struct {
 	mu          sync.RWMutex
 	subscribers map[chan core.Event]struct{}
+	history     []core.Event
 }
 
 func New() *Bus {
@@ -20,8 +21,12 @@ func (b *Bus) Publish(event core.Event) {
 	if event.Timestamp.IsZero() {
 		event.Timestamp = time.Now().UTC()
 	}
-	b.mu.RLock()
-	defer b.mu.RUnlock()
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.history = append(b.history, event)
+	if len(b.history) > 200 {
+		b.history = append([]core.Event(nil), b.history[len(b.history)-200:]...)
+	}
 	for subscriber := range b.subscribers {
 		select {
 		case subscriber <- event:
@@ -31,8 +36,14 @@ func (b *Bus) Publish(event core.Event) {
 }
 
 func (b *Bus) Subscribe(size int) (<-chan core.Event, func()) {
-	channel := make(chan core.Event, size)
 	b.mu.Lock()
+	if size < len(b.history) {
+		size = len(b.history)
+	}
+	channel := make(chan core.Event, size)
+	for _, event := range b.history {
+		channel <- event
+	}
 	b.subscribers[channel] = struct{}{}
 	b.mu.Unlock()
 	return channel, func() {

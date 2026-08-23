@@ -3,6 +3,7 @@ package snapshot
 import (
 	"context"
 	"crypto/sha256"
+	"database/sql"
 	"encoding/hex"
 	"errors"
 	"fmt"
@@ -12,14 +13,18 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 
+	"github.com/bmatcuk/doublestar/v4"
 	"github.com/klauspost/compress/zstd"
 	"github.com/saveknot/saveknot/internal/core"
+	"github.com/saveknot/saveknot/internal/registrybackup"
 )
 
 var (
 	ErrNoFiles     = errors.New("no save files found")
+	ErrUnchanged   = errors.New("save data is unchanged since the latest snapshot")
 	errFileChanged = errors.New("save file changed while it was being read")
 )
 
@@ -31,15 +36,39 @@ type repository interface {
 	Snapshot(context.Context, string) (core.Snapshot, error)
 }
 
+type sourceRepository interface {
+	GameRegistry(context.Context, string) ([]core.RegistryPath, error)
+	ListExclusions(context.Context, string) ([]core.GameExclusion, error)
+	LatestSnapshot(context.Context, string) (core.Snapshot, error)
+}
+
 type Service struct {
 	repository repository
+	sources    sourceRepository
+	blobRootMu sync.RWMutex
 	blobRoot   string
 	deviceID   string
 	now        func() time.Time
 }
 
-func New(repository repository, blobRoot, deviceID string) *Service {
-	return &Service{repository: repository, blobRoot: blobRoot, deviceID: deviceID, now: time.Now}
+func (s *Service) SetBlobRoot(root string) {
+	s.blobRootMu.Lock()
+	s.blobRoot = root
+	s.blobRootMu.Unlock()
+}
+
+func (s *Service) currentBlobRoot() string {
+	s.blobRootMu.RLock()
+	defer s.blobRootMu.RUnlock()
+	return s.blobRoot
+}
+
+func (s *Service) BlobRoot() string {
+	return s.currentBlobRoot()
+}
+
+func New(repository repository, sources sourceRepository, blobRoot, deviceID string) *Service {
+	return &Service{repository: repository, sources: sources, blobRoot: blobRoot, deviceID: deviceID, now: time.Now}
 }
 
 func (s *Service) Create(ctx context.Context, game core.Game) (core.Snapshot, error) {
@@ -55,21 +84,36 @@ func (s *Service) Create(ctx context.Context, game core.Game) (core.Snapshot, er
 	snapshot := core.Snapshot{
 		Version: 1, ID: id, GameID: game.ID, GameName: game.DisplayName,
 		DeviceID: s.deviceID, CreatedAt: created, RemoteState: "local",
+		Metadata: core.PortableGameMetadata{DisplayName: game.DisplayName, Notes: game.Notes, Image: portableImage(game.Image)},
 	}
 	storedBlobs := make(map[string]int64)
+	exclusions, err := s.sources.ListExclusions(ctx, game.ID)
+	if err != nil {
+		return core.Snapshot{}, err
+	}
 	for _, path := range paths {
 		if !path.Enabled {
 			continue
 		}
-		if err := s.addPath(ctx, path, &snapshot, storedBlobs); err != nil {
+		if err := s.addPath(ctx, path, exclusions, &snapshot, storedBlobs); err != nil {
 			return core.Snapshot{}, err
 		}
 	}
-	if len(snapshot.Files) == 0 {
+	if err := s.addRegistry(ctx, game.ID, &snapshot, storedBlobs); err != nil {
+		return core.Snapshot{}, err
+	}
+	if len(snapshot.Files) == 0 && snapshot.Registry == nil {
 		return core.Snapshot{}, ErrNoFiles
 	}
 	for _, size := range storedBlobs {
 		snapshot.StoredSize += size
+	}
+	latest, err := s.sources.LatestSnapshot(ctx, game.ID)
+	if err == nil && sameContents(latest, snapshot) {
+		return core.Snapshot{}, ErrUnchanged
+	}
+	if err != nil && !errors.Is(err, sql.ErrNoRows) {
+		return core.Snapshot{}, err
 	}
 	if err := s.repository.SaveSnapshot(ctx, snapshot); err != nil {
 		return core.Snapshot{}, err
@@ -77,7 +121,87 @@ func (s *Service) Create(ctx context.Context, game core.Game) (core.Snapshot, er
 	return snapshot, nil
 }
 
-func (s *Service) addPath(ctx context.Context, path core.GamePath, snapshot *core.Snapshot, storedBlobs map[string]int64) error {
+func portableImage(image string) string {
+	if strings.HasPrefix(image, "https://") {
+		return image
+	}
+	return ""
+}
+
+func sameContents(left, right core.Snapshot) bool {
+	if left.Metadata != right.Metadata {
+		return false
+	}
+	if len(left.Files) != len(right.Files) || (left.Registry == nil) != (right.Registry == nil) {
+		return false
+	}
+	files := make(map[string]string, len(left.Files))
+	for _, file := range left.Files {
+		files[file.SourceKey+"\x00"+file.Path] = file.Hash
+	}
+	for _, file := range right.Files {
+		if files[file.SourceKey+"\x00"+file.Path] != file.Hash {
+			return false
+		}
+	}
+	return left.Registry == nil || left.Registry.Hash == right.Registry.Hash
+}
+
+func (s *Service) addRegistry(ctx context.Context, gameID string, snapshot *core.Snapshot, storedBlobs map[string]int64) error {
+	rules, err := s.sources.GameRegistry(ctx, gameID)
+	if err != nil {
+		return err
+	}
+	keys := make([]string, 0, len(rules))
+	for _, rule := range rules {
+		if rule.Enabled {
+			keys = append(keys, rule.Path)
+		}
+	}
+	if len(keys) == 0 {
+		return nil
+	}
+	data, err := (registrybackup.Service{}).Backup(ctx, keys)
+	if errors.Is(err, registrybackup.ErrUnsupported) {
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("back up Windows registry: %w", err)
+	}
+	stored, err := s.storeData(data)
+	if err != nil {
+		return err
+	}
+	if err := s.repository.SaveBlob(ctx, stored.hash, stored.path, stored.originalSize, stored.storedSize); err != nil {
+		return err
+	}
+	snapshot.Registry = &core.SnapshotRegistry{Keys: keys, Hash: stored.hash, Size: stored.originalSize}
+	snapshot.OriginalSize += stored.originalSize
+	storedBlobs[stored.hash] = stored.storedSize
+	return nil
+}
+
+func (s *Service) storeData(data []byte) (blob, error) {
+	staging := filepath.Join(s.currentBlobRoot(), ".staging")
+	if err := os.MkdirAll(staging, 0o700); err != nil {
+		return blob{}, fmt.Errorf("create registry staging directory: %w", err)
+	}
+	temporary, err := os.CreateTemp(staging, "registry-*.json")
+	if err != nil {
+		return blob{}, fmt.Errorf("create registry staging file: %w", err)
+	}
+	path := temporary.Name()
+	if _, err := temporary.Write(data); err != nil {
+		return blob{}, errors.Join(fmt.Errorf("write registry staging file: %w", err), temporary.Close(), removeTemporary(path))
+	}
+	if err := temporary.Close(); err != nil {
+		return blob{}, errors.Join(fmt.Errorf("close registry staging file: %w", err), removeTemporary(path))
+	}
+	stored, storeErr := s.storeFile(path)
+	return stored, errors.Join(storeErr, removeTemporary(path))
+}
+
+func (s *Service) addPath(ctx context.Context, path core.GamePath, exclusions []core.GameExclusion, snapshot *core.Snapshot, storedBlobs map[string]int64) error {
 	files, err := filesAt(path.Resolved)
 	if errors.Is(err, os.ErrNotExist) {
 		return nil
@@ -88,6 +212,9 @@ func (s *Service) addPath(ctx context.Context, path core.GamePath, snapshot *cor
 	for _, file := range files {
 		if err := ctx.Err(); err != nil {
 			return err
+		}
+		if excluded(file, exclusions) {
+			continue
 		}
 		stored, err := s.storeStableFile(ctx, file.absolute)
 		if err != nil {
@@ -104,6 +231,21 @@ func (s *Service) addPath(ctx context.Context, path core.GamePath, snapshot *cor
 		storedBlobs[stored.hash] = stored.storedSize
 	}
 	return nil
+}
+
+func excluded(file scannedFile, exclusions []core.GameExclusion) bool {
+	relative := filepath.ToSlash(file.relative)
+	absolute := filepath.ToSlash(file.absolute)
+	for _, exclusion := range exclusions {
+		pattern := filepath.ToSlash(exclusion.Pattern)
+		if matched, err := doublestar.Match(pattern, relative); err == nil && matched {
+			return true
+		}
+		if matched, err := doublestar.Match(pattern, absolute); err == nil && matched {
+			return true
+		}
+	}
+	return false
 }
 
 func (s *Service) storeStableFile(ctx context.Context, path string) (blob, error) {
@@ -174,14 +316,15 @@ type blob struct {
 }
 
 func (s *Service) storeFile(path string) (result blob, err error) {
+	blobRoot := s.currentBlobRoot()
 	before, err := os.Stat(path)
 	if err != nil {
 		return blob{}, err
 	}
-	if err := os.MkdirAll(filepath.Join(s.blobRoot, ".staging"), 0o700); err != nil {
+	if err := os.MkdirAll(filepath.Join(blobRoot, ".staging"), 0o700); err != nil {
 		return blob{}, fmt.Errorf("create blob staging directory: %w", err)
 	}
-	temporary, err := os.CreateTemp(filepath.Join(s.blobRoot, ".staging"), "blob-*.zst")
+	temporary, err := os.CreateTemp(filepath.Join(blobRoot, ".staging"), "blob-*.zst")
 	if err != nil {
 		return blob{}, fmt.Errorf("create staged blob: %w", err)
 	}
@@ -215,7 +358,7 @@ func (s *Service) storeFile(path string) (result blob, err error) {
 		return blob{}, errFileChanged
 	}
 	hashValue := hex.EncodeToString(digest.Sum(nil))
-	directory := filepath.Join(s.blobRoot, hashValue[:2])
+	directory := filepath.Join(blobRoot, hashValue[:2])
 	if err := os.MkdirAll(directory, 0o700); err != nil {
 		return blob{}, fmt.Errorf("create blob directory: %w", err)
 	}
@@ -254,7 +397,7 @@ func (s *Service) Restore(ctx context.Context, game core.Game, snapshotID string
 		return core.Snapshot{}, errors.New("snapshot does not belong to this game")
 	}
 	preRestore, err := s.Create(ctx, game)
-	if err != nil && !errors.Is(err, ErrNoFiles) {
+	if err != nil && !errors.Is(err, ErrNoFiles) && !errors.Is(err, ErrUnchanged) {
 		return core.Snapshot{}, fmt.Errorf("create pre-restore snapshot: %w", err)
 	}
 	paths, err := s.repository.GamePaths(ctx, game.ID)
@@ -275,15 +418,76 @@ func (s *Service) Restore(ctx context.Context, game core.Game, snapshotID string
 		if !ok {
 			return core.Snapshot{}, fmt.Errorf("save location for %q is not configured on this device", file.Path)
 		}
-		destination := filepath.Join(source.Resolved, filepath.FromSlash(file.Path))
-		if file.RootFile {
-			destination = source.Resolved
+		destination, err := restoreDestination(source, file)
+		if err != nil {
+			return core.Snapshot{}, err
 		}
 		if err := s.restoreFile(ctx, destination, file); err != nil {
 			return core.Snapshot{}, err
 		}
 	}
+	if target.Registry != nil {
+		if err := s.restoreRegistry(ctx, target.Registry); err != nil {
+			return core.Snapshot{}, err
+		}
+	}
 	return preRestore, nil
+}
+
+func (s *Service) restoreRegistry(ctx context.Context, registrySnapshot *core.SnapshotRegistry) error {
+	blobPath, err := s.repository.BlobPath(ctx, registrySnapshot.Hash)
+	if err != nil {
+		return err
+	}
+	data, err := readCompressedBlob(blobPath, registrySnapshot.Hash, registrySnapshot.Size)
+	if err != nil {
+		return err
+	}
+	if err := (registrybackup.Service{}).Restore(ctx, data); err != nil {
+		return fmt.Errorf("restore Windows registry: %w", err)
+	}
+	return nil
+}
+
+func readCompressedBlob(path, expectedHash string, size int64) ([]byte, error) {
+	//nolint:gosec // The path is retrieved from SaveKnot's private blob index.
+	input, err := os.Open(path)
+	if err != nil {
+		return nil, err
+	}
+	decoder, err := zstd.NewReader(input)
+	if err != nil {
+		return nil, errors.Join(err, input.Close())
+	}
+	data, readErr := io.ReadAll(io.LimitReader(decoder, size+1))
+	decoder.Close()
+	if err := errors.Join(readErr, input.Close()); err != nil {
+		return nil, err
+	}
+	if int64(len(data)) != size {
+		return nil, errors.New("registry blob size did not match the snapshot")
+	}
+	digest := sha256.Sum256(data)
+	if !strings.EqualFold(hex.EncodeToString(digest[:]), expectedHash) {
+		return nil, errors.New("registry blob failed SHA-256 verification")
+	}
+	return data, nil
+}
+
+func restoreDestination(source core.GamePath, file core.SnapshotFile) (string, error) {
+	if file.RootFile {
+		return source.Resolved, nil
+	}
+	relative := filepath.Clean(filepath.FromSlash(file.Path))
+	if relative == "." || filepath.IsAbs(relative) || relative == ".." || strings.HasPrefix(relative, ".."+string(filepath.Separator)) {
+		return "", fmt.Errorf("snapshot file path %q escapes its configured save location", file.Path)
+	}
+	destination := filepath.Join(source.Resolved, relative)
+	contained, err := filepath.Rel(source.Resolved, destination)
+	if err != nil || contained == ".." || strings.HasPrefix(contained, ".."+string(filepath.Separator)) {
+		return "", fmt.Errorf("snapshot file path %q escapes its configured save location", file.Path)
+	}
+	return destination, nil
 }
 
 func (s *Service) restoreFile(ctx context.Context, destination string, file core.SnapshotFile) error {

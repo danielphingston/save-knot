@@ -33,6 +33,29 @@ func TestParseIndexesSteamGames(t *testing.T) {
 	}
 }
 
+func TestParseResolvesAliasesAndExtraSteamIDs(t *testing.T) {
+	t.Parallel()
+	manifest, err := Parse([]byte(`Canonical:
+  files:
+    "<home>/Canonical": {}
+  id:
+    steamExtra: [42]
+Alias:
+  alias: Canonical
+  steam:
+    id: 99
+`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, id := range []string{"42", "99"} {
+		game, ok := manifest.SteamGame(id)
+		if !ok || game.Name != "Canonical" {
+			t.Fatalf("ID %s did not resolve to the canonical definition: %#v", id, game)
+		}
+	}
+}
+
 func TestFetcherUsesETagAndKeepsValidatedCache(t *testing.T) {
 	t.Parallel()
 	requests := 0
