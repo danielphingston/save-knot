@@ -3,7 +3,7 @@ name: product-dogfood
 description: >
   Dogfood a running application as a real user, identify missing product
   capabilities, incomplete CRUD/lifecycle actions, missing bulk operations,
-  recovery gaps, inconsistencies, and UX friction. Use Playwright to operate
+  recovery gaps, inconsistencies, and UX friction. Use agent-browser to operate
   the product before inspecting its implementation. When Codex Luna subagents
   are available, use them for bounded independent audit lanes and source
   classification. Then consolidate findings as UI gaps, backend gaps, product
@@ -37,22 +37,21 @@ not just broken buttons or cosmetic problems.
 ---
 
 
-# Mandatory Requirement: Playwright
+# Mandatory Requirement: agent-browser
 
-This skill requires Playwright-based browser automation.
+This skill requires the `agent-browser` CLI for browser automation.
 
-Before beginning any audit, verify that Playwright is available and that it can
-actually open and interact with the target application.
+Do not substitute another browser automation system for the product-exploration
+passes. The purpose of this requirement is to ensure the agent can actually use
+the running application as a user rather than infer behavior from source code.
 
-Acceptable Playwright access includes:
+Before beginning any audit, verify that `agent-browser` is installed, its
+browser runtime is usable, and it can actually open and interact with the target
+application.
 
-- a configured Playwright MCP server
-- a Playwright browser automation tool exposed by the agent environment
-- a project-local Playwright installation that the agent can execute and use to
-  drive the application
-
-Merely finding Playwright in `package.json` is not sufficient. The agent must
-confirm that browser automation is usable.
+Merely finding `agent-browser` in a package manifest, skill directory, shell
+history, or documentation is not sufficient. The agent must prove that the CLI
+works in the current environment.
 
 ## Required Preflight
 
@@ -60,13 +59,21 @@ Before reading application source code or starting the product audit:
 
 1. Determine the application's URL or start the application using only the
    minimum setup information necessary.
-2. Verify that Playwright browser automation is available.
-3. Use Playwright to open the application.
-4. Confirm that Playwright can inspect the rendered page and perform at least
-   one harmless interaction or navigation where appropriate.
-5. Only after this succeeds may the audit continue.
+2. Verify that `agent-browser` is executable, for example with
+   `agent-browser --help`.
+3. Use `agent-browser` to open the actual application URL.
+4. Use `agent-browser snapshot -i` (or the installed equivalent) to confirm the
+   rendered UI can be inspected.
+5. Perform at least one harmless user-level interaction or navigation through
+   `agent-browser` when appropriate.
+6. Re-snapshot or otherwise inspect the resulting UI state through
+   `agent-browser`.
+7. Only after this succeeds may the audit continue.
 
-## If Playwright Is Missing or Unusable
+The preflight must prove real browser control. A successful process exit alone
+is not enough.
+
+## If agent-browser Is Missing or Unusable
 
 STOP the audit immediately.
 
@@ -75,31 +82,38 @@ Do not:
 - inspect the application source code
 - infer the product from routes, components, APIs, tests, or schemas
 - perform a static-only UX/product review
-- substitute `curl`, raw HTTP requests, screenshots, DOM dumps, or another
-  browser automation system
+- substitute `curl`, raw HTTP requests, screenshots, DOM dumps, Playwright MCP,
+  Chrome DevTools MCP, Selenium, Puppeteer, or another browser automation system
 - produce a partial product-dogfood report
 - claim that the application was dogfooded
 
-Tell the user clearly that this skill requires Playwright and that Playwright
-could not be used.
+Tell the user clearly which prerequisite failed.
 
-Ask the user to install or configure Playwright, then rerun the skill.
+If the `agent-browser` command is missing, ask the user to install it. A suitable
+response is:
 
-A suitable response is:
+> Product dogfooding requires `agent-browser`, and it is not available in the
+> current environment. Please install it and its browser runtime, then rerun the
+> audit. A typical setup is `npm install -g agent-browser` followed by
+> `agent-browser install`.
 
-> Product dogfooding requires Playwright browser automation, and I cannot use
-> Playwright in the current environment. Please install or configure Playwright
-> (or a Playwright MCP server) and rerun the audit.
+If `agent-browser` exists but its browser runtime is missing, ask the user to
+run:
 
-Do not install Playwright automatically unless the user explicitly asks you to
-do so.
+```bash
+agent-browser install
+```
 
-If Playwright exists but cannot launch, connect to the application, or operate
-the page, stop and report the specific blocker instead of falling back to a
-different audit method.
+If `agent-browser` exists but cannot launch, connect to the application, take an
+interactive snapshot, or operate the page, stop and report that specific
+blocker.
+
+Do not install `agent-browser` or its browser runtime automatically unless the
+user explicitly asks you to do so.
+
+Do not fall back to another audit method.
 
 ---
-
 
 # Luna Subagents
 
@@ -110,7 +124,7 @@ Luna is an execution/review helper, not the audit controller.
 
 The primary agent owns:
 
-- Playwright preflight
+- `agent-browser` preflight
 - audit scope
 - task decomposition
 - final prioritization
@@ -123,14 +137,14 @@ Do not hand the entire audit to one subagent.
 
 ## Luna Availability Preflight
 
-After the mandatory Playwright preflight succeeds:
+After the mandatory `agent-browser` preflight succeeds:
 
 1. Determine whether native Codex subagents are available.
 2. Determine whether a Luna-capable subagent can be selected.
-3. Determine whether Playwright tools are exposed to that subagent.
+3. Determine whether that subagent can execute `agent-browser` from its shell.
 4. Do not guess model/tool availability from configuration files alone.
 5. Only assign browser dogfooding work to a Luna subagent if that subagent can
-   actually use Playwright.
+   actually execute `agent-browser` and control the running application.
 
 Luna is optional.
 
@@ -138,11 +152,11 @@ If Luna is unavailable, continue the audit in the primary agent.
 
 Do not stop the audit merely because Luna is unavailable.
 
-Playwright remains mandatory.
+`agent-browser` remains mandatory.
 
 ## Preferred Parallel Audit Lanes
 
-When Luna subagents can use Playwright, prefer 2-4 independent bounded lanes
+When Luna subagents can use `agent-browser`, prefer 2-4 independent bounded lanes
 rather than one large delegated task.
 
 Good lanes include:
@@ -207,14 +221,15 @@ each other.
 
 When possible:
 
-- give each browser subagent an isolated Playwright browser context/session
+- give each browser subagent a separate `agent-browser` session when supported
 - give each subagent an independent seeded scenario or resettable fixture
 - avoid concurrent destructive actions against the same test data
 - avoid concurrent writes to the same local application state
 - assign read-only/exploratory lanes when environment isolation is uncertain
 
-If isolated browser state cannot be guaranteed, run browser lanes sequentially
-or keep browser operation in the primary agent.
+If independent `agent-browser` sessions or independent application state
+cannot be guaranteed, run browser lanes sequentially or keep browser operation
+in the primary agent.
 
 Do not trade audit correctness for parallelism.
 
@@ -227,7 +242,7 @@ Include:
 - the running application URL
 - the scenario/fixture name, if any
 - the exact audit lane
-- whether Playwright is available to the subagent
+- whether `agent-browser` is executable and usable by the subagent
 - a strict prohibition on source inspection during product exploration
 - a strict prohibition on modifying application code
 - safety constraints
@@ -249,21 +264,21 @@ Good:
 
 A Luna subagent performing a product-exploration lane must:
 
-1. Use Playwright.
+1. Use `agent-browser` through its own shell access.
 2. Operate the actual running application.
 3. Not inspect source code, routes, APIs, tests, schemas, or implementation docs.
 4. Not modify source code.
 5. Record only behavior it directly observed.
 6. Distinguish observed behavior from inferred user expectation.
 7. Return concise evidence to the primary agent.
-8. Stop its lane if Playwright becomes unavailable.
+8. Stop its lane if `agent-browser` becomes unavailable or loses browser control.
 
-If Playwright is not exposed to that Luna subagent, do not assign it a browser
-lane.
+If `agent-browser` is not executable or usable by that Luna subagent, do not
+assign it a browser lane.
 
 ## Non-Browser Luna Use
 
-If Luna subagents are available but cannot use Playwright, they may still be
+If Luna subagents are available but cannot use `agent-browser`, they may still be
 used after the primary agent completes passes 1 through 4.
 
 Useful post-observation Luna tasks include:
@@ -291,7 +306,7 @@ Use them to create independent perspectives.
 When two agents disagree:
 
 1. Preserve both claims temporarily.
-2. Return to Playwright evidence where possible.
+2. Return to `agent-browser` evidence where possible.
 3. Reproduce the behavior in the primary agent.
 4. Prefer directly observed behavior over speculation.
 5. Record unresolved ambiguity explicitly.
@@ -380,7 +395,7 @@ For every implementation task:
 - prohibit unrelated refactors
 - require tests/verification
 - have the primary agent review the result
-- rerun the affected journey through Playwright
+- rerun the affected journey through `agent-browser`
 
 The primary agent remains responsible for integration and final acceptance.
 
@@ -434,25 +449,25 @@ Do not mark untested behavior as confirmed.
 
 # Audit Method
 
-Run the audit only after the mandatory Playwright preflight succeeds.
+Run the audit only after the mandatory `agent-browser` preflight succeeds.
 
-After Playwright preflight, check whether Luna subagents are available. Use
-them for bounded independent lanes when doing so preserves test isolation and
-evidence quality.
+After the `agent-browser` preflight, check whether Luna subagents are available.
+Use them for bounded independent lanes when doing so preserves test isolation
+and evidence quality.
 
 The audit has five passes.
 
-1. Cold-use exploration with Playwright
+1. Cold-use exploration with `agent-browser`
 2. Capability inventory
 3. Completeness and symmetry analysis
-4. Failure/recovery analysis with Playwright
+4. Failure/recovery analysis with `agent-browser`
 5. Implementation inspection and classification
 
 Do not skip directly to implementation.
 
 All user-visible observations in passes 1 through 4 must come from actually
-operating the application through Playwright, whether by the primary agent or
-a browser-capable Luna subagent. Source inspection begins only in pass 5.
+operating the application through `agent-browser`, whether by the primary agent
+or a browser-capable Luna subagent. Source inspection begins only in pass 5.
 
 The primary agent must consolidate and deduplicate all subagent findings before
 classification and prioritization.
@@ -1126,39 +1141,57 @@ Rejected / not recommended
 
 ---
 
-# Playwright Browser Automation Guidance
+# agent-browser Guidance
 
-Playwright is mandatory for this skill, not optional.
+`agent-browser` is mandatory for this skill, not optional.
 
-Use Playwright to operate the actual running application throughout the
-user-facing portions of the audit.
+Use the `agent-browser` CLI to operate the actual running application throughout
+the user-facing portions of the audit.
 
-- Prefer semantic selectors and accessible names.
-- Navigate through the UI instead of calling internal APIs to shortcut flows.
+Typical interaction loop:
+
+```bash
+agent-browser open <app-url>
+agent-browser snapshot -i
+agent-browser click <target>
+agent-browser snapshot -i
+```
+
+Use the syntax supported by the installed `agent-browser` version when it
+differs from these examples.
+
+Guidelines:
+
+- Prefer accessible/semantic targets exposed by the interactive snapshot.
+- Navigate through the visible UI instead of calling internal APIs to shortcut
+  flows.
 - Fill forms as a user would.
 - Trigger actions through visible controls.
-- Verify actions by observing resulting UI state.
+- Re-snapshot after meaningful actions.
+- Verify actions by observing resulting browser state.
 - Refresh and revisit pages to detect persistence problems.
 - Use browser back/forward where relevant.
 - Exercise empty, populated, loading, error, and recovery states when reachable.
 - Take screenshots when they materially document a finding.
 - Restart or reopen the application for persistence/recovery checks when
   practical.
-- Inspect console/network errors only after first observing the user-facing
-  symptom.
-- Do not infer success merely because a network request returned 200.
-- Do not treat a DOM element's existence as proof that the workflow works;
-  execute the workflow.
+- Inspect console/network information only after first observing the user-facing
+  symptom, if the installed `agent-browser` capabilities expose that information.
+- Do not infer success merely because an underlying request succeeded.
+- Do not treat an element's existence as proof that the workflow works; execute
+  the workflow.
 - Do not use implementation knowledge to choose hidden or non-obvious UI paths
   during the cold-use pass.
+- Keep browser commands user-oriented. Do not use browser scripting as a covert
+  substitute for operating the product normally.
 
-If Playwright loses access to the application during the audit and cannot
+If `agent-browser` loses access to the application during the audit and cannot
 recover, stop the audit and tell the user what failed. Do not complete the
 remaining audit using source inspection as a substitute.
 
-If only one portion of the application is inaccessible while Playwright itself
-continues to work, record that specific limitation and continue only with the
-parts that can genuinely be exercised through Playwright.
+If only one portion of the application is inaccessible while `agent-browser`
+itself continues to work, record that specific limitation and continue only
+with the parts that can genuinely be exercised.
 
 ---
 
@@ -1181,9 +1214,9 @@ Do not:
 - recommend bulk destructive actions casually
 - prioritize visual polish above missing core capabilities
 - inspect source before the cold-use pass
-- continue the audit when Playwright is unavailable or unusable
-- replace Playwright dogfooding with static review, raw HTTP calls, or source inspection
-- assign browser dogfooding to a subagent that cannot actually use Playwright
+- continue the audit when `agent-browser` is unavailable or unusable
+- replace `agent-browser` dogfooding with static review, raw HTTP calls, source inspection, or another browser driver
+- assign browser dogfooding to a subagent that cannot actually use `agent-browser`
 - let subagents inspect source during their cold-use browser lanes
 - prime subagents with the missing feature you expect them to discover
 - blindly merge duplicate or contradictory subagent findings
