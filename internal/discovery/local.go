@@ -28,14 +28,21 @@ type LocalResult struct {
 	Paths []core.GamePath
 }
 
-func DiscoverLocalSaves(ctx context.Context, manifest *catalog.Manifest, excluded map[string]struct{}, now time.Time) ([]LocalResult, error) {
+type definitionSource interface {
+	EachDefinition(context.Context, func(string, catalog.Definition) error) error
+}
+
+func DiscoverLocalSaves(ctx context.Context, definitions definitionSource, excluded map[string]struct{}, now time.Time) ([]LocalResult, error) {
 	home, err := os.UserHomeDir()
 	if err != nil {
 		return nil, err
 	}
 	replacements := userPathReplacements(home)
-	jobs, results := startLocalWorkers(ctx, len(manifest.Games), replacements, now)
-	go feedLocalCandidates(ctx, manifest, excluded, jobs)
+	jobs, results := startLocalWorkers(ctx, replacements, now)
+	feedResult := make(chan error, 1)
+	go func() {
+		feedResult <- feedLocalCandidates(ctx, definitions, excluded, jobs)
+	}()
 	var found []LocalResult
 	for result := range results {
 		found = append(found, result)
@@ -43,17 +50,19 @@ func DiscoverLocalSaves(ctx context.Context, manifest *catalog.Manifest, exclude
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
+	if err := <-feedResult; err != nil {
+		return nil, err
+	}
 	sort.Slice(found, func(i, j int) bool { return found[i].Game.DisplayName < found[j].Game.DisplayName })
 	return found, nil
 }
 
-func startLocalWorkers(ctx context.Context, games int, replacements map[string]string, now time.Time) (chan<- localCandidate, <-chan LocalResult) {
+func startLocalWorkers(ctx context.Context, replacements map[string]string, now time.Time) (chan<- localCandidate, <-chan LocalResult) {
 	jobs := make(chan localCandidate)
 	results := make(chan LocalResult)
-	workers := min(localScanWorkers, games)
 	var wait sync.WaitGroup
-	wait.Add(workers)
-	for range workers {
+	wait.Add(localScanWorkers)
+	for range localScanWorkers {
 		go localWorker(ctx, jobs, results, replacements, now, &wait)
 	}
 	go func() {
@@ -78,21 +87,19 @@ func localWorker(ctx context.Context, jobs <-chan localCandidate, results chan<-
 	}
 }
 
-func feedLocalCandidates(ctx context.Context, manifest *catalog.Manifest, excluded map[string]struct{}, jobs chan<- localCandidate) {
+func feedLocalCandidates(ctx context.Context, definitions definitionSource, excluded map[string]struct{}, jobs chan<- localCandidate) error {
 	defer close(jobs)
-	for name, definition := range manifest.Games {
-		if definition.Alias != "" {
-			continue
-		}
+	return definitions.EachDefinition(ctx, func(name string, definition catalog.Definition) error {
 		if _, skip := excluded[name]; skip {
-			continue
+			return nil
 		}
 		select {
 		case jobs <- localCandidate{name: name, definition: definition}:
+			return nil
 		case <-ctx.Done():
-			return
+			return ctx.Err()
 		}
-	}
+	})
 }
 
 func scanLocalCandidate(candidate localCandidate, replacements map[string]string, now time.Time) (LocalResult, bool) {

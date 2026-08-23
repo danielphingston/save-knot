@@ -1,6 +1,7 @@
 package catalog
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -158,6 +159,21 @@ func (m *Manifest) SteamGame(id string) (Definition, bool) {
 	return m.Resolve(name)
 }
 
+func (m *Manifest) EachDefinition(ctx context.Context, consume func(string, Definition) error) error {
+	for name, definition := range m.Games {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		if definition.Alias != "" {
+			continue
+		}
+		if err := consume(name, definition); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 func LoadSecondary(path string) (*Manifest, error) {
 	//nolint:gosec // The path is a fixed filename under an installed game's detected directory.
 	data, err := os.ReadFile(path)
@@ -168,10 +184,11 @@ func LoadSecondary(path string) (*Manifest, error) {
 }
 
 type Fetcher struct {
-	Client   *http.Client
-	URL      string
-	Path     string
-	ETagPath string
+	Client    *http.Client
+	URL       string
+	Path      string
+	IndexPath string
+	ETagPath  string
 }
 
 func (f Fetcher) Update(ctx context.Context) (bool, error) {
@@ -198,6 +215,9 @@ func (f Fetcher) Update(ctx context.Context) (bool, error) {
 		if err := response.Body.Close(); err != nil {
 			return false, fmt.Errorf("close manifest response: %w", err)
 		}
+		if err := EnsureIndex(ctx, f.Path, f.IndexPath); err != nil {
+			return false, err
+		}
 		return false, nil
 	}
 	if response.StatusCode != http.StatusOK {
@@ -212,7 +232,7 @@ func (f Fetcher) Update(ctx context.Context) (bool, error) {
 	if len(data) > maxManifestSize {
 		return false, fmt.Errorf("ludusavi manifest exceeds %d bytes", maxManifestSize)
 	}
-	if _, err := Parse(data); err != nil {
+	if err := Compile(ctx, bytes.NewReader(data), f.IndexPath); err != nil {
 		return false, err
 	}
 	if err := writeAtomic(f.Path, data, 0o600); err != nil {

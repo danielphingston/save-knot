@@ -70,8 +70,9 @@ func TestFetcherUsesETagAndKeepsValidatedCache(t *testing.T) {
 	})}
 	directory := t.TempDir()
 	manifestPath := filepath.Join(directory, "manifest.yaml")
+	indexPath := filepath.Join(directory, "catalog.db")
 	etagPath := filepath.Join(directory, "manifest.etag")
-	fetcher := Fetcher{Client: client, URL: "https://catalog.invalid/manifest.yaml", Path: manifestPath, ETagPath: etagPath}
+	fetcher := Fetcher{Client: client, URL: "https://catalog.invalid/manifest.yaml", Path: manifestPath, IndexPath: indexPath, ETagPath: etagPath}
 	updated, err := fetcher.Update(context.Background())
 	if err != nil || !updated {
 		t.Fatalf("first update: updated=%v, err=%v", updated, err)
@@ -90,6 +91,10 @@ func TestFetcherUsesETagAndKeepsValidatedCache(t *testing.T) {
 	if string(data) != testManifest {
 		t.Fatal("cached manifest changed")
 	}
+	count, err := (Index{Path: indexPath}).Count(context.Background())
+	if err != nil || count != 1 {
+		t.Fatalf("catalog index was not compiled: count=%d err=%v", count, err)
+	}
 }
 
 func TestFetcherRejectsInvalidManifest(t *testing.T) {
@@ -98,7 +103,7 @@ func TestFetcherRejectsInvalidManifest(t *testing.T) {
 		return response(http.StatusOK, ":", nil), nil
 	})}
 	path := filepath.Join(t.TempDir(), "manifest.yaml")
-	_, err := (Fetcher{Client: client, URL: "https://catalog.invalid/manifest.yaml", Path: path, ETagPath: path + ".etag"}).Update(context.Background())
+	_, err := (Fetcher{Client: client, URL: "https://catalog.invalid/manifest.yaml", Path: path, IndexPath: path + ".db", ETagPath: path + ".etag"}).Update(context.Background())
 	if err == nil {
 		t.Fatal("expected malformed manifest to be rejected")
 	}

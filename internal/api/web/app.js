@@ -80,7 +80,7 @@ function gamesPage() {
         <div class="cover">${cover(game)}<span class="badge"><span class="dot ${game.enabled ? '' : 'warn'}"></span>${game.enabled ? 'Watching' : 'Manual backups'}</span></div>
         <div class="card-body"><h2>${escapeHTML(game.displayName)}</h2><div class="card-meta"><span>${game.snapshotCount} snapshots</span><span>${game.syncEnabled ? 'R2 sync on' : 'Local only'}</span><span>${formatBytes(game.storedSize)}</span></div></div>
       </a>`).join('')}</section>` : `
-      <section class="empty"><div><div class="empty-mark">⌁</div><h2>No games tied in yet</h2><p class="subtle">Steam games appear automatically after the Ludusavi catalog loads. You can also add any save folder yourself.</p><button class="button primary" id="empty-add">Add a custom game</button></div></section>`}`;
+      <section class="empty"><div><div class="empty-mark">⌁</div><h2>No games tied in yet</h2><p class="subtle">Select Scan for games to check Steam, Epic, GOG, and existing local saves. You can also add any save folder yourself.</p><button class="button primary" id="empty-add">Add a custom game</button></div></section>`}`;
   document.querySelector('#add-game').addEventListener('click', showAddGame);
   document.querySelector('#empty-add')?.addEventListener('click', showAddGame);
   document.querySelector('#scan-games').addEventListener('click', async event => {
@@ -200,7 +200,7 @@ function settingsPage() {
   document.querySelector('#local-form').addEventListener('submit', async event => {
     event.preventDefault(); const form = new FormData(event.currentTarget); const button = event.currentTarget.querySelector('button[type="submit"]'); button.disabled = true;
     const lines = name => String(form.get(name) || '').split(/\r?\n/).map(value => value.trim()).filter(Boolean);
-    try { await api('/api/settings/local', { method: 'PUT', body: JSON.stringify({ localBackupDir: form.get('localBackupDir'), steamRoots: lines('steamRoots'), epicManifests: lines('epicManifests'), gogRoots: lines('gogRoots') }) }); await api('/api/settings/autostart', { method: 'PUT', body: JSON.stringify({ enabled: form.get('launchAtLogin') === 'on' }) }); await api('/api/settings/retention', { method: 'PUT', body: JSON.stringify({ keep: Number(form.get('retentionKeep')) }) }); await loadShared(); settingsPage(); toast('Local settings saved and discovery rerun'); }
+    try { await api('/api/settings/local', { method: 'PUT', body: JSON.stringify({ localBackupDir: form.get('localBackupDir'), steamRoots: lines('steamRoots'), epicManifests: lines('epicManifests'), gogRoots: lines('gogRoots') }) }); await api('/api/settings/autostart', { method: 'PUT', body: JSON.stringify({ enabled: form.get('launchAtLogin') === 'on' }) }); await api('/api/settings/retention', { method: 'PUT', body: JSON.stringify({ keep: Number(form.get('retentionKeep')) }) }); await loadShared(); settingsPage(); toast('Local settings saved; select Scan now to rediscover games'); }
     catch (error) { toast(error.message, true); button.disabled = false; }
   });
   document.querySelectorAll('.browse').forEach(button => button.addEventListener('click', async () => {

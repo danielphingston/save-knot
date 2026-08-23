@@ -44,6 +44,7 @@ type Paths struct {
 	Config     string
 	Database   string
 	Catalog    string
+	CatalogDB  string
 	CatalogTag string
 	Blobs      string
 }
@@ -54,6 +55,7 @@ func DataPaths(root string) Paths {
 		Config:     filepath.Join(root, "config.json"),
 		Database:   filepath.Join(root, "saveknot.db"),
 		Catalog:    filepath.Join(root, "manifest.yaml"),
+		CatalogDB:  filepath.Join(root, "catalog.db"),
 		CatalogTag: filepath.Join(root, "manifest.etag"),
 		Blobs:      filepath.Join(root, "blobs"),
 	}

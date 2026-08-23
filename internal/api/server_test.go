@@ -87,9 +87,11 @@ func (c *coordinatorFake) ConfigureLocal(context.Context, config.Local) error   
 func (c *coordinatorFake) ReconcileRemote(context.Context) (remote.ReconcileResult, error) {
 	return remote.ReconcileResult{}, nil
 }
-func (c *coordinatorFake) Diagnostics() core.Diagnostics                      { return core.Diagnostics{} }
-func (c *coordinatorFake) SearchCatalog(string) ([]core.CatalogChoice, error) { return nil, nil }
-func (c *coordinatorFake) RemapGame(context.Context, string, string) error    { return nil }
+func (c *coordinatorFake) Diagnostics() core.Diagnostics { return core.Diagnostics{} }
+func (c *coordinatorFake) SearchCatalog(context.Context, string) ([]core.CatalogChoice, error) {
+	return nil, nil
+}
+func (c *coordinatorFake) RemapGame(context.Context, string, string) error { return nil }
 
 type vaultFake struct{ values map[string]string }
 

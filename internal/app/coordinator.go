@@ -8,7 +8,6 @@ import (
 	"os"
 	"path"
 	"path/filepath"
-	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -104,6 +103,7 @@ func (c *Coordinator) Start(ctx context.Context) {
 			}
 		}
 	})
+	c.ReconcileWatches(ctx)
 	go c.run(ctx)
 }
 
@@ -112,25 +112,21 @@ func (c *Coordinator) Close() error {
 }
 
 func (c *Coordinator) run(ctx context.Context) {
-	c.refresh(ctx)
+	c.refreshCatalog(ctx)
 	if _, err := c.ReconcileRemote(ctx); err != nil && !errors.Is(err, settings.ErrR2NotConfigured) {
 		slog.Error("startup R2 reconciliation failed", "error", err)
 		c.events.Publish(core.Event{Type: "storage.error", Message: err.Error()})
 	}
 	catalogTicker := time.NewTicker(24 * time.Hour)
-	discoveryTicker := time.NewTicker(5 * time.Minute)
 	syncTicker := time.NewTicker(5 * time.Minute)
 	defer catalogTicker.Stop()
-	defer discoveryTicker.Stop()
 	defer syncTicker.Stop()
 	for {
 		select {
 		case <-ctx.Done():
 			return
 		case <-catalogTicker.C:
-			c.refresh(ctx)
-		case <-discoveryTicker.C:
-			c.discover(ctx, false)
+			c.refreshCatalog(ctx)
 		case <-syncTicker.C:
 			if err := c.SyncPending(ctx); err != nil && !errors.Is(err, settings.ErrR2NotConfigured) {
 				slog.Warn("retry pending R2 snapshots", "error", err)
@@ -139,15 +135,15 @@ func (c *Coordinator) run(ctx context.Context) {
 	}
 }
 
-func (c *Coordinator) refresh(ctx context.Context) {
+func (c *Coordinator) refreshCatalog(ctx context.Context) {
 	checked := time.Now().UTC()
 	cfg := c.settings.Config()
-	fetcher := catalog.Fetcher{URL: cfg.ManifestURL, Path: c.paths.Catalog, ETagPath: c.paths.CatalogTag}
+	fetcher := catalog.Fetcher{URL: cfg.ManifestURL, Path: c.paths.Catalog, IndexPath: c.paths.CatalogDB, ETagPath: c.paths.CatalogTag}
 	updated, err := fetcher.Update(ctx)
 	if err != nil {
 		slog.Error("refresh Ludusavi catalog", "url", cfg.ManifestURL, "cache", c.paths.Catalog, "error", err)
 		c.setCatalogDiagnostics(checked, false, 0, err)
-		if _, statErr := os.Stat(c.paths.Catalog); statErr != nil {
+		if indexErr := catalog.EnsureIndex(ctx, c.paths.Catalog, c.paths.CatalogDB); indexErr != nil {
 			c.events.Publish(core.Event{Type: "catalog.failed", Message: err.Error()})
 			return
 		}
@@ -155,20 +151,27 @@ func (c *Coordinator) refresh(ctx context.Context) {
 		slog.Info("Ludusavi catalog updated", "cache", c.paths.Catalog)
 		c.events.Publish(core.Event{Type: "catalog.updated"})
 	}
-	c.discover(ctx, true)
+	count, err := (catalog.Index{Path: c.paths.CatalogDB}).Count(ctx)
+	if err != nil {
+		slog.Error("inspect Ludusavi catalog index", "path", c.paths.CatalogDB, "error", err)
+		c.setCatalogDiagnostics(checked, false, 0, err)
+		return
+	}
+	c.setCatalogDiagnostics(checked, true, count, nil)
 }
 
-func (c *Coordinator) discover(ctx context.Context, deep bool) {
+func (c *Coordinator) discover(ctx context.Context) {
 	c.reconcileMu.Lock()
 	defer c.reconcileMu.Unlock()
-	manifest, err := catalog.Load(c.paths.Catalog)
+	index := catalog.Index{Path: c.paths.CatalogDB}
+	count, err := index.Count(ctx)
 	if err != nil {
-		slog.Error("load Ludusavi catalog", "path", c.paths.Catalog, "error", err)
+		slog.Error("load Ludusavi catalog index", "path", c.paths.CatalogDB, "error", err)
 		c.setCatalogDiagnostics(time.Now().UTC(), false, 0, err)
 		return
 	}
 	now := time.Now().UTC()
-	c.setCatalogDiagnostics(now, true, len(manifest.Games), nil)
+	c.setCatalogDiagnostics(now, true, count, nil)
 	roots := discovery.SteamRoots(c.settings.Config().SteamRoots)
 	installed, err := discovery.DiscoverSteam(ctx, roots)
 	if err != nil {
@@ -177,7 +180,7 @@ func (c *Coordinator) discover(ctx context.Context, deep bool) {
 		c.events.Publish(core.Event{Type: "discovery.failed", Message: err.Error()})
 		return
 	}
-	matched, registered, matchedNames, unmatched := c.registerSteamGames(ctx, manifest, installed, now)
+	matched, registered, matchedNames, unmatched := c.registerSteamGames(ctx, index, installed, now)
 	cfg := c.settings.Config()
 	epicInstalled, epicErr := discovery.DiscoverEpic(ctx, cfg.EpicManifests)
 	if epicErr != nil {
@@ -187,10 +190,10 @@ func (c *Coordinator) discover(ctx context.Context, deep bool) {
 	if gogErr != nil {
 		slog.Error("discover GOG games", "error", gogErr)
 	}
-	storeMatched, storeRegistered := c.registerInstalledGames(ctx, manifest, append(epicInstalled, gogInstalled...), now, matchedNames, &unmatched)
+	storeMatched, storeRegistered := c.registerInstalledGames(ctx, index, append(epicInstalled, gogInstalled...), now, matchedNames, &unmatched)
 	matched += storeMatched
 	registered += storeRegistered
-	localFound, localRegistered, deepMillis, deepErr := c.registerLocalSaves(ctx, manifest, matchedNames, now, deep)
+	localFound, localRegistered, deepMillis, deepErr := c.registerLocalSaves(ctx, index, matchedNames, now)
 	registered += localRegistered
 	if deepErr != nil {
 		slog.Error("deep local-save discovery failed", "error", deepErr)
@@ -198,17 +201,21 @@ func (c *Coordinator) discover(ctx context.Context, deep bool) {
 		return
 	}
 	c.setDiscoveryDiagnostics(core.DiscoveryDiagnostics{LastRun: &now, SteamRoots: roots, SteamInstalled: len(installed), EpicInstalled: len(epicInstalled), GOGInstalled: len(gogInstalled), CatalogMatched: matched, GamesRegistered: registered, LocalSaveGames: localFound, DeepScanMillis: deepMillis, Unmatched: unmatched})
-	slog.Info("game discovery completed", "catalog_games", len(manifest.Games), "steam_roots", len(roots), "steam_installed", len(installed), "epic_installed", len(epicInstalled), "gog_installed", len(gogInstalled), "catalog_matched", matched, "local_save_games", localFound, "registered", registered, "unmatched", len(unmatched), "deep_scan_ms", deepMillis)
+	slog.Info("game discovery completed", "catalog_games", count, "steam_roots", len(roots), "steam_installed", len(installed), "epic_installed", len(epicInstalled), "gog_installed", len(gogInstalled), "catalog_matched", matched, "local_save_games", localFound, "registered", registered, "unmatched", len(unmatched), "deep_scan_ms", deepMillis)
 	c.ReconcileWatches(ctx)
 }
 
-func (c *Coordinator) registerSteamGames(ctx context.Context, manifest *catalog.Manifest, installed []discovery.SteamGame, now time.Time) (int, int, map[string]struct{}, []string) {
+func (c *Coordinator) registerSteamGames(ctx context.Context, index catalog.Index, installed []discovery.SteamGame, now time.Time) (int, int, map[string]struct{}, []string) {
 	matched := 0
 	registered := 0
 	matchedNames := make(map[string]struct{})
 	var unmatched []string
 	for _, installation := range installed {
-		definition, ok := manifest.SteamGame(installation.AppID)
+		definition, ok, err := index.SteamGame(ctx, installation.AppID)
+		if err != nil {
+			slog.Error("look up Steam game in catalog index", "app_id", installation.AppID, "error", err)
+			continue
+		}
 		if !ok {
 			if len(unmatched) < 25 {
 				unmatched = append(unmatched, installation.Name+" ("+installation.AppID+")")
@@ -251,13 +258,9 @@ func (c *Coordinator) registerSteamGame(ctx context.Context, installation discov
 	return true
 }
 
-func (c *Coordinator) registerLocalSaves(ctx context.Context, manifest *catalog.Manifest, matchedNames map[string]struct{}, now time.Time, deep bool) (int, int, int64, error) {
-	previous := c.Diagnostics().Discovery
-	if !deep {
-		return previous.LocalSaveGames, 0, previous.DeepScanMillis, nil
-	}
+func (c *Coordinator) registerLocalSaves(ctx context.Context, index catalog.Index, matchedNames map[string]struct{}, now time.Time) (int, int, int64, error) {
 	started := time.Now()
-	localGames, err := discovery.DiscoverLocalSaves(ctx, manifest, matchedNames, now)
+	localGames, err := discovery.DiscoverLocalSaves(ctx, index, matchedNames, now)
 	duration := time.Since(started).Milliseconds()
 	if err != nil {
 		return 0, 0, duration, err
@@ -278,11 +281,15 @@ func (c *Coordinator) registerLocalSaves(ctx context.Context, manifest *catalog.
 	return len(localGames), registered, duration, nil
 }
 
-func (c *Coordinator) registerInstalledGames(ctx context.Context, manifest *catalog.Manifest, installed []discovery.InstalledGame, now time.Time, matchedNames map[string]struct{}, unmatched *[]string) (int, int) {
+func (c *Coordinator) registerInstalledGames(ctx context.Context, index catalog.Index, installed []discovery.InstalledGame, now time.Time, matchedNames map[string]struct{}, unmatched *[]string) (int, int) {
 	matched := 0
 	registered := 0
 	for _, installation := range installed {
-		definition, ok := manifest.MatchName(installation.Name, installation.GameDir)
+		definition, ok, err := index.MatchName(ctx, installation.Name, installation.GameDir)
+		if err != nil {
+			slog.Error("look up installed game in catalog index", "store", installation.Store, "name", installation.Name, "error", err)
+			continue
+		}
 		if !ok {
 			if len(*unmatched) < 25 {
 				*unmatched = append(*unmatched, installation.Store+": "+installation.Name)
@@ -320,36 +327,28 @@ func (c *Coordinator) registerInstalledGames(ctx context.Context, manifest *cata
 }
 
 func (c *Coordinator) DiscoverNow(ctx context.Context) core.Diagnostics {
-	c.refresh(ctx)
+	c.refreshCatalog(ctx)
+	c.discover(ctx)
 	return c.Diagnostics()
 }
 
-func (c *Coordinator) SearchCatalog(query string) ([]core.CatalogChoice, error) {
-	manifest, err := catalog.Load(c.paths.Catalog)
+func (c *Coordinator) SearchCatalog(ctx context.Context, query string) ([]core.CatalogChoice, error) {
+	names, err := (catalog.Index{Path: c.paths.CatalogDB}).Search(ctx, strings.TrimSpace(query), 20)
 	if err != nil {
 		return nil, err
 	}
-	query = strings.ToLower(strings.TrimSpace(query))
-	choices := make([]core.CatalogChoice, 0, 20)
-	for name, definition := range manifest.Games {
-		if definition.Alias != "" || query != "" && !strings.Contains(strings.ToLower(name), query) {
-			continue
-		}
+	choices := make([]core.CatalogChoice, 0, len(names))
+	for _, name := range names {
 		choices = append(choices, core.CatalogChoice{ID: name, Name: name})
-	}
-	sort.Slice(choices, func(i, j int) bool { return choices[i].Name < choices[j].Name })
-	if len(choices) > 20 {
-		choices = choices[:20]
 	}
 	return choices, nil
 }
 
 func (c *Coordinator) RemapGame(ctx context.Context, gameID, catalogID string) error {
-	manifest, err := catalog.Load(c.paths.Catalog)
+	definition, ok, err := (catalog.Index{Path: c.paths.CatalogDB}).Resolve(ctx, catalogID)
 	if err != nil {
 		return err
 	}
-	definition, ok := manifest.Resolve(catalogID)
 	if !ok {
 		return fmt.Errorf("catalog game %q was not found", catalogID)
 	}
@@ -402,7 +401,7 @@ func (c *Coordinator) ConfigureLocal(ctx context.Context, local config.Local) er
 		return err
 	}
 	c.snapshots.SetBlobRoot(filepath.Clean(local.LocalBackupDir))
-	c.discover(ctx, true)
+	c.ReconcileWatches(ctx)
 	return nil
 }
 

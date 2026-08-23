@@ -80,7 +80,7 @@ type discoveryCoordinator interface {
 	DiscoverNow(context.Context) core.Diagnostics
 	ConfigureLocal(context.Context, config.Local) error
 	Diagnostics() core.Diagnostics
-	SearchCatalog(string) ([]core.CatalogChoice, error)
+	SearchCatalog(context.Context, string) ([]core.CatalogChoice, error)
 	RemapGame(context.Context, string, string) error
 }
 
@@ -460,7 +460,7 @@ func (s *Server) discover(writer http.ResponseWriter, request *http.Request) {
 }
 
 func (s *Server) searchCatalog(writer http.ResponseWriter, request *http.Request) {
-	choices, err := s.discovery.SearchCatalog(request.URL.Query().Get("q"))
+	choices, err := s.discovery.SearchCatalog(request.Context(), request.URL.Query().Get("q"))
 	if err != nil {
 		writeError(writer, http.StatusInternalServerError, err)
 		return

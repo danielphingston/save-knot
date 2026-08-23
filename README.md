@@ -7,6 +7,7 @@ There is no SaveKnot account, hosted backend, central database, analytics servic
 ## What works
 
 - Ludusavi manifest download with ETag caching and validation before activation
+- Streaming compilation into a compact SQLite catalog index; the full YAML object graph is never retained
 - Steam discovery from Windows registry entries, standard roots, and `libraryfolders.vdf`
 - Epic launcher manifest discovery, GOG root discovery, and a bounded deep scan for existing local saves
 - Ludusavi aliases, extra store IDs, secondary `.ludusavi.yaml` manifests, registry rules, placeholders, constraints, and globs
@@ -65,6 +66,8 @@ Open **Settings → Discovery diagnostics**, then select **Scan now**. The panel
 
 Ludusavi is the save-definition catalog, not a rich store-metadata API. SaveKnot consumes its canonical title, aliases, store IDs, installation aliases, file/registry rules, constraints, and path placeholders. Steam cover art is derived separately from a matched Steam app ID; custom pictures always override it. Ludusavi does not supply descriptions or cover images.
 
+Game discovery is deliberately manual. SaveKnot refreshes its compact catalog in the background, but it only searches launchers and local save locations when you select **Scan for games** or **Scan now**. Between scans, it watches only enabled save locations already registered in the local database.
+
 ## Connect R2
 
 1. Create an R2 bucket in Cloudflare.
@@ -85,7 +88,7 @@ R2 objects use this layout:
 
 Blobs are immutable by their SHA-256 name. A snapshot becomes visible remotely only after all of its blobs have uploaded successfully.
 
-`ListObjectsV2` is not used by the watcher or periodic five-minute discovery loop. The connection test makes one `MaxKeys=1` capability-list request under its temporary probe prefix. SaveKnot lists snapshot manifests only at startup when R2 is configured or when you explicitly select **Refresh from R2**. Already-known immutable snapshot IDs are not downloaded again. Blob uploads use the local SQLite hash index during normal operation.
+`ListObjectsV2` is not used by the watcher or save tracking. The connection test makes one `MaxKeys=1` capability-list request under its temporary probe prefix. SaveKnot lists snapshot manifests only at startup when R2 is configured or when you explicitly select **Refresh from R2**. Already-known immutable snapshot IDs are not downloaded again. Blob uploads use the local SQLite hash index during normal operation.
 
 ## Architecture
 
