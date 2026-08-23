@@ -12,6 +12,7 @@ import (
 
 	"github.com/saveknot/saveknot/internal/catalog"
 	"github.com/saveknot/saveknot/internal/config"
+	"github.com/saveknot/saveknot/internal/core"
 )
 
 func TestApplicationBuildAndCatalogDiscovery(t *testing.T) {
@@ -46,6 +47,42 @@ func TestApplicationBuildAndCatalogDiscovery(t *testing.T) {
 	diagnostics := application.coordinator.Diagnostics()
 	if !diagnostics.Catalog.Loaded || diagnostics.Catalog.GameCount != 1 {
 		t.Fatalf("catalog did not become ready: %#v", diagnostics)
+	}
+}
+
+func TestBuildNormalizesRelativeDataAndBackupPaths(t *testing.T) {
+	root := t.TempDir()
+	t.Chdir(root)
+	dataDir := "state"
+	paths := config.DataPaths(dataDir)
+	if err := config.Save(paths.Config, config.Config{
+		Listen: "127.0.0.1:0", LocalBackupDir: filepath.Join(dataDir, "blobs"),
+		RetentionKeep: 50, DeviceID: "test-device", R2: config.R2{Prefix: "saveknot"},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	application, err := Build(context.Background(), dataDir, "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if err := errors.Join(application.coordinator.Close(), application.database.Close()); err != nil {
+			t.Error(err)
+		}
+	})
+	backupDir := application.coordinator.settings.Config().LocalBackupDir
+	if !filepath.IsAbs(backupDir) || backupDir != filepath.Join(root, dataDir, "blobs") {
+		t.Fatalf("relative backup path was not normalized: %q", backupDir)
+	}
+	game := core.Game{ID: "hidden-game", DisplayName: "Hidden Game", Store: "custom", Enabled: true, SyncEnabled: true}
+	if err := application.database.UpsertGame(context.Background(), game); err != nil {
+		t.Fatal(err)
+	}
+	if err := application.coordinator.SetGameHidden(context.Background(), game.ID, true); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := application.coordinator.Backup(context.Background(), game.ID); !errors.Is(err, core.ErrGameNotFound) {
+		t.Fatalf("hidden game accepted a queued backup: %v", err)
 	}
 }
 
@@ -112,5 +149,30 @@ func TestCoordinatorStartOnlyWatchesRegisteredGames(t *testing.T) {
 	}
 	if len(games) != 1 || games[0].DisplayName != "Example Game" {
 		t.Fatalf("manual scan did not register the existing save: %#v", games)
+	}
+}
+
+func TestSyncSnapshotBatchContinuesAfterIndividualFailure(t *testing.T) {
+	t.Parallel()
+	snapshots := []core.Snapshot{{ID: "one", GameID: "game-a"}, {ID: "two", GameID: "game-b"}, {ID: "three", GameID: "game-c"}}
+	var attempted []string
+	var published []core.Event
+	result, syncedGames, err := syncSnapshotBatch(snapshots, func(snapshot core.Snapshot) error {
+		attempted = append(attempted, snapshot.ID)
+		if snapshot.ID == "two" {
+			return errors.New("upload failed")
+		}
+		return nil
+	}, func(event core.Event) {
+		published = append(published, event)
+	})
+	if err == nil || result.Eligible != 3 || result.Synced != 2 || result.Failed != 1 {
+		t.Fatalf("unexpected partial result: result=%#v err=%v", result, err)
+	}
+	if len(attempted) != 3 || attempted[2] != "three" {
+		t.Fatalf("later upload was aborted: %#v", attempted)
+	}
+	if len(syncedGames) != 2 || len(published) != 3 || published[1].Type != "upload.failed" {
+		t.Fatalf("batch outcomes were not recorded: games=%#v events=%#v", syncedGames, published)
 	}
 }

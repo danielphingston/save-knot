@@ -3,6 +3,7 @@ package database
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"path/filepath"
 	"testing"
 	"time"
@@ -39,7 +40,7 @@ func TestStoreGamePathsAndSnapshots(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(games) != 1 || games[0].SnapshotCount != 1 || games[0].StoredSize != 8 || games[0].LastBackup == nil || games[0].LastChange == nil {
+	if len(games) != 1 || games[0].SnapshotCount != 1 || games[0].PendingCount != 1 || games[0].StoredSize != 8 || games[0].LastBackup == nil || games[0].LastChange == nil {
 		t.Fatalf("unexpected game summary: %#v", games)
 	}
 	snapshots, err := store.ListSnapshots(ctx, game.ID)
@@ -69,6 +70,87 @@ func TestStoreGamePathsAndSnapshots(t *testing.T) {
 	}
 	if updated.DisplayName != name || updated.Enabled || updated.SyncEnabled {
 		t.Fatalf("game update was not saved: %#v", updated)
+	}
+}
+
+//nolint:gocognit // The linear lifecycle assertions are clearer together as one storage regression journey.
+func TestHiddenGameLifecyclePreservesDataAndStaysOutOfSync(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	store, err := Open(ctx, filepath.Join(t.TempDir(), "state.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if err := store.Close(); err != nil {
+			t.Error(err)
+		}
+	})
+	game := core.Game{ID: "game-hidden", DisplayName: "Hidden Game", Store: "custom", Enabled: true, SyncEnabled: true}
+	if err := store.UpsertGame(ctx, game); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.AddPath(ctx, core.GamePath{ID: "path-hidden", GameID: game.ID, Source: "custom", Template: "/saves", Resolved: "/saves", Enabled: true}); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.UpdateGamePolicy(ctx, game.ID, core.BackupPolicy{QuietSeconds: 2, MinGapSeconds: 3, MaxDirtySeconds: 4}); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.SaveSnapshot(ctx, core.Snapshot{Version: 1, ID: "snapshot-hidden", GameID: game.ID, CreatedAt: time.Now(), RemoteState: "local"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.SetGameHidden(ctx, game.ID, true); err != nil {
+		t.Fatal(err)
+	}
+	games, err := store.ListGames(ctx)
+	if err != nil || len(games) != 0 {
+		t.Fatalf("hidden game remained active: games=%#v err=%v", games, err)
+	}
+	hidden, err := store.ListHiddenGames(ctx)
+	if err != nil || len(hidden) != 1 || hidden[0].PendingCount != 1 {
+		t.Fatalf("hidden game summary missing: games=%#v err=%v", hidden, err)
+	}
+	pending, err := store.PendingSnapshots(ctx)
+	if err != nil || len(pending) != 0 {
+		t.Fatalf("hidden game leaked into global sync: snapshots=%#v err=%v", pending, err)
+	}
+	paths, err := store.GamePaths(ctx, game.ID)
+	if err != nil || len(paths) != 1 {
+		t.Fatalf("hidden game paths were lost: paths=%#v err=%v", paths, err)
+	}
+	policy, err := store.GamePolicy(ctx, game.ID)
+	if err != nil || policy.QuietSeconds != 2 {
+		t.Fatalf("hidden game policy was lost: policy=%#v err=%v", policy, err)
+	}
+	if err := store.UpsertGame(ctx, game); err != nil {
+		t.Fatal(err)
+	}
+	loaded, err := store.Game(ctx, game.ID)
+	if err != nil || !loaded.Hidden {
+		t.Fatalf("discovery resurrected hidden game: game=%#v err=%v", loaded, err)
+	}
+	if err := store.SetGameHidden(ctx, game.ID, false); err != nil {
+		t.Fatal(err)
+	}
+	games, err = store.ListGames(ctx)
+	if err != nil || len(games) != 1 {
+		t.Fatalf("restored game did not return: games=%#v err=%v", games, err)
+	}
+}
+
+func TestMissingGameUsesDomainError(t *testing.T) {
+	t.Parallel()
+	store, err := Open(context.Background(), filepath.Join(t.TempDir(), "state.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if err := store.Close(); err != nil {
+			t.Error(err)
+		}
+	})
+	if _, err := store.Game(context.Background(), "missing"); !errors.Is(err, core.ErrGameNotFound) {
+		t.Fatalf("expected domain not-found error, got %v", err)
 	}
 }
 

@@ -57,3 +57,15 @@ func TestSnapshotDueDebouncesAndEnforcesMinimumGap(t *testing.T) {
 		t.Fatalf("maximum dirty duration not applied: %v", got)
 	}
 }
+
+func TestPrunePendingDropsGamesRemovedFromWatchTargets(t *testing.T) {
+	t.Parallel()
+	pending := map[string]pendingChange{"active": {}, "removed": {}}
+	prunePending([]Target{{GameID: "active", Path: "/saves"}}, pending)
+	if _, present := pending["removed"]; present {
+		t.Fatal("removed game retained a queued backup")
+	}
+	if _, present := pending["active"]; !present {
+		t.Fatal("active game lost its queued backup")
+	}
+}

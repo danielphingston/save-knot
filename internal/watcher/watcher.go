@@ -97,6 +97,7 @@ func (m *Manager) run(ctx context.Context) {
 			return
 		case revised := <-m.update:
 			targets = m.applyTargets(revised)
+			prunePending(revised, pending)
 		case event, ok := <-m.watcher.Events:
 			if !ok {
 				return
@@ -108,6 +109,18 @@ func (m *Manager) run(ctx context.Context) {
 			if ok {
 				slog.Warn("filesystem watcher", "error", err)
 			}
+		}
+	}
+}
+
+func prunePending(targets []Target, pending map[string]pendingChange) {
+	activeGames := make(map[string]struct{}, len(targets))
+	for _, target := range targets {
+		activeGames[target.GameID] = struct{}{}
+	}
+	for gameID := range pending {
+		if _, active := activeGames[gameID]; !active {
+			delete(pending, gameID)
 		}
 	}
 }

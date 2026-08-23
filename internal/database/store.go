@@ -48,6 +48,7 @@ func (s *Store) initialize(ctx context.Context) error {
 			notes TEXT NOT NULL DEFAULT '',
 			enabled INTEGER NOT NULL DEFAULT 1,
 			sync_enabled INTEGER NOT NULL DEFAULT 1,
+			hidden INTEGER NOT NULL DEFAULT 0,
 			last_seen INTEGER,
 			last_change INTEGER,
 			last_backup INTEGER
@@ -110,10 +111,21 @@ func (s *Store) initialize(ctx context.Context) error {
 	if err := s.ensureSyncEnabledColumn(ctx); err != nil {
 		return err
 	}
+	if err := s.ensureHiddenColumn(ctx); err != nil {
+		return err
+	}
 	return nil
 }
 
 func (s *Store) ensureSyncEnabledColumn(ctx context.Context) (err error) {
+	return s.ensureGameColumn(ctx, "sync_enabled", `ALTER TABLE games ADD COLUMN sync_enabled INTEGER NOT NULL DEFAULT 1`)
+}
+
+func (s *Store) ensureHiddenColumn(ctx context.Context) error {
+	return s.ensureGameColumn(ctx, "hidden", `ALTER TABLE games ADD COLUMN hidden INTEGER NOT NULL DEFAULT 0`)
+}
+
+func (s *Store) ensureGameColumn(ctx context.Context, target, statement string) (err error) {
 	rows, err := s.db.QueryContext(ctx, `PRAGMA table_info(games)`)
 	if err != nil {
 		return fmt.Errorf("inspect games columns: %w", err)
@@ -126,7 +138,7 @@ func (s *Store) ensureSyncEnabledColumn(ctx context.Context) (err error) {
 		if err := rows.Scan(&sequence, &name, &dataType, &notNull, &defaultValue, &primaryKey); err != nil {
 			return fmt.Errorf("scan games column: %w", errors.Join(err, rows.Close()))
 		}
-		if name == "sync_enabled" {
+		if name == target {
 			found = true
 		}
 	}
@@ -136,8 +148,8 @@ func (s *Store) ensureSyncEnabledColumn(ctx context.Context) (err error) {
 	if found {
 		return nil
 	}
-	if _, err := s.db.ExecContext(ctx, `ALTER TABLE games ADD COLUMN sync_enabled INTEGER NOT NULL DEFAULT 1`); err != nil {
-		return fmt.Errorf("add games.sync_enabled: %w", err)
+	if _, err := s.db.ExecContext(ctx, statement); err != nil {
+		return fmt.Errorf("add games.%s: %w", target, err)
 	}
 	return nil
 }
@@ -381,12 +393,21 @@ func (s *Store) AddPath(ctx context.Context, path core.GamePath) error {
 }
 
 func (s *Store) ListGames(ctx context.Context) (games []core.Game, err error) {
+	return s.listGames(ctx, false)
+}
+
+func (s *Store) ListHiddenGames(ctx context.Context) ([]core.Game, error) {
+	return s.listGames(ctx, true)
+}
+
+func (s *Store) listGames(ctx context.Context, hidden bool) (games []core.Game, err error) {
 	rows, err := s.db.QueryContext(ctx, `SELECT
 		g.id, g.catalog_id, g.catalog_name, g.display_name, g.store, g.store_id, g.install_path,
-		g.image, g.notes, g.enabled, g.sync_enabled, g.last_seen, g.last_change, g.last_backup,
-		COUNT(s.id), COALESCE(SUM(s.stored_size), 0)
+		g.image, g.notes, g.enabled, g.sync_enabled, g.hidden, g.last_seen, g.last_change, g.last_backup,
+		COUNT(s.id), COALESCE(SUM(s.stored_size), 0),
+		COALESCE(SUM(CASE WHEN s.remote_state != 'synced' THEN 1 ELSE 0 END), 0)
 	FROM games g LEFT JOIN snapshots s ON s.game_id = g.id
-	GROUP BY g.id ORDER BY g.display_name COLLATE NOCASE`)
+	WHERE g.hidden = ? GROUP BY g.id ORDER BY g.display_name COLLATE NOCASE`, hidden)
 	if err != nil {
 		return nil, fmt.Errorf("list games: %w", err)
 	}
@@ -407,12 +428,13 @@ func (s *Store) ListGames(ctx context.Context) (games []core.Game, err error) {
 func (s *Store) Game(ctx context.Context, id string) (core.Game, error) {
 	row := s.db.QueryRowContext(ctx, `SELECT
 		g.id, g.catalog_id, g.catalog_name, g.display_name, g.store, g.store_id, g.install_path,
-		g.image, g.notes, g.enabled, g.sync_enabled, g.last_seen, g.last_change, g.last_backup,
-		COUNT(s.id), COALESCE(SUM(s.stored_size), 0)
+		g.image, g.notes, g.enabled, g.sync_enabled, g.hidden, g.last_seen, g.last_change, g.last_backup,
+		COUNT(s.id), COALESCE(SUM(s.stored_size), 0),
+		COALESCE(SUM(CASE WHEN s.remote_state != 'synced' THEN 1 ELSE 0 END), 0)
 	FROM games g LEFT JOIN snapshots s ON s.game_id = g.id WHERE g.id = ? GROUP BY g.id`, id)
 	game, err := scanGame(row)
 	if errors.Is(err, sql.ErrNoRows) {
-		return core.Game{}, fmt.Errorf("game %q: %w", id, err)
+		return core.Game{}, fmt.Errorf("%w: %q", core.ErrGameNotFound, id)
 	}
 	return game, err
 }
@@ -423,21 +445,37 @@ type scanner interface {
 
 func scanGame(row scanner) (core.Game, error) {
 	var game core.Game
-	var enabled, syncEnabled bool
+	var enabled, syncEnabled, hidden bool
 	var lastSeen, lastChange, lastBackup sql.NullInt64
 	if err := row.Scan(
 		&game.ID, &game.CatalogID, &game.CatalogName, &game.DisplayName, &game.Store, &game.StoreID,
-		&game.InstallPath, &game.Image, &game.Notes, &enabled, &syncEnabled, &lastSeen, &lastChange, &lastBackup,
-		&game.SnapshotCount, &game.StoredSize,
+		&game.InstallPath, &game.Image, &game.Notes, &enabled, &syncEnabled, &hidden, &lastSeen, &lastChange, &lastBackup,
+		&game.SnapshotCount, &game.StoredSize, &game.PendingCount,
 	); err != nil {
 		return core.Game{}, fmt.Errorf("scan game: %w", err)
 	}
 	game.Enabled = enabled
 	game.SyncEnabled = syncEnabled
+	game.Hidden = hidden
 	game.LastSeen = timePointer(lastSeen)
 	game.LastChange = timePointer(lastChange)
 	game.LastBackup = timePointer(lastBackup)
 	return game, nil
+}
+
+func (s *Store) SetGameHidden(ctx context.Context, id string, hidden bool) error {
+	result, err := s.db.ExecContext(ctx, `UPDATE games SET hidden = ? WHERE id = ?`, hidden, id)
+	if err != nil {
+		return fmt.Errorf("update library state for game %q: %w", id, err)
+	}
+	count, err := result.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("check library state for game %q: %w", id, err)
+	}
+	if count == 0 {
+		return fmt.Errorf("%w: %q", core.ErrGameNotFound, id)
+	}
+	return nil
 }
 
 func (s *Store) GamePaths(ctx context.Context, gameID string) (paths []core.GamePath, err error) {
@@ -607,7 +645,7 @@ func (s *Store) pendingSnapshots(ctx context.Context, gameID string, filterGame 
 		query += ` AND s.game_id = ?`
 		arguments = append(arguments, gameID)
 	} else {
-		query += ` AND g.sync_enabled = 1`
+		query += ` AND g.sync_enabled = 1 AND g.hidden = 0`
 	}
 	query += ` ORDER BY s.created_at`
 	rows, err := s.db.QueryContext(ctx, query, arguments...)

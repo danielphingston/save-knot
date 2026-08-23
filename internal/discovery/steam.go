@@ -65,11 +65,12 @@ func SteamRoots(configured []string) []string {
 			continue
 		}
 		candidate = filepath.Clean(candidate)
-		if _, ok := seen[candidate]; ok {
+		identity := steamPathIdentity(candidate, runtime.GOOS)
+		if _, ok := seen[identity]; ok {
 			continue
 		}
 		if info, err := os.Stat(filepath.Join(candidate, "steamapps")); err == nil && info.IsDir() {
-			seen[candidate] = struct{}{}
+			seen[identity] = struct{}{}
 			roots = append(roots, candidate)
 		}
 	}
@@ -77,19 +78,44 @@ func SteamRoots(configured []string) []string {
 }
 
 func DiscoverSteam(ctx context.Context, roots []string) ([]SteamGame, error) {
-	libraries := make(map[string]struct{})
+	libraries, err := steamLibraries(roots)
+	if err != nil {
+		return nil, err
+	}
+	return discoverSteamLibraries(ctx, libraries)
+}
+
+func steamLibraries(roots []string) ([]string, error) {
+	seenLibraries := make(map[string]struct{})
+	var libraries []string
 	for _, root := range SteamRoots(roots) {
-		libraries[root] = struct{}{}
+		libraries = appendUniqueSteamPath(libraries, seenLibraries, root)
 		paths, err := parseLibraryFolders(filepath.Join(root, "steamapps", "libraryfolders.vdf"))
 		if err != nil && !errors.Is(err, os.ErrNotExist) {
 			return nil, err
 		}
 		for _, path := range paths {
-			libraries[path] = struct{}{}
+			libraries = appendUniqueSteamPath(libraries, seenLibraries, path)
 		}
 	}
+	return libraries, nil
+}
+
+func appendUniqueSteamPath(paths []string, seen map[string]struct{}, candidate string) []string {
+	candidate = filepath.Clean(candidate)
+	identity := steamPathIdentity(candidate, runtime.GOOS)
+	if _, exists := seen[identity]; exists {
+		return paths
+	}
+	seen[identity] = struct{}{}
+	return append(paths, candidate)
+}
+
+func discoverSteamLibraries(ctx context.Context, libraries []string) ([]SteamGame, error) {
 	var games []SteamGame
-	for library := range libraries {
+	seenManifests := make(map[string]struct{})
+	seenApps := make(map[string]struct{})
+	for _, library := range libraries {
 		if err := ctx.Err(); err != nil {
 			return nil, err
 		}
@@ -97,17 +123,41 @@ func DiscoverSteam(ctx context.Context, roots []string) ([]SteamGame, error) {
 		if err != nil {
 			return nil, fmt.Errorf("find Steam app manifests: %w", err)
 		}
+		sort.Strings(manifests)
 		for _, path := range manifests {
+			manifestIdentity := steamPathIdentity(path, runtime.GOOS)
+			if _, exists := seenManifests[manifestIdentity]; exists {
+				continue
+			}
+			seenManifests[manifestIdentity] = struct{}{}
 			game, err := parseAppManifest(path)
 			if err != nil {
 				continue
 			}
+			if _, exists := seenApps[game.AppID]; exists {
+				continue
+			}
+			seenApps[game.AppID] = struct{}{}
 			game.Library = library
 			games = append(games, game)
 		}
 	}
-	sort.Slice(games, func(i, j int) bool { return games[i].Name < games[j].Name })
+	sort.Slice(games, func(i, j int) bool {
+		if games[i].Name == games[j].Name {
+			return games[i].AppID < games[j].AppID
+		}
+		return games[i].Name < games[j].Name
+	})
 	return games, nil
+}
+
+func steamPathIdentity(value, goos string) string {
+	if goos == "windows" {
+		identity := filepath.Clean(strings.ReplaceAll(strings.TrimSpace(value), `\`, "/"))
+		identity = strings.ReplaceAll(identity, "/", `\`)
+		return strings.ToLower(identity)
+	}
+	return filepath.Clean(strings.TrimSpace(value))
 }
 
 func parseLibraryFolders(path string) (paths []string, err error) {

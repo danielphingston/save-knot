@@ -19,6 +19,7 @@ func (v *memoryVault) Get(id string) (string, error) {
 	}
 	return secret, nil
 }
+func (v *memoryVault) Delete(id string) error { delete(v.values, id); return nil }
 
 func TestManagerCreatesStableDeviceIdentity(t *testing.T) {
 	t.Parallel()
@@ -40,5 +41,77 @@ func TestManagerCreatesStableDeviceIdentity(t *testing.T) {
 	}
 	if _, err := manager.R2(context.Background()); !errors.Is(err, ErrR2NotConfigured) {
 		t.Fatalf("expected ErrR2NotConfigured, got %v", err)
+	}
+}
+
+func TestRetentionPersistsWithoutChangingOtherSettings(t *testing.T) {
+	t.Parallel()
+	path := filepath.Join(t.TempDir(), "config.json")
+	cfg := config.Config{Listen: "127.0.0.1:32147", DeviceID: "device-a", RetentionKeep: 50, LocalBackupDir: "/backups"}
+	manager, err := New(path, cfg, &memoryVault{values: make(map[string]string)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := manager.ConfigureRetention(51); err != nil {
+		t.Fatal(err)
+	}
+	if manager.Config().RetentionKeep != 51 {
+		t.Fatalf("in-memory retention was not updated: %#v", manager.Config())
+	}
+	loaded, err := config.Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if loaded.RetentionKeep != 51 || loaded.LocalBackupDir != "/backups" || loaded.DeviceID != "device-a" {
+		t.Fatalf("retention update corrupted config: %#v", loaded)
+	}
+}
+
+func TestDisconnectR2ClearsCredentialAndConfiguration(t *testing.T) {
+	t.Parallel()
+	path := filepath.Join(t.TempDir(), "config.json")
+	vault := &memoryVault{values: map[string]string{"r2-default": "secret"}}
+	cfg := config.Config{Listen: "127.0.0.1:32147", DeviceID: "device-a", RetentionKeep: 51, R2: config.R2{AccountID: "account", Bucket: "bucket", AccessKeyID: "key", CredentialID: "r2-default", Prefix: "prefix"}}
+	manager, err := New(path, cfg, vault)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := manager.DisconnectR2(); err != nil {
+		t.Fatal(err)
+	}
+	if _, present := vault.values["r2-default"]; present {
+		t.Fatal("R2 credential remained in the vault")
+	}
+	loaded, err := config.Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if loaded.R2.CredentialID != "" || loaded.R2.AccountID != "" || loaded.RetentionKeep != 51 {
+		t.Fatalf("disconnect left active R2 metadata or changed unrelated settings: %#v", loaded)
+	}
+	if err := manager.DisconnectR2(); err != nil {
+		t.Fatalf("disconnect was not idempotent: %v", err)
+	}
+}
+
+func TestR2HealthTracksVerificationAndFailure(t *testing.T) {
+	t.Parallel()
+	path := filepath.Join(t.TempDir(), "config.json")
+	manager, err := New(path, config.Config{
+		Listen: "127.0.0.1:32147", DeviceID: "device-a",
+		R2: config.R2{Bucket: "bucket", CredentialID: "r2-default"},
+	}, &memoryVault{values: map[string]string{"r2-default": "secret"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	manager.RecordR2Failure(errors.New("bucket unavailable"))
+	failed := manager.Config().R2
+	if failed.LastFailureAt == nil || failed.LastError != "bucket unavailable" || failed.LastVerifiedAt != nil {
+		t.Fatalf("R2 failure was not recorded: %#v", failed)
+	}
+	manager.RecordR2Success()
+	verified := manager.Config().R2
+	if verified.LastVerifiedAt == nil || verified.LastFailureAt != nil || verified.LastError != "" {
+		t.Fatalf("R2 verification did not clear degraded state: %#v", verified)
 	}
 }

@@ -38,6 +38,7 @@ var webFiles embed.FS
 
 type gameReader interface {
 	ListGames(context.Context) ([]core.Game, error)
+	ListHiddenGames(context.Context) ([]core.Game, error)
 	Game(context.Context, string) (core.Game, error)
 	ListSnapshots(context.Context, string) ([]core.Snapshot, error)
 }
@@ -68,10 +69,11 @@ type backupCoordinator interface {
 	Restore(context.Context, string, string) (core.Snapshot, error)
 	ReconcileWatches(context.Context)
 	DeleteSnapshot(context.Context, string, string, bool) error
+	SetGameHidden(context.Context, string, bool) error
 }
 
 type syncCoordinator interface {
-	SyncPending(context.Context) error
+	SyncPending(context.Context) (core.SyncResult, error)
 	SyncGame(context.Context, string) error
 	ReconcileRemote(context.Context) (remote.ReconcileResult, error)
 }
@@ -146,9 +148,12 @@ func (s *Server) Close(ctx context.Context) error {
 func (s *Server) routes(mux *http.ServeMux) {
 	mux.HandleFunc("GET /api/status", s.status)
 	mux.HandleFunc("GET /api/games", s.listGames)
+	mux.HandleFunc("GET /api/games/ignored", s.listHiddenGames)
 	mux.HandleFunc("POST /api/games", s.addGame)
 	mux.HandleFunc("GET /api/games/{id}", s.game)
 	mux.HandleFunc("PATCH /api/games/{id}", s.updateGame)
+	mux.HandleFunc("DELETE /api/games/{id}", s.hideGame)
+	mux.HandleFunc("POST /api/games/{id}/restore-library", s.restoreGame)
 	mux.HandleFunc("POST /api/games/{id}/paths", s.addPath)
 	mux.HandleFunc("PATCH /api/games/{id}/paths/{path}", s.updatePath)
 	mux.HandleFunc("DELETE /api/games/{id}/paths/{path}", s.deletePath)
@@ -156,6 +161,7 @@ func (s *Server) routes(mux *http.ServeMux) {
 	mux.HandleFunc("DELETE /api/games/{id}/exclusions/{exclusion}", s.deleteExclusion)
 	mux.HandleFunc("PUT /api/games/{id}/policy", s.updatePolicy)
 	mux.HandleFunc("POST /api/games/{id}/image", s.uploadImage)
+	mux.HandleFunc("DELETE /api/games/{id}/image", s.resetImage)
 	mux.HandleFunc("GET /api/games/{id}/snapshots", s.listSnapshots)
 	mux.HandleFunc("POST /api/games/{id}/backup", s.backup)
 	mux.HandleFunc("POST /api/games/{id}/sync", s.syncGame)
@@ -171,6 +177,7 @@ func (s *Server) routes(mux *http.ServeMux) {
 	mux.HandleFunc("POST /api/sync", s.syncAll)
 	mux.HandleFunc("POST /api/r2/reconcile", s.reconcileRemote)
 	mux.HandleFunc("POST /api/r2", s.configureR2)
+	mux.HandleFunc("DELETE /api/r2", s.disconnectR2)
 	mux.HandleFunc("GET /api/events", s.eventStream)
 	mux.Handle("GET /artwork/", http.StripPrefix("/artwork/", http.FileServer(http.Dir(s.artworkDir))))
 	assets, err := fs.Sub(webFiles, "web")
@@ -182,9 +189,22 @@ func (s *Server) routes(mux *http.ServeMux) {
 
 func (s *Server) status(writer http.ResponseWriter, request *http.Request) {
 	cfg := s.settings.Config()
+	r2State := "disconnected"
+	if cfg.R2.CredentialID != "" {
+		r2State = "configured"
+		if cfg.R2.LastFailureAt != nil && (cfg.R2.LastVerifiedAt == nil || cfg.R2.LastFailureAt.After(*cfg.R2.LastVerifiedAt)) {
+			r2State = "unavailable"
+		} else if cfg.R2.LastVerifiedAt != nil {
+			r2State = "verified"
+		}
+	}
 	writeJSON(writer, http.StatusOK, map[string]any{
 		"deviceId":       cfg.DeviceID,
 		"r2Configured":   cfg.R2.CredentialID != "",
+		"r2State":        r2State,
+		"r2LastVerified": cfg.R2.LastVerifiedAt,
+		"r2LastFailure":  cfg.R2.LastFailureAt,
+		"r2LastError":    cfg.R2.LastError,
 		"r2":             map[string]string{"accountId": cfg.R2.AccountID, "bucket": cfg.R2.Bucket, "prefix": cfg.R2.Prefix, "accessKeyId": cfg.R2.AccessKeyID},
 		"localBackupDir": cfg.LocalBackupDir,
 		"steamRoots":     cfg.SteamRoots,
@@ -194,6 +214,18 @@ func (s *Server) status(writer http.ResponseWriter, request *http.Request) {
 		"retentionKeep":  cfg.RetentionKeep,
 		"diagnostics":    s.discovery.Diagnostics(),
 	})
+}
+
+func (s *Server) listHiddenGames(writer http.ResponseWriter, request *http.Request) {
+	games, err := s.reader.ListHiddenGames(request.Context())
+	if err != nil {
+		writeError(writer, http.StatusInternalServerError, err)
+		return
+	}
+	if games == nil {
+		games = []core.Game{}
+	}
+	writeJSON(writer, http.StatusOK, games)
 }
 
 func (s *Server) listGames(writer http.ResponseWriter, request *http.Request) {
@@ -211,7 +243,15 @@ func (s *Server) listGames(writer http.ResponseWriter, request *http.Request) {
 func (s *Server) game(writer http.ResponseWriter, request *http.Request) {
 	game, err := s.reader.Game(request.Context(), request.PathValue("id"))
 	if err != nil {
-		writeError(writer, http.StatusNotFound, err)
+		if errors.Is(err, core.ErrGameNotFound) {
+			writeError(writer, http.StatusNotFound, core.ErrGameNotFound)
+		} else {
+			writeError(writer, http.StatusInternalServerError, err)
+		}
+		return
+	}
+	if game.Hidden {
+		writeError(writer, http.StatusNotFound, core.ErrGameNotFound)
 		return
 	}
 	paths, err := s.sources.GamePaths(request.Context(), game.ID)
@@ -234,7 +274,40 @@ func (s *Server) game(writer http.ResponseWriter, request *http.Request) {
 		writeError(writer, http.StatusInternalServerError, err)
 		return
 	}
+	if paths == nil {
+		paths = []core.GamePath{}
+	}
+	if registryPaths == nil {
+		registryPaths = []core.RegistryPath{}
+	}
+	if exclusions == nil {
+		exclusions = []core.GameExclusion{}
+	}
 	writeJSON(writer, http.StatusOK, map[string]any{"game": game, "paths": paths, "registry": registryPaths, "exclusions": exclusions, "policy": policy})
+}
+
+func (s *Server) hideGame(writer http.ResponseWriter, request *http.Request) {
+	if err := s.backups.SetGameHidden(request.Context(), request.PathValue("id"), true); err != nil {
+		if errors.Is(err, core.ErrGameNotFound) {
+			writeError(writer, http.StatusNotFound, core.ErrGameNotFound)
+		} else {
+			writeError(writer, http.StatusInternalServerError, err)
+		}
+		return
+	}
+	writer.WriteHeader(http.StatusNoContent)
+}
+
+func (s *Server) restoreGame(writer http.ResponseWriter, request *http.Request) {
+	if err := s.backups.SetGameHidden(request.Context(), request.PathValue("id"), false); err != nil {
+		if errors.Is(err, core.ErrGameNotFound) {
+			writeError(writer, http.StatusNotFound, core.ErrGameNotFound)
+		} else {
+			writeError(writer, http.StatusInternalServerError, err)
+		}
+		return
+	}
+	writer.WriteHeader(http.StatusNoContent)
 }
 
 func (s *Server) addGame(writer http.ResponseWriter, request *http.Request) {
@@ -430,11 +503,17 @@ func (s *Server) syncGame(writer http.ResponseWriter, request *http.Request) {
 }
 
 func (s *Server) syncAll(writer http.ResponseWriter, request *http.Request) {
-	if err := s.sync.SyncPending(request.Context()); err != nil {
+	result, err := s.sync.SyncPending(request.Context())
+	if err != nil && result.Eligible == 0 {
 		writeError(writer, http.StatusUnprocessableEntity, err)
 		return
 	}
-	writer.WriteHeader(http.StatusNoContent)
+	status := http.StatusOK
+	if err != nil {
+		status = http.StatusMultiStatus
+		result.Error = err.Error()
+	}
+	writeJSON(writer, status, result)
 }
 
 func (s *Server) reconcileRemote(writer http.ResponseWriter, request *http.Request) {
@@ -563,7 +642,15 @@ func (s *Server) configureR2(writer http.ResponseWriter, request *http.Request) 
 		writeError(writer, http.StatusBadRequest, err)
 		return
 	}
-	writeJSON(writer, http.StatusOK, map[string]any{"connected": true})
+	writeJSON(writer, http.StatusOK, map[string]any{"verified": true})
+}
+
+func (s *Server) disconnectR2(writer http.ResponseWriter, _ *http.Request) {
+	if err := s.settings.DisconnectR2(); err != nil {
+		writeError(writer, http.StatusInternalServerError, err)
+		return
+	}
+	writer.WriteHeader(http.StatusNoContent)
 }
 
 func (s *Server) eventStream(writer http.ResponseWriter, request *http.Request) {
@@ -644,12 +731,77 @@ func (s *Server) uploadImage(writer http.ResponseWriter, request *http.Request) 
 		writeError(writer, http.StatusInternalServerError, err)
 		return
 	}
+	s.cleanupObsoleteArtwork(gameID, filename)
 	writeJSON(writer, http.StatusOK, map[string]string{"image": imageURL})
+}
+
+func (s *Server) resetImage(writer http.ResponseWriter, request *http.Request) {
+	gameID := request.PathValue("id")
+	game, err := s.reader.Game(request.Context(), gameID)
+	if err != nil {
+		if errors.Is(err, core.ErrGameNotFound) {
+			writeError(writer, http.StatusNotFound, core.ErrGameNotFound)
+		} else {
+			writeError(writer, http.StatusInternalServerError, err)
+		}
+		return
+	}
+	filename, custom := localArtworkFilename(gameID, game.Image)
+	if !custom {
+		writeError(writer, http.StatusBadRequest, errors.New("this game does not have a custom picture"))
+		return
+	}
+	defaultImage := defaultGameImage(game)
+	if err := s.writer.UpdateGame(request.Context(), gameID, core.GameUpdate{Image: &defaultImage}); err != nil {
+		writeError(writer, http.StatusInternalServerError, err)
+		return
+	}
+	if err := removeTemporary(filepath.Join(s.artworkDir, filename)); err != nil {
+		if rollbackErr := s.writer.UpdateGame(request.Context(), gameID, core.GameUpdate{Image: &game.Image}); rollbackErr != nil {
+			slog.Error("restore custom artwork after cleanup failure", "game_id", gameID, "error", rollbackErr)
+		}
+		writeError(writer, http.StatusInternalServerError, fmt.Errorf("remove custom artwork: %w", err))
+		return
+	}
+	writer.WriteHeader(http.StatusNoContent)
+}
+
+func defaultGameImage(game core.Game) string {
+	if game.Store == "steam" && game.StoreID != "" {
+		return fmt.Sprintf("https://shared.cloudflare.steamstatic.com/store_item_assets/steam/apps/%s/library_600x900_2x.jpg", game.StoreID)
+	}
+	return ""
+}
+
+func localArtworkFilename(gameID, image string) (string, bool) {
+	filename := strings.TrimPrefix(image, "/artwork/")
+	if filename == image {
+		return "", false
+	}
+	for _, extension := range []string{".jpg", ".png", ".gif", ".webp"} {
+		if filename == gameID+extension {
+			return filename, true
+		}
+	}
+	return "", false
+}
+
+func (s *Server) cleanupObsoleteArtwork(gameID, keep string) {
+	for _, extension := range []string{".jpg", ".png", ".gif", ".webp"} {
+		filename := gameID + extension
+		if filename == keep {
+			continue
+		}
+		if err := removeTemporary(filepath.Join(s.artworkDir, filename)); err != nil {
+			slog.Warn("remove obsolete custom artwork", "game_id", gameID, "file", filename, "error", err)
+		}
+	}
 }
 
 var safeIDPattern = regexp.MustCompile(`^[A-Za-z0-9_-]{1,64}$`)
 
 func removeTemporary(path string) error {
+	//nolint:gosec // Callers pass application-owned temporary paths or validated artwork filenames under the private artwork directory.
 	err := os.Remove(path)
 	if errors.Is(err, os.ErrNotExist) {
 		return nil
@@ -698,6 +850,7 @@ func decodeJSON(writer http.ResponseWriter, request *http.Request, target any) b
 
 func writeJSON(writer http.ResponseWriter, status int, value any) {
 	writer.Header().Set("Content-Type", "application/json")
+	writer.Header().Set("Cache-Control", "no-store")
 	writer.WriteHeader(status)
 	if err := json.NewEncoder(writer).Encode(value); err != nil {
 		slog.Error("write HTTP response", "error", err)

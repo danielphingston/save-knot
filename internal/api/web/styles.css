@@ -16,7 +16,7 @@
 
 * { box-sizing: border-box; }
 body { margin: 0; min-width: 320px; min-height: 100vh; background: radial-gradient(circle at 80% 0, #20271a 0, var(--bg) 34rem); }
-button, input, textarea { font: inherit; }
+button, input, textarea, select { font: inherit; }
 button, a { -webkit-tap-highlight-color: transparent; }
 a { color: inherit; text-decoration: none; }
 
@@ -53,6 +53,9 @@ h3 { font-size: 15px; }
 .button.small { padding: 7px 10px; font-size: 12px; }
 
 .games { display: grid; grid-template-columns: repeat(auto-fill, minmax(255px, 1fr)); gap: 16px; }
+.library-tools { display: grid; grid-template-columns: minmax(220px, 1.5fr) repeat(3, minmax(135px, .7fr)); gap: 10px; align-items: end; margin-bottom: 18px; }
+.library-tools label { position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0 0 0 0); clip-path: inset(50%); white-space: nowrap; }
+.filtered-empty { min-height: 280px; }
 .game-card { min-width: 0; border: 1px solid var(--line); background: linear-gradient(145deg, rgba(31,36,29,.95), rgba(22,25,21,.95)); border-radius: 15px; overflow: hidden; transition: transform .16s, border-color .16s; }
 .game-card:hover { transform: translateY(-2px); border-color: #485140; }
 .cover { position: relative; aspect-ratio: 16 / 9; overflow: hidden; background: linear-gradient(135deg, #293122, #151914); display: grid; place-items: center; }
@@ -112,11 +115,13 @@ h3 { font-size: 15px; }
 .field { display: grid; gap: 7px; }
 .field.full { grid-column: 1 / -1; }
 label { color: #c8cec1; font-size: 12px; font-weight: 650; }
-input, textarea { width: 100%; border: 1px solid var(--line); border-radius: 9px; color: var(--text); background: #11140f; padding: 10px 11px; outline: none; }
-input:focus, textarea:focus { border-color: #718259; box-shadow: 0 0 0 3px rgba(199,243,106,.07); }
+input, textarea, select { width: 100%; border: 1px solid var(--line); border-radius: 9px; color: var(--text); background: #11140f; padding: 10px 11px; outline: none; }
+input:focus, textarea:focus, select:focus { border-color: #718259; box-shadow: 0 0 0 3px rgba(199,243,106,.07); }
 textarea { min-height: 90px; resize: vertical; }
 .help { color: var(--muted); font-size: 11px; line-height: 1.5; }
-.form-actions { display: flex; justify-content: flex-end; margin-top: 18px; }
+.form-actions { display: flex; justify-content: flex-end; gap: 10px; margin-top: 18px; }
+.r2-health { margin-top: 16px; }
+.ignored-games { margin-top: 14px; }
 .callout { color: var(--muted); font-size: 12px; line-height: 1.65; padding: 14px; border-radius: 10px; background: rgba(199,243,106,.045); border: 1px solid rgba(199,243,106,.12); }
 
 .modal-backdrop { position: fixed; inset: 0; z-index: 20; display: grid; place-items: center; padding: 20px; background: rgba(6,8,6,.72); backdrop-filter: blur(6px); }
@@ -141,4 +146,5 @@ textarea { min-height: 90px; resize: vertical; }
   .detail-cover { max-width: 430px; }
   .form-grid { grid-template-columns: 1fr; }
   .field.full { grid-column: auto; }
+  .library-tools { grid-template-columns: 1fr; }
 }

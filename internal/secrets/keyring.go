@@ -1,6 +1,7 @@
 package secrets
 
 import (
+	"errors"
 	"fmt"
 
 	"github.com/zalando/go-keyring"
@@ -27,6 +28,9 @@ func (Keyring) Get(id string) (string, error) {
 
 func (Keyring) Delete(id string) error {
 	if err := keyring.Delete(serviceName, id); err != nil {
+		if errors.Is(err, keyring.ErrNotFound) {
+			return nil
+		}
 		return fmt.Errorf("delete R2 secret from the operating system credential store: %w", err)
 	}
 	return nil

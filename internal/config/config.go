@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"time"
 )
 
 const DefaultManifestURL = "https://raw.githubusercontent.com/mtkennerly/ludusavi-manifest/master/data/manifest.yaml"
@@ -25,11 +26,14 @@ type Config struct {
 }
 
 type R2 struct {
-	AccountID    string `json:"accountId"`
-	Bucket       string `json:"bucket"`
-	Prefix       string `json:"prefix"`
-	AccessKeyID  string `json:"accessKeyId"`
-	CredentialID string `json:"credentialId"`
+	AccountID      string     `json:"accountId"`
+	Bucket         string     `json:"bucket"`
+	Prefix         string     `json:"prefix"`
+	AccessKeyID    string     `json:"accessKeyId"`
+	CredentialID   string     `json:"credentialId"`
+	LastVerifiedAt *time.Time `json:"lastVerifiedAt,omitempty"`
+	LastFailureAt  *time.Time `json:"lastFailureAt,omitempty"`
+	LastError      string     `json:"lastError,omitempty"`
 }
 
 type Local struct {

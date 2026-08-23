@@ -66,3 +66,43 @@ func TestParseLibraryFolders(t *testing.T) {
 		t.Fatalf("unexpected library paths: %#v", paths)
 	}
 }
+
+func TestSteamPathIdentityFoldsOnlyWindowsPaths(t *testing.T) {
+	t.Parallel()
+	if steamPathIdentity(`E:\Steam\steamapps\..`, "windows") != steamPathIdentity(`e:/steam`, "windows") {
+		t.Fatal("Windows path casing or separators were not folded")
+	}
+	if steamPathIdentity("/games/Steam", "linux") == steamPathIdentity("/games/steam", "linux") {
+		t.Fatal("case-distinct Unix paths were incorrectly folded")
+	}
+}
+
+func TestDiscoverSteamDeduplicatesAppIDAcrossLibraries(t *testing.T) {
+	t.Setenv("XDG_DATA_HOME", filepath.Join(t.TempDir(), "data"))
+	createLibrary := func(root, name string) {
+		steamapps := filepath.Join(root, "steamapps")
+		if err := os.MkdirAll(steamapps, 0o700); err != nil {
+			t.Fatal(err)
+		}
+		manifest := `"AppState"
+{
+  "appid" "1234"
+  "name" "` + name + `"
+  "installdir" "Example"
+}`
+		if err := os.WriteFile(filepath.Join(steamapps, "appmanifest_1234.acf"), []byte(manifest), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	first := t.TempDir()
+	second := t.TempDir()
+	createLibrary(first, "First")
+	createLibrary(second, "Second")
+	games, err := DiscoverSteam(t.Context(), []string{first, second})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(games) != 1 || games[0].AppID != "1234" || games[0].Library != first {
+		t.Fatalf("duplicate AppID was not resolved deterministically: %#v", games)
+	}
+}

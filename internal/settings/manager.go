@@ -4,7 +4,9 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
 	"time"
@@ -20,6 +22,7 @@ var ErrR2NotConfigured = errors.New("R2 is not configured")
 type vault interface {
 	Set(string, string) error
 	Get(string) (string, error)
+	Delete(string) error
 }
 
 func (m *Manager) ConfigureAutostart(enabled bool) error {
@@ -59,6 +62,7 @@ func (m *Manager) ConfigureLocal(local config.Local) error {
 	}
 	cleanRoots := func(label string, roots []string) ([]string, error) {
 		cleaned := make([]string, 0, len(roots))
+		seen := make(map[string]struct{}, len(roots))
 		for _, root := range roots {
 			root = filepath.Clean(strings.TrimSpace(root))
 			if root == "." {
@@ -67,6 +71,14 @@ func (m *Manager) ConfigureLocal(local config.Local) error {
 			if !filepath.IsAbs(root) {
 				return nil, fmt.Errorf("%s path %q must be absolute", label, root)
 			}
+			identity := root
+			if runtime.GOOS == "windows" {
+				identity = strings.ToLower(strings.ReplaceAll(identity, "/", `\`))
+			}
+			if _, exists := seen[identity]; exists {
+				continue
+			}
+			seen[identity] = struct{}{}
 			cleaned = append(cleaned, root)
 		}
 		return cleaned, nil
@@ -155,6 +167,10 @@ func (m *Manager) ConfigureR2(ctx context.Context, settings config.R2, secret st
 		return err
 	}
 	settings.CredentialID = credentialID
+	verifiedAt := time.Now().UTC()
+	settings.LastVerifiedAt = &verifiedAt
+	settings.LastFailureAt = nil
+	settings.LastError = ""
 	m.mu.Lock()
 	updated := m.config
 	updated.R2 = settings
@@ -165,4 +181,67 @@ func (m *Manager) ConfigureR2(ctx context.Context, settings config.R2, secret st
 	m.config = updated
 	m.mu.Unlock()
 	return nil
+}
+
+func (m *Manager) DisconnectR2() error {
+	m.mu.RLock()
+	credentialID := m.config.R2.CredentialID
+	m.mu.RUnlock()
+	if credentialID == "" {
+		return nil
+	}
+	secret, getErr := m.vault.Get(credentialID)
+	if getErr != nil {
+		slog.Warn("load R2 secret before disconnect", "error", getErr)
+	}
+	if err := m.vault.Delete(credentialID); err != nil {
+		return err
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	updated := m.config
+	updated.R2 = config.R2{Prefix: "saveknot"}
+	if err := config.Save(m.path, updated); err != nil {
+		var restoreErr error
+		if secret != "" {
+			restoreErr = m.vault.Set(credentialID, secret)
+		}
+		return errors.Join(fmt.Errorf("save disconnected R2 settings: %w", err), restoreErr)
+	}
+	m.config = updated
+	return nil
+}
+
+func (m *Manager) RecordR2Success() {
+	m.recordR2Health(nil)
+}
+
+func (m *Manager) RecordR2Failure(err error) {
+	if err == nil || errors.Is(err, ErrR2NotConfigured) {
+		return
+	}
+	m.recordR2Health(err)
+}
+
+func (m *Manager) recordR2Health(operationErr error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.config.R2.CredentialID == "" {
+		return
+	}
+	updated := m.config
+	now := time.Now().UTC()
+	if operationErr == nil {
+		updated.R2.LastVerifiedAt = &now
+		updated.R2.LastFailureAt = nil
+		updated.R2.LastError = ""
+	} else {
+		updated.R2.LastFailureAt = &now
+		updated.R2.LastError = operationErr.Error()
+	}
+	if err := config.Save(m.path, updated); err != nil {
+		slog.Warn("save R2 health", "error", err)
+		return
+	}
+	m.config = updated
 }

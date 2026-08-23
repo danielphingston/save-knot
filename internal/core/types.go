@@ -1,6 +1,11 @@
 package core
 
-import "time"
+import (
+	"errors"
+	"time"
+)
+
+var ErrGameNotFound = errors.New("game not found")
 
 type Game struct {
 	ID            string     `json:"id"`
@@ -14,11 +19,20 @@ type Game struct {
 	Notes         string     `json:"notes,omitempty"`
 	Enabled       bool       `json:"enabled"`
 	SyncEnabled   bool       `json:"syncEnabled"`
+	Hidden        bool       `json:"hidden,omitempty"`
 	LastSeen      *time.Time `json:"lastSeen,omitempty"`
 	LastChange    *time.Time `json:"lastChange,omitempty"`
 	LastBackup    *time.Time `json:"lastBackup,omitempty"`
 	SnapshotCount int        `json:"snapshotCount"`
 	StoredSize    int64      `json:"storedSize"`
+	PendingCount  int        `json:"pendingSnapshotCount"`
+}
+
+type SyncResult struct {
+	Eligible int    `json:"eligible"`
+	Synced   int    `json:"synced"`
+	Failed   int    `json:"failed"`
+	Error    string `json:"error,omitempty"`
 }
 
 type GamePath struct {

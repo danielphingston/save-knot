@@ -26,7 +26,11 @@ type Application struct {
 }
 
 func Build(ctx context.Context, dataDir, listenOverride string) (*Application, error) {
-	paths := config.DataPaths(dataDir)
+	absoluteDataDir, err := filepath.Abs(dataDir)
+	if err != nil {
+		return nil, fmt.Errorf("resolve data directory: %w", err)
+	}
+	paths := config.DataPaths(absoluteDataDir)
 	for _, directory := range []string{paths.Root, paths.Blobs, filepath.Join(paths.Root, "artwork")} {
 		if err := os.MkdirAll(directory, 0o700); err != nil {
 			return nil, fmt.Errorf("create data directory %q: %w", directory, err)
@@ -41,6 +45,11 @@ func Build(ctx context.Context, dataDir, listenOverride string) (*Application, e
 	}
 	if cfg.LocalBackupDir == "" {
 		cfg.LocalBackupDir = paths.Blobs
+	} else if !filepath.IsAbs(cfg.LocalBackupDir) {
+		cfg.LocalBackupDir, err = filepath.Abs(cfg.LocalBackupDir)
+		if err != nil {
+			return nil, fmt.Errorf("resolve local backup directory: %w", err)
+		}
 	}
 	if err := os.MkdirAll(cfg.LocalBackupDir, 0o700); err != nil {
 		return nil, fmt.Errorf("create local backup directory %q: %w", cfg.LocalBackupDir, err)
@@ -62,7 +71,7 @@ func Build(ctx context.Context, dataDir, listenOverride string) (*Application, e
 	snapshotService := snapshot.New(repository, repository, cfg.LocalBackupDir, settingsManager.Config().DeviceID)
 	syncer := remote.NewSyncer(repository)
 	reconciler := remote.NewReconciler(repository)
-	coordinator := NewCoordinator(repository, repository, repository, snapshotService, syncer, reconciler, settingsManager, paths, eventBus, watchManager)
+	coordinator := NewCoordinator(repository, repository, repository, repository, snapshotService, syncer, reconciler, settingsManager, paths, eventBus, watchManager)
 	server, err := api.New(settingsManager.Config().Listen, repository, repository, repository, repository, coordinator, coordinator, coordinator, settingsManager, eventBus, filepath.Join(paths.Root, "artwork"))
 	if err != nil {
 		return nil, errors.Join(err, watchManager.Close(), repository.Close())
