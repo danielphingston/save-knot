@@ -174,6 +174,7 @@ func (s *Server) routes(mux *http.ServeMux) {
 	mux.HandleFunc("PUT /api/settings/local", s.configureLocal)
 	mux.HandleFunc("PUT /api/settings/autostart", s.configureAutostart)
 	mux.HandleFunc("PUT /api/settings/retention", s.configureRetention)
+	mux.HandleFunc("PUT /api/settings/automation", s.configureAutomation)
 	mux.HandleFunc("POST /api/sync", s.syncAll)
 	mux.HandleFunc("POST /api/r2/reconcile", s.reconcileRemote)
 	mux.HandleFunc("POST /api/r2", s.configureR2)
@@ -212,6 +213,7 @@ func (s *Server) status(writer http.ResponseWriter, request *http.Request) {
 		"gogRoots":       cfg.GOGRoots,
 		"launchAtLogin":  cfg.LaunchAtLogin,
 		"retentionKeep":  cfg.RetentionKeep,
+		"automation":     cfg.Automation,
 		"diagnostics":    s.discovery.Diagnostics(),
 	})
 }
@@ -609,6 +611,18 @@ func (s *Server) configureRetention(writer http.ResponseWriter, request *http.Re
 		return
 	}
 	if err := s.settings.ConfigureRetention(input.Keep); err != nil {
+		writeError(writer, http.StatusBadRequest, err)
+		return
+	}
+	writer.WriteHeader(http.StatusNoContent)
+}
+
+func (s *Server) configureAutomation(writer http.ResponseWriter, request *http.Request) {
+	var input config.Automation
+	if !decodeJSON(writer, request, &input) {
+		return
+	}
+	if err := s.settings.ConfigureAutomation(input); err != nil {
 		writeError(writer, http.StatusBadRequest, err)
 		return
 	}

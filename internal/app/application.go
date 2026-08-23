@@ -71,7 +71,7 @@ func Build(ctx context.Context, dataDir, listenOverride string) (*Application, e
 	snapshotService := snapshot.New(repository, repository, cfg.LocalBackupDir, settingsManager.Config().DeviceID)
 	syncer := remote.NewSyncer(repository)
 	reconciler := remote.NewReconciler(repository)
-	coordinator := NewCoordinator(repository, repository, repository, repository, snapshotService, syncer, reconciler, settingsManager, paths, eventBus, watchManager)
+	coordinator := NewCoordinator(repository, repository, repository, repository, repository, snapshotService, syncer, reconciler, settingsManager, paths, eventBus, watchManager)
 	server, err := api.New(settingsManager.Config().Listen, repository, repository, repository, repository, coordinator, coordinator, coordinator, settingsManager, eventBus, filepath.Join(paths.Root, "artwork"))
 	if err != nil {
 		return nil, errors.Join(err, watchManager.Close(), repository.Close())

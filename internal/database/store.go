@@ -638,6 +638,12 @@ func (s *Store) PendingSnapshotsForGame(ctx context.Context, gameID string) ([]c
 	return s.pendingSnapshots(ctx, gameID, true)
 }
 
+func (s *Store) PendingSnapshotsForWatchedGames(ctx context.Context) (snapshots []core.Snapshot, err error) {
+	query := `SELECT s.manifest FROM snapshots s JOIN games g ON g.id = s.game_id
+		WHERE s.remote_state != 'synced' AND g.enabled = 1 AND g.sync_enabled = 1 AND g.hidden = 0 ORDER BY s.created_at`
+	return s.scanPendingSnapshots(ctx, query, nil)
+}
+
 func (s *Store) pendingSnapshots(ctx context.Context, gameID string, filterGame bool) (snapshots []core.Snapshot, err error) {
 	query := `SELECT s.manifest FROM snapshots s JOIN games g ON g.id = s.game_id WHERE s.remote_state != 'synced'`
 	arguments := []any{}
@@ -648,6 +654,10 @@ func (s *Store) pendingSnapshots(ctx context.Context, gameID string, filterGame 
 		query += ` AND g.sync_enabled = 1 AND g.hidden = 0`
 	}
 	query += ` ORDER BY s.created_at`
+	return s.scanPendingSnapshots(ctx, query, arguments)
+}
+
+func (s *Store) scanPendingSnapshots(ctx context.Context, query string, arguments []any) (snapshots []core.Snapshot, err error) {
 	rows, err := s.db.QueryContext(ctx, query, arguments...)
 	if err != nil {
 		return nil, fmt.Errorf("list pending snapshots: %w", err)

@@ -22,7 +22,7 @@ There is no SaveKnot account, hosted backend, central database, analytics servic
 - Conservative restores with a pre-restore snapshot and SHA-256 verification
 - Recursive Windows registry backup and restore
 - Custom titles, notes, catalog remapping, pictures, save locations, file exclusions, and per-game backup policy
-- Configurable local backup location, per-game retention, and per-user launch at login
+- Configurable local backup location, per-game retention, periodic watched-game sync, optional game discovery, and per-user launch at login
 - Embedded localhost UI, native folder picker, discovery diagnostics, and server-sent activity events
 - Persistent rotating logs at `<data directory>/logs/saveknot.log`
 - OS credential-vault storage for the R2 secret access key
@@ -66,7 +66,7 @@ Open **Settings → Discovery diagnostics**, then select **Scan now**. The panel
 
 Ludusavi is the save-definition catalog, not a rich store-metadata API. SaveKnot consumes its canonical title, aliases, store IDs, installation aliases, file/registry rules, constraints, and path placeholders. Steam cover art is derived separately from a matched Steam app ID; custom pictures always override it. Ludusavi does not supply descriptions or cover images.
 
-Game discovery is deliberately manual. SaveKnot refreshes its compact catalog in the background, but it only searches launchers and local save locations when you select **Scan for games** or **Scan now**. Between scans, it watches only enabled save locations already registered in the local database.
+Game discovery is manual by default. SaveKnot refreshes its compact catalog in the background, and searches launchers and local save locations when you select **Scan for games** or **Scan now**. You can independently enable a periodic search in **Settings → Automatic sync & discovery**. Between scans, it watches only enabled save locations already registered in the local database.
 
 ## Connect R2
 

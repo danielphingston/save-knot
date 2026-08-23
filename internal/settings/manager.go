@@ -55,6 +55,21 @@ func (m *Manager) ConfigureRetention(keep int) error {
 	return nil
 }
 
+func (m *Manager) ConfigureAutomation(automation config.Automation) error {
+	if err := automation.Validate(); err != nil {
+		return err
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	updated := m.config
+	updated.Automation = automation
+	if err := config.Save(m.path, updated); err != nil {
+		return fmt.Errorf("save automation settings: %w", err)
+	}
+	m.config = updated
+	return nil
+}
+
 func (m *Manager) ConfigureLocal(local config.Local) error {
 	local.LocalBackupDir = filepath.Clean(strings.TrimSpace(local.LocalBackupDir))
 	if !filepath.IsAbs(local.LocalBackupDir) {

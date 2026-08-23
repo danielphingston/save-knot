@@ -67,6 +67,25 @@ func TestRetentionPersistsWithoutChangingOtherSettings(t *testing.T) {
 	}
 }
 
+func TestAutomationPersistsIndependentSchedules(t *testing.T) {
+	t.Parallel()
+	path := filepath.Join(t.TempDir(), "config.json")
+	manager, err := New(path, config.Config{Listen: "127.0.0.1:32147", DeviceID: "device-a"}, &memoryVault{values: make(map[string]string)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	automation := config.Automation{SyncIntervalMinutes: 30, PeriodicDiscoveryEnabled: true, DiscoveryIntervalMinutes: 180}
+	if err := manager.ConfigureAutomation(automation); err != nil {
+		t.Fatal(err)
+	}
+	if manager.Config().Automation != automation {
+		t.Fatalf("automation was not stored: %#v", manager.Config().Automation)
+	}
+	if err := manager.ConfigureAutomation(config.Automation{}); err == nil {
+		t.Fatal("invalid zero intervals were accepted")
+	}
+}
+
 func TestDisconnectR2ClearsCredentialAndConfiguration(t *testing.T) {
 	t.Parallel()
 	path := filepath.Join(t.TempDir(), "config.json")
