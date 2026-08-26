@@ -44,6 +44,8 @@ h2 { font-size: 21px; letter-spacing: -.025em; }
 h3 { font-size: 15px; }
 .subtle { color: var(--muted); font-size: 14px; line-height: 1.6; }
 .actions { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+.sync-now-control { display: grid; gap: 5px; justify-items: stretch; }
+.sync-now-control small { color: var(--muted); font-size: 10px; text-align: center; }
 .button { appearance: none; border: 1px solid var(--line); color: var(--text); background: var(--panel-raised); border-radius: 9px; padding: 10px 14px; font-size: 13px; font-weight: 720; cursor: pointer; transition: transform .12s, border-color .12s, background .12s; }
 .button:hover { border-color: #47503e; transform: translateY(-1px); }
 .button.primary { color: #142008; background: var(--accent); border-color: var(--accent); }

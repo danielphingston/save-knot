@@ -3,6 +3,7 @@ module github.com/saveknot/saveknot
 go 1.26
 
 require (
+	fyne.io/systray v1.12.2
 	github.com/aws/aws-sdk-go-v2 v1.43.7
 	github.com/aws/aws-sdk-go-v2/config v1.32.38
 	github.com/aws/aws-sdk-go-v2/credentials v1.19.37

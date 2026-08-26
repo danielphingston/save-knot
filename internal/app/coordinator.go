@@ -31,12 +31,16 @@ type repository interface {
 	GamePaths(context.Context, string) ([]core.GamePath, error)
 }
 
+type diagnosticsRepository interface {
+	SaveDiagnostics(context.Context, core.Diagnostics) error
+	LoadDiagnostics(context.Context) (core.Diagnostics, bool, error)
+}
+
 type gameStateRepository interface {
 	SetGameHidden(context.Context, string, bool) error
 }
 
 type pendingRepository interface {
-	PendingSnapshots(context.Context) ([]core.Snapshot, error)
 	PendingSnapshotsForGame(context.Context, string) ([]core.Snapshot, error)
 	Snapshot(context.Context, string) (core.Snapshot, error)
 	DeleteSnapshot(context.Context, string) error
@@ -53,22 +57,23 @@ type registryRepository interface {
 }
 
 type Coordinator struct {
-	repository    repository
-	gameState     gameStateRepository
-	pending       pendingRepository
-	periodic      periodicPendingRepository
-	registry      registryRepository
-	snapshots     *snapshot.Service
-	syncer        *remote.Syncer
-	reconciler    *remote.Reconciler
-	settings      *settings.Manager
-	paths         config.Paths
-	events        *events.Bus
-	watcher       *watcher.Manager
-	backupMu      sync.Mutex
-	reconcileMu   sync.Mutex
-	diagnosticsMu sync.RWMutex
-	diagnostics   core.Diagnostics
+	repository      repository
+	diagnosticCache diagnosticsRepository
+	gameState       gameStateRepository
+	pending         pendingRepository
+	periodic        periodicPendingRepository
+	registry        registryRepository
+	snapshots       *snapshot.Service
+	syncer          *remote.Syncer
+	reconciler      *remote.Reconciler
+	settings        *settings.Manager
+	paths           config.Paths
+	events          *events.Bus
+	watcher         *watcher.Manager
+	backupMu        sync.Mutex
+	reconcileMu     sync.Mutex
+	diagnosticsMu   sync.RWMutex
+	diagnostics     core.Diagnostics
 }
 
 func (c *Coordinator) Diagnostics() core.Diagnostics {
@@ -80,8 +85,25 @@ func (c *Coordinator) Diagnostics() core.Diagnostics {
 	return result
 }
 
+func (c *Coordinator) loadCachedDiagnostics(ctx context.Context) {
+	diagnostics, found, err := c.diagnosticCache.LoadDiagnostics(ctx)
+	if err != nil {
+		slog.Warn("load cached discovery diagnostics", "error", err)
+		return
+	}
+	if !found {
+		return
+	}
+	diagnostics.Discovery.SteamRoots = append([]string(nil), diagnostics.Discovery.SteamRoots...)
+	diagnostics.Discovery.Unmatched = append([]string(nil), diagnostics.Discovery.Unmatched...)
+	c.diagnosticsMu.Lock()
+	c.diagnostics = diagnostics
+	c.diagnosticsMu.Unlock()
+}
+
 func NewCoordinator(
 	repository repository,
+	diagnosticCache diagnosticsRepository,
 	gameState gameStateRepository,
 	pending pendingRepository,
 	periodic periodicPendingRepository,
@@ -95,7 +117,7 @@ func NewCoordinator(
 	watchManager *watcher.Manager,
 ) *Coordinator {
 	return &Coordinator{
-		repository: repository, gameState: gameState, pending: pending, periodic: periodic, registry: registry, snapshots: snapshots, syncer: syncer, reconciler: reconciler, settings: settings,
+		repository: repository, diagnosticCache: diagnosticCache, gameState: gameState, pending: pending, periodic: periodic, registry: registry, snapshots: snapshots, syncer: syncer, reconciler: reconciler, settings: settings,
 		paths: paths, events: eventBus, watcher: watchManager,
 	}
 }
@@ -164,7 +186,7 @@ func (c *Coordinator) refreshCatalog(ctx context.Context) {
 	updated, err := fetcher.Update(ctx)
 	if err != nil {
 		slog.Error("refresh Ludusavi catalog", "url", cfg.ManifestURL, "cache", c.paths.Catalog, "error", err)
-		c.setCatalogDiagnostics(checked, false, 0, err)
+		c.setCatalogDiagnostics(ctx, checked, false, 0, err)
 		if indexErr := catalog.EnsureIndex(ctx, c.paths.Catalog, c.paths.CatalogDB); indexErr != nil {
 			c.events.Publish(core.Event{Type: "catalog.failed", Message: err.Error()})
 			return
@@ -176,10 +198,10 @@ func (c *Coordinator) refreshCatalog(ctx context.Context) {
 	count, err := (catalog.Index{Path: c.paths.CatalogDB}).Count(ctx)
 	if err != nil {
 		slog.Error("inspect Ludusavi catalog index", "path", c.paths.CatalogDB, "error", err)
-		c.setCatalogDiagnostics(checked, false, 0, err)
+		c.setCatalogDiagnostics(ctx, checked, false, 0, err)
 		return
 	}
-	c.setCatalogDiagnostics(checked, true, count, nil)
+	c.setCatalogDiagnostics(ctx, checked, true, count, nil)
 }
 
 func (c *Coordinator) discover(ctx context.Context) {
@@ -189,16 +211,16 @@ func (c *Coordinator) discover(ctx context.Context) {
 	count, err := index.Count(ctx)
 	if err != nil {
 		slog.Error("load Ludusavi catalog index", "path", c.paths.CatalogDB, "error", err)
-		c.setCatalogDiagnostics(time.Now().UTC(), false, 0, err)
+		c.setCatalogDiagnostics(ctx, time.Now().UTC(), false, 0, err)
 		return
 	}
 	now := time.Now().UTC()
-	c.setCatalogDiagnostics(now, true, count, nil)
+	c.setCatalogDiagnostics(ctx, now, true, count, nil)
 	roots := discovery.SteamRoots(c.settings.Config().SteamRoots)
 	installed, err := discovery.DiscoverSteam(ctx, roots)
 	if err != nil {
 		slog.Error("discover Steam games", "roots", roots, "error", err)
-		c.setDiscoveryDiagnostics(core.DiscoveryDiagnostics{LastRun: &now, SteamRoots: roots, LastError: err.Error()})
+		c.setDiscoveryDiagnostics(ctx, core.DiscoveryDiagnostics{LastRun: &now, SteamRoots: roots, LastError: err.Error()})
 		c.events.Publish(core.Event{Type: "discovery.failed", Message: err.Error()})
 		return
 	}
@@ -219,10 +241,10 @@ func (c *Coordinator) discover(ctx context.Context) {
 	registered += localRegistered
 	if deepErr != nil {
 		slog.Error("deep local-save discovery failed", "error", deepErr)
-		c.setDiscoveryDiagnostics(core.DiscoveryDiagnostics{LastRun: &now, SteamRoots: roots, SteamInstalled: len(installed), EpicInstalled: len(epicInstalled), GOGInstalled: len(gogInstalled), CatalogMatched: matched, GamesRegistered: registered, DeepScanMillis: deepMillis, Unmatched: unmatched, LastError: deepErr.Error()})
+		c.setDiscoveryDiagnostics(ctx, core.DiscoveryDiagnostics{LastRun: &now, SteamRoots: roots, SteamInstalled: len(installed), EpicInstalled: len(epicInstalled), GOGInstalled: len(gogInstalled), CatalogMatched: matched, GamesRegistered: registered, DeepScanMillis: deepMillis, Unmatched: unmatched, LastError: deepErr.Error()})
 		return
 	}
-	c.setDiscoveryDiagnostics(core.DiscoveryDiagnostics{LastRun: &now, SteamRoots: roots, SteamInstalled: len(installed), EpicInstalled: len(epicInstalled), GOGInstalled: len(gogInstalled), CatalogMatched: matched, GamesRegistered: registered, LocalSaveGames: localFound, DeepScanMillis: deepMillis, Unmatched: unmatched})
+	c.setDiscoveryDiagnostics(ctx, core.DiscoveryDiagnostics{LastRun: &now, SteamRoots: roots, SteamInstalled: len(installed), EpicInstalled: len(epicInstalled), GOGInstalled: len(gogInstalled), CatalogMatched: matched, GamesRegistered: registered, LocalSaveGames: localFound, DeepScanMillis: deepMillis, Unmatched: unmatched})
 	slog.Info("game discovery completed", "catalog_games", count, "steam_roots", len(roots), "steam_installed", len(installed), "epic_installed", len(epicInstalled), "gog_installed", len(gogInstalled), "catalog_matched", matched, "local_save_games", localFound, "registered", registered, "unmatched", len(unmatched), "deep_scan_ms", deepMillis)
 	c.ReconcileWatches(ctx)
 }
@@ -491,7 +513,7 @@ func (c *Coordinator) ReconcileWatches(ctx context.Context) {
 	slog.Debug("filesystem watches reconciled", "targets", len(targets))
 }
 
-func (c *Coordinator) setCatalogDiagnostics(checked time.Time, loaded bool, count int, diagnosticErr error) {
+func (c *Coordinator) setCatalogDiagnostics(ctx context.Context, checked time.Time, loaded bool, count int, diagnosticErr error) {
 	c.diagnosticsMu.Lock()
 	defer c.diagnosticsMu.Unlock()
 	c.diagnostics.Catalog.Loaded = loaded
@@ -499,14 +521,26 @@ func (c *Coordinator) setCatalogDiagnostics(checked time.Time, loaded bool, coun
 	c.diagnostics.Catalog.CachePath = c.paths.Catalog
 	c.diagnostics.Catalog.LastChecked = &checked
 	c.diagnostics.Catalog.LastError = errorMessage(diagnosticErr)
+	c.persistDiagnostics(ctx)
 }
 
-func (c *Coordinator) setDiscoveryDiagnostics(diagnostics core.DiscoveryDiagnostics) {
+func (c *Coordinator) setDiscoveryDiagnostics(ctx context.Context, diagnostics core.DiscoveryDiagnostics) {
 	c.diagnosticsMu.Lock()
 	defer c.diagnosticsMu.Unlock()
 	diagnostics.SteamRoots = append([]string(nil), diagnostics.SteamRoots...)
 	diagnostics.Unmatched = append([]string(nil), diagnostics.Unmatched...)
 	c.diagnostics.Discovery = diagnostics
+	c.persistDiagnostics(ctx)
+}
+
+// persistDiagnostics is called with diagnosticsMu held so concurrent catalog
+// and discovery updates cannot overwrite each other with an older snapshot.
+func (c *Coordinator) persistDiagnostics(ctx context.Context) {
+	updatedAt := time.Now().UTC()
+	c.diagnostics.UpdatedAt = &updatedAt
+	if err := c.diagnosticCache.SaveDiagnostics(ctx, c.diagnostics); err != nil {
+		slog.Warn("cache discovery diagnostics", "error", err)
+	}
 }
 
 func errorMessage(err error) string {
@@ -627,8 +661,55 @@ func (c *Coordinator) ReconcileRemote(ctx context.Context) (remote.ReconcileResu
 	return result, nil
 }
 
-func (c *Coordinator) SyncPending(ctx context.Context) (core.SyncResult, error) {
-	return c.syncPending(ctx, c.pending.PendingSnapshots)
+func (c *Coordinator) SyncNow(ctx context.Context) (core.SyncResult, error) {
+	if _, err := c.settings.R2(ctx); err != nil {
+		c.settings.RecordR2Failure(err)
+		return core.SyncResult{}, err
+	}
+	games, err := c.repository.ListGames(ctx)
+	if err != nil {
+		return core.SyncResult{}, err
+	}
+	result, backupErr := checkpointWatchedGames(ctx, games, c.Backup, c.events.Publish)
+	uploaded, uploadErr := c.syncWatchedPending(ctx)
+	result.Eligible = uploaded.Eligible
+	result.Synced = uploaded.Synced
+	result.Failed = uploaded.Failed
+	return result, errors.Join(backupErr, uploadErr)
+}
+
+func checkpointWatchedGames(
+	ctx context.Context,
+	games []core.Game,
+	backup func(context.Context, string) (core.Snapshot, error),
+	publish func(core.Event),
+) (core.SyncResult, error) {
+	var result core.SyncResult
+	var failures []error
+	for _, game := range games {
+		if err := ctx.Err(); err != nil {
+			failures = append(failures, err)
+			break
+		}
+		if !game.Enabled || !game.SyncEnabled || game.Hidden {
+			continue
+		}
+		result.CheckedGames++
+		_, err := backup(ctx, game.ID)
+		switch {
+		case err == nil:
+			result.CreatedSnapshots++
+		case errors.Is(err, snapshot.ErrUnchanged):
+			result.UnchangedGames++
+		case errors.Is(err, snapshot.ErrNoFiles):
+			result.NoFilesGames++
+		default:
+			result.BackupFailed++
+			failures = append(failures, fmt.Errorf("checkpoint %q: %w", game.DisplayName, err))
+			publish(core.Event{Type: "snapshot.failed", GameID: game.ID, Message: err.Error()})
+		}
+	}
+	return result, errors.Join(failures...)
 }
 
 func (c *Coordinator) syncWatchedPending(ctx context.Context) (core.SyncResult, error) {
@@ -656,7 +737,7 @@ func (c *Coordinator) syncPending(ctx context.Context, load func(context.Context
 		}
 	}
 	if result.Synced > 0 {
-		c.settings.RecordR2Success()
+		c.settings.RecordR2Sync()
 	}
 	if uploadErr != nil {
 		c.settings.RecordR2Failure(uploadErr)
@@ -791,7 +872,7 @@ func (c *Coordinator) syncOne(ctx context.Context, target core.Snapshot) error {
 		c.settings.RecordR2Failure(err)
 		return err
 	}
-	c.settings.RecordR2Success()
+	c.settings.RecordR2Sync()
 	c.events.Publish(core.Event{Type: "upload.completed", GameID: target.GameID, Data: map[string]any{"snapshotId": target.ID}})
 	return nil
 }
@@ -801,7 +882,7 @@ func (c *Coordinator) uploadAll(ctx context.Context, r2 *remote.R2, snapshots []
 	for _, pendingSnapshot := range snapshots {
 		if err := c.syncer.Upload(ctx, r2, pendingSnapshot); err != nil {
 			if uploaded {
-				c.settings.RecordR2Success()
+				c.settings.RecordR2Sync()
 			}
 			return err
 		}
@@ -809,7 +890,7 @@ func (c *Coordinator) uploadAll(ctx context.Context, r2 *remote.R2, snapshots []
 		c.events.Publish(core.Event{Type: "upload.completed", GameID: pendingSnapshot.GameID, Data: map[string]any{"snapshotId": pendingSnapshot.ID}})
 	}
 	if uploaded {
-		c.settings.RecordR2Success()
+		c.settings.RecordR2Sync()
 	}
 	return nil
 }

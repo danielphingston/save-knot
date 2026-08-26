@@ -7,12 +7,15 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
 	"github.com/saveknot/saveknot/internal/catalog"
 	"github.com/saveknot/saveknot/internal/config"
 	"github.com/saveknot/saveknot/internal/core"
+	"github.com/saveknot/saveknot/internal/database"
+	"github.com/saveknot/saveknot/internal/snapshot"
 )
 
 func TestApplicationBuildAndCatalogDiscovery(t *testing.T) {
@@ -83,6 +86,52 @@ func TestBuildNormalizesRelativeDataAndBackupPaths(t *testing.T) {
 	}
 	if _, err := application.coordinator.Backup(context.Background(), game.ID); !errors.Is(err, core.ErrGameNotFound) {
 		t.Fatalf("hidden game accepted a queued backup: %v", err)
+	}
+}
+
+func TestBuildLoadsCachedDiscoveryDiagnostics(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	dataDir := t.TempDir()
+	paths := config.DataPaths(dataDir)
+	if err := config.Save(paths.Config, config.Config{
+		Listen: "127.0.0.1:0", LocalBackupDir: filepath.Join(dataDir, "blobs"),
+		RetentionKeep: 50, DeviceID: "test-device", R2: config.R2{Prefix: "saveknot"},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	store, err := database.Open(ctx, paths.Database)
+	if err != nil {
+		t.Fatal(err)
+	}
+	updatedAt := time.UnixMilli(1_700_000_000_123).UTC()
+	lastRun := time.UnixMilli(1_700_000_100_456).UTC()
+	want := core.Diagnostics{
+		Discovery: core.DiscoveryDiagnostics{LastRun: &lastRun, SteamInstalled: 8, GamesRegistered: 14, SteamRoots: []string{`E:\steam`}},
+		UpdatedAt: &updatedAt,
+	}
+	if err := store.SaveDiagnostics(ctx, want); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	application, err := Build(ctx, dataDir, "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if err := errors.Join(application.coordinator.Close(), application.database.Close()); err != nil {
+			t.Error(err)
+		}
+	})
+	got := application.coordinator.Diagnostics()
+	if got.UpdatedAt == nil || !got.UpdatedAt.Equal(updatedAt) || got.Discovery.LastRun == nil || !got.Discovery.LastRun.Equal(lastRun) {
+		t.Fatalf("cached diagnostic timestamps were not restored: %#v", got)
+	}
+	if got.Discovery.SteamInstalled != want.Discovery.SteamInstalled || got.Discovery.GamesRegistered != want.Discovery.GamesRegistered || len(got.Discovery.SteamRoots) != 1 {
+		t.Fatalf("cached discovery counts were not restored: %#v", got.Discovery)
 	}
 }
 
@@ -234,5 +283,47 @@ func TestSyncSnapshotBatchContinuesAfterIndividualFailure(t *testing.T) {
 	}
 	if len(syncedGames) != 2 || len(published) != 3 || published[1].Type != "upload.failed" {
 		t.Fatalf("batch outcomes were not recorded: games=%#v events=%#v", syncedGames, published)
+	}
+}
+
+func TestCheckpointWatchedGamesOnlyChecksEligibleGamesAndContinuesAfterFailure(t *testing.T) {
+	t.Parallel()
+	games := []core.Game{
+		{ID: "changed", DisplayName: "Changed", Enabled: true, SyncEnabled: true},
+		{ID: "unchanged", DisplayName: "Unchanged", Enabled: true, SyncEnabled: true},
+		{ID: "empty", DisplayName: "Empty", Enabled: true, SyncEnabled: true},
+		{ID: "failed", DisplayName: "Failed", Enabled: true, SyncEnabled: true},
+		{ID: "manual", DisplayName: "Manual", Enabled: false, SyncEnabled: true},
+		{ID: "sync-off", DisplayName: "Sync off", Enabled: true, SyncEnabled: false},
+		{ID: "hidden", DisplayName: "Hidden", Enabled: true, SyncEnabled: true, Hidden: true},
+	}
+	var attempted []string
+	var published []core.Event
+	result, err := checkpointWatchedGames(context.Background(), games, func(_ context.Context, gameID string) (core.Snapshot, error) {
+		attempted = append(attempted, gameID)
+		switch gameID {
+		case "unchanged":
+			return core.Snapshot{}, snapshot.ErrUnchanged
+		case "empty":
+			return core.Snapshot{}, snapshot.ErrNoFiles
+		case "failed":
+			return core.Snapshot{}, errors.New("read failed")
+		default:
+			return core.Snapshot{ID: "new-snapshot", GameID: gameID}, nil
+		}
+	}, func(event core.Event) {
+		published = append(published, event)
+	})
+	if err == nil || !strings.Contains(err.Error(), `checkpoint "Failed": read failed`) {
+		t.Fatalf("checkpoint failure was not returned: %v", err)
+	}
+	if result.CheckedGames != 4 || result.CreatedSnapshots != 1 || result.UnchangedGames != 1 || result.NoFilesGames != 1 || result.BackupFailed != 1 {
+		t.Fatalf("unexpected checkpoint result: %#v", result)
+	}
+	if len(attempted) != 4 || attempted[3] != "failed" {
+		t.Fatalf("ineligible games were checked: %#v", attempted)
+	}
+	if len(published) != 1 || published[0].Type != "snapshot.failed" || published[0].GameID != "failed" {
+		t.Fatalf("checkpoint failure event was not published: %#v", published)
 	}
 }

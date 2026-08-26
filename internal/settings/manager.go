@@ -231,6 +231,25 @@ func (m *Manager) RecordR2Success() {
 	m.recordR2Health(nil)
 }
 
+func (m *Manager) RecordR2Sync() {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.config.R2.CredentialID == "" {
+		return
+	}
+	updated := m.config
+	now := time.Now().UTC()
+	updated.R2.LastSyncedAt = &now
+	updated.R2.LastVerifiedAt = &now
+	updated.R2.LastFailureAt = nil
+	updated.R2.LastError = ""
+	if err := config.Save(m.path, updated); err != nil {
+		slog.Warn("save R2 sync time", "error", err)
+		return
+	}
+	m.config = updated
+}
+
 func (m *Manager) RecordR2Failure(err error) {
 	if err == nil || errors.Is(err, ErrR2NotConfigured) {
 		return

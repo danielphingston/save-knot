@@ -23,6 +23,7 @@ type Application struct {
 	database    *database.Store
 	coordinator *Coordinator
 	server      *api.Server
+	webURL      string
 }
 
 func Build(ctx context.Context, dataDir, listenOverride string) (*Application, error) {
@@ -71,12 +72,20 @@ func Build(ctx context.Context, dataDir, listenOverride string) (*Application, e
 	snapshotService := snapshot.New(repository, repository, cfg.LocalBackupDir, settingsManager.Config().DeviceID)
 	syncer := remote.NewSyncer(repository)
 	reconciler := remote.NewReconciler(repository)
-	coordinator := NewCoordinator(repository, repository, repository, repository, repository, snapshotService, syncer, reconciler, settingsManager, paths, eventBus, watchManager)
+	coordinator := NewCoordinator(repository, repository, repository, repository, repository, repository, snapshotService, syncer, reconciler, settingsManager, paths, eventBus, watchManager)
+	coordinator.loadCachedDiagnostics(ctx)
 	server, err := api.New(settingsManager.Config().Listen, repository, repository, repository, repository, coordinator, coordinator, coordinator, settingsManager, eventBus, filepath.Join(paths.Root, "artwork"))
 	if err != nil {
 		return nil, errors.Join(err, watchManager.Close(), repository.Close())
 	}
-	return &Application{database: repository, coordinator: coordinator, server: server}, nil
+	return &Application{
+		database: repository, coordinator: coordinator, server: server,
+		webURL: "http://" + settingsManager.Config().Listen,
+	}, nil
+}
+
+func (a *Application) WebURL() string {
+	return a.webURL
 }
 
 func (a *Application) Run(ctx context.Context) error {

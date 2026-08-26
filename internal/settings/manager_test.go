@@ -133,4 +133,19 @@ func TestR2HealthTracksVerificationAndFailure(t *testing.T) {
 	if verified.LastVerifiedAt == nil || verified.LastFailureAt != nil || verified.LastError != "" {
 		t.Fatalf("R2 verification did not clear degraded state: %#v", verified)
 	}
+	if verified.LastSyncedAt != nil {
+		t.Fatalf("R2 verification was incorrectly recorded as a sync: %#v", verified)
+	}
+	manager.RecordR2Sync()
+	synced := manager.Config().R2
+	if synced.LastSyncedAt == nil || synced.LastVerifiedAt == nil {
+		t.Fatalf("R2 sync time was not recorded: %#v", synced)
+	}
+	loaded, err := config.Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if loaded.R2.LastSyncedAt == nil {
+		t.Fatalf("R2 sync time was not persisted: %#v", loaded.R2)
+	}
 }

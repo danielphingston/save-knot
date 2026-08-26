@@ -120,7 +120,7 @@ func (c *coordinatorFake) Restore(context.Context, string, string) (core.Snapsho
 	return core.Snapshot{}, nil
 }
 func (c *coordinatorFake) ReconcileWatches(context.Context) { c.reconciled++ }
-func (c *coordinatorFake) SyncPending(context.Context) (core.SyncResult, error) {
+func (c *coordinatorFake) SyncNow(context.Context) (core.SyncResult, error) {
 	return c.syncResult, c.syncErr
 }
 func (c *coordinatorFake) SyncGame(context.Context, string) error                     { return nil }
@@ -281,6 +281,11 @@ func TestGameLifecycleRecoveryAndSettingsAPI(t *testing.T) {
 	status = serveRequest(server, http.MethodGet, "/api/status", "")
 	if !strings.Contains(status.Body.String(), `"r2State":"verified"`) || strings.Contains(status.Body.String(), `"r2LastVerified":null`) {
 		t.Fatalf("verified R2 status was not exposed: %s", status.Body.String())
+	}
+	manager.RecordR2Sync()
+	status = serveRequest(server, http.MethodGet, "/api/status", "")
+	if strings.Contains(status.Body.String(), `"r2LastSynced":null`) {
+		t.Fatalf("last R2 sync time was not exposed: %s", status.Body.String())
 	}
 	manager.RecordR2Failure(errors.New("bucket unavailable"))
 	status = serveRequest(server, http.MethodGet, "/api/status", "")

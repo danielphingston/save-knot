@@ -53,6 +53,7 @@ type R2 struct {
 	Prefix         string     `json:"prefix"`
 	AccessKeyID    string     `json:"accessKeyId"`
 	CredentialID   string     `json:"credentialId"`
+	LastSyncedAt   *time.Time `json:"lastSyncedAt,omitempty"`
 	LastVerifiedAt *time.Time `json:"lastVerifiedAt,omitempty"`
 	LastFailureAt  *time.Time `json:"lastFailureAt,omitempty"`
 	LastError      string     `json:"lastError,omitempty"`

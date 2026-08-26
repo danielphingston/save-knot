@@ -29,10 +29,15 @@ type Game struct {
 }
 
 type SyncResult struct {
-	Eligible int    `json:"eligible"`
-	Synced   int    `json:"synced"`
-	Failed   int    `json:"failed"`
-	Error    string `json:"error,omitempty"`
+	CheckedGames     int    `json:"checkedGames"`
+	CreatedSnapshots int    `json:"createdSnapshots"`
+	UnchangedGames   int    `json:"unchangedGames"`
+	NoFilesGames     int    `json:"noFilesGames"`
+	BackupFailed     int    `json:"backupFailed"`
+	Eligible         int    `json:"eligible"`
+	Synced           int    `json:"synced"`
+	Failed           int    `json:"failed"`
+	Error            string `json:"error,omitempty"`
 }
 
 type GamePath struct {
@@ -135,6 +140,7 @@ type Event struct {
 type Diagnostics struct {
 	Catalog   CatalogDiagnostics   `json:"catalog"`
 	Discovery DiscoveryDiagnostics `json:"discovery"`
+	UpdatedAt *time.Time           `json:"updatedAt,omitempty"`
 }
 
 type CatalogDiagnostics struct {

@@ -98,11 +98,10 @@ function visibleGames() {
 function gamesPage() {
   setActiveNav('games');
   const games = visibleGames();
-  const pending = state.games.filter(game => game.syncEnabled).reduce((total, game) => total + game.pendingSnapshotCount, 0);
   root.innerHTML = `
     <header class="page-head">
       <div><p class="eyebrow">Your library</p><h1>Game saves</h1><p class="subtle">Immutable checkpoints, kept close and synced safely.</p></div>
-      <div class="actions"><button class="button" id="sync-all" ${!state.status.r2Configured || pending === 0 ? 'disabled' : ''}>${state.status.r2Configured ? `Sync pending (${pending})` : 'Connect R2 to sync'}</button><button class="button" id="scan-games">Scan for games</button><button class="button primary" id="add-game">+ Add game</button></div>
+      <div class="actions"><div class="sync-now-control"><button class="button" id="sync-all" title="Check watched games for changes, create snapshots, and upload pending snapshots" ${!state.status.r2Configured ? 'disabled' : ''}>${state.status.r2Configured ? 'Sync now' : 'Connect R2 to sync'}</button><small>${state.status.r2Configured ? `Last synced: ${escapeHTML(formatTime(state.status.r2LastSynced))}` : 'Last synced: Never'}</small></div><button class="button" id="scan-games">Scan for games</button><button class="button primary" id="add-game">+ Add game</button></div>
     </header>
     ${state.games.length ? `<section class="library-tools" aria-label="Filter games"><label class="search-field" for="game-search">Search games</label><input id="game-search" type="search" placeholder="Search display or catalog name" value="${escapeHTML(state.gameFilters.query)}"><label for="watcher-filter">Backup mode</label><select id="watcher-filter"><option value="all">All modes</option><option value="watched" ${state.gameFilters.watcher === 'watched' ? 'selected' : ''}>Watched</option><option value="manual" ${state.gameFilters.watcher === 'manual' ? 'selected' : ''}>Manual backups</option></select><label for="sync-filter">Sync state</label><select id="sync-filter"><option value="all">All sync states</option><option value="pending" ${state.gameFilters.sync === 'pending' ? 'selected' : ''}>Pending</option><option value="current" ${state.gameFilters.sync === 'current' ? 'selected' : ''}>Up to date</option></select><label for="snapshot-filter">Backups</label><select id="snapshot-filter"><option value="all">All backup states</option><option value="yes" ${state.gameFilters.snapshots === 'yes' ? 'selected' : ''}>Has snapshots</option><option value="no" ${state.gameFilters.snapshots === 'no' ? 'selected' : ''}>No snapshots</option></select></section>${games.length ? `<section class="games">${games.map(game => `
       <a class="game-card" href="#/games/${encodeURIComponent(game.id)}">
@@ -113,9 +112,14 @@ function gamesPage() {
   document.querySelector('#add-game').addEventListener('click', showAddGame);
   document.querySelector('#empty-add')?.addEventListener('click', showAddGame);
   document.querySelector('#sync-all').addEventListener('click', async event => {
-    event.currentTarget.disabled = true;
-    try { const result = await api('/api/sync', { method: 'POST', body: '{}' }); await loadShared(); gamesPage(); toast(result.failed || result.error ? `${result.synced} synced; ${result.failed} failed${result.error ? ` · ${result.error}` : ''}` : `${result.synced} snapshots synced`, Boolean(result.failed || result.error)); }
-    catch (error) { toast(error.message, true); event.currentTarget.disabled = false; }
+    const button = event.currentTarget; button.disabled = true; button.textContent = 'Syncing…';
+    try {
+      const result = await api('/api/sync', { method: 'POST', body: '{}' }); await loadShared(); gamesPage();
+      const failed = result.backupFailed + result.failed;
+      const summary = `${result.checkedGames} games checked · ${result.createdSnapshots} snapshots created · ${result.synced} uploaded`;
+      toast(failed || result.error ? `${summary} · ${failed} failed${result.error ? ` · ${result.error}` : ''}` : summary, Boolean(failed || result.error));
+    }
+    catch (error) { toast(error.message, true); button.disabled = false; button.textContent = 'Sync now'; }
   });
   const updateFilter = (name, value) => { state.gameFilters[name] = value; gamesPage(); };
   document.querySelector('#game-search')?.addEventListener('input', event => { const cursor = event.currentTarget.selectionStart; updateFilter('query', event.currentTarget.value); const input = document.querySelector('#game-search'); input.focus(); input.setSelectionRange(cursor, cursor); });
@@ -239,8 +243,9 @@ function settingsPage() {
           <details class="advanced-settings field full"><summary>Custom launcher locations</summary><p class="help">Only add these when a launcher is installed somewhere SaveKnot cannot detect.</p><div class="form-grid"><div class="field full"><label for="steam-roots">Extra Steam roots</label><textarea id="steam-roots" name="steamRoots" placeholder="One absolute folder per line">${escapeHTML((state.status.steamRoots || []).join('\n'))}</textarea></div><div class="field full"><label for="epic-manifests">Extra Epic manifest folders</label><textarea id="epic-manifests" name="epicManifests" placeholder="One absolute folder per line">${escapeHTML((state.status.epicManifests || []).join('\n'))}</textarea></div><div class="field full"><label for="gog-roots">Extra GOG game roots</label><textarea id="gog-roots" name="gogRoots" placeholder="One absolute folder per line">${escapeHTML((state.status.gogRoots || []).join('\n'))}</textarea></div></div></details>
         </div><div class="form-actions"><button class="button primary" type="submit">Save local settings</button></div>
       </form>
-      <div class="settings-card"><h2>Discovery diagnostics</h2><p class="subtle">Use these counts to diagnose an empty game list.</p>
+      <div class="settings-card"><div class="settings-card-head"><div><h2>Discovery diagnostics</h2><p class="subtle">Use these counts to diagnose an empty game list.</p></div><span class="status-pill">${diagnostics.updatedAt ? `Updated ${escapeHTML(formatTime(diagnostics.updatedAt))}` : 'Not cached yet'}</span></div>
         <div class="callout">Catalog: ${catalog.loaded ? `${catalog.gameCount || 0} games loaded` : `not loaded${catalog.lastError ? ` · ${escapeHTML(catalog.lastError)}` : ''}`}<br>Steam roots: ${(discovery.steamRoots || []).length ? discovery.steamRoots.map(escapeHTML).join(', ') : 'none detected'}<br>Installed: ${discovery.steamInstalled || 0} Steam · ${discovery.epicInstalled || 0} Epic · ${discovery.gogInstalled || 0} GOG<br>Matched in Ludusavi: ${discovery.catalogMatched || 0}<br>Found from local save data: ${discovery.localSaveGames || 0}${discovery.deepScanMillis ? ` (${discovery.deepScanMillis} ms deep scan)` : ''}<br>Registered: ${discovery.gamesRegistered || 0}${(discovery.unmatched || []).length ? `<br>Unmatched: ${discovery.unmatched.slice(0, 10).map(escapeHTML).join(', ')}` : ''}${discovery.lastError ? `<br>Error: ${escapeHTML(discovery.lastError)}` : ''}</div>
+        <p class="help">Catalog checked: ${escapeHTML(formatTime(catalog.lastChecked))} · Last discovery scan: ${escapeHTML(formatTime(discovery.lastRun))}</p>
         <div class="form-actions"><button class="button" type="button" id="settings-scan">Scan now</button>${state.status.r2Configured ? '<button class="button" type="button" id="reconcile-r2">Refresh from R2</button>' : ''}</div>
       </div>
       <div class="settings-card"><h2>Ignored and removed games</h2><p class="subtle">These games stay out of the library and discovery scans. Snapshots and customizations are preserved.</p><div class="panel ignored-games">${state.ignoredGames.length ? state.ignoredGames.map(game => `<div class="row"><div><strong>${escapeHTML(game.displayName)}</strong><small>${game.store === 'custom' ? 'Removed custom game' : 'Ignored discovered game'} · ${game.snapshotCount} snapshots</small></div><button class="button small restore-game" data-game="${escapeHTML(game.id)}">Restore to library</button></div>`).join('') : '<div class="row"><div><strong>No ignored games</strong><small>Games removed from the library will appear here.</small></div></div>'}</div></div>

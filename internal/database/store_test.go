@@ -103,6 +103,49 @@ func TestPeriodicSyncSelectsOnlyWatchedGames(t *testing.T) {
 	}
 }
 
+func TestDiscoveryDiagnosticsCacheRoundTrip(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	store, err := Open(ctx, filepath.Join(t.TempDir(), "state.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if err := store.Close(); err != nil {
+			t.Error(err)
+		}
+	})
+	if diagnostics, found, err := store.LoadDiagnostics(ctx); err != nil || found {
+		t.Fatalf("empty cache returned data: diagnostics=%#v found=%v err=%v", diagnostics, found, err)
+	}
+
+	lastChecked := time.UnixMilli(1_700_000_000_123).UTC()
+	lastRun := time.UnixMilli(1_700_000_100_456).UTC()
+	updatedAt := time.UnixMilli(1_700_000_200_789).UTC()
+	want := core.Diagnostics{
+		Catalog: core.CatalogDiagnostics{Loaded: true, GameCount: 53_046, CachePath: "/catalog.db", LastChecked: &lastChecked},
+		Discovery: core.DiscoveryDiagnostics{
+			LastRun: &lastRun, SteamRoots: []string{`E:\steam`}, SteamInstalled: 8, EpicInstalled: 1,
+			CatalogMatched: 4, GamesRegistered: 14, LocalSaveGames: 10, DeepScanMillis: 1_041,
+			Unmatched: []string{"Example (123)"},
+		},
+		UpdatedAt: &updatedAt,
+	}
+	if err := store.SaveDiagnostics(ctx, want); err != nil {
+		t.Fatal(err)
+	}
+	got, found, err := store.LoadDiagnostics(ctx)
+	if err != nil || !found {
+		t.Fatalf("saved cache was not loaded: diagnostics=%#v found=%v err=%v", got, found, err)
+	}
+	if got.UpdatedAt == nil || !got.UpdatedAt.Equal(updatedAt) || got.Catalog.GameCount != want.Catalog.GameCount || got.Discovery.GamesRegistered != want.Discovery.GamesRegistered {
+		t.Fatalf("diagnostics cache changed during round trip: got=%#v want=%#v", got, want)
+	}
+	if len(got.Discovery.SteamRoots) != 1 || got.Discovery.SteamRoots[0] != want.Discovery.SteamRoots[0] || len(got.Discovery.Unmatched) != 1 {
+		t.Fatalf("diagnostics lists changed during round trip: %#v", got.Discovery)
+	}
+}
+
 //nolint:gocognit // The linear lifecycle assertions are clearer together as one storage regression journey.
 func TestHiddenGameLifecyclePreservesDataAndStaysOutOfSync(t *testing.T) {
 	t.Parallel()

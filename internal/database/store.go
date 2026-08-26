@@ -102,6 +102,11 @@ func (s *Store) initialize(ctx context.Context) error {
 			stored_size INTEGER NOT NULL,
 			uploaded_to TEXT NOT NULL DEFAULT ''
 		)`,
+		`CREATE TABLE IF NOT EXISTS diagnostic_cache (
+			id INTEGER PRIMARY KEY CHECK (id = 1),
+			payload BLOB NOT NULL,
+			updated_at INTEGER NOT NULL
+		)`,
 	}
 	for _, statement := range statements {
 		if _, err := s.db.ExecContext(ctx, statement); err != nil {
@@ -115,6 +120,41 @@ func (s *Store) initialize(ctx context.Context) error {
 		return err
 	}
 	return nil
+}
+
+func (s *Store) SaveDiagnostics(ctx context.Context, diagnostics core.Diagnostics) error {
+	updatedAt := time.Now().UTC()
+	if diagnostics.UpdatedAt != nil {
+		updatedAt = diagnostics.UpdatedAt.UTC()
+	}
+	payload, err := json.Marshal(diagnostics)
+	if err != nil {
+		return fmt.Errorf("encode diagnostics cache: %w", err)
+	}
+	if _, err := s.db.ExecContext(ctx, `INSERT INTO diagnostic_cache (id, payload, updated_at) VALUES (1, ?, ?)
+		ON CONFLICT(id) DO UPDATE SET payload = excluded.payload, updated_at = excluded.updated_at`, payload, updatedAt.UnixMilli()); err != nil {
+		return fmt.Errorf("save diagnostics cache: %w", err)
+	}
+	return nil
+}
+
+func (s *Store) LoadDiagnostics(ctx context.Context) (core.Diagnostics, bool, error) {
+	var payload []byte
+	var updatedMillis int64
+	err := s.db.QueryRowContext(ctx, `SELECT payload, updated_at FROM diagnostic_cache WHERE id = 1`).Scan(&payload, &updatedMillis)
+	if errors.Is(err, sql.ErrNoRows) {
+		return core.Diagnostics{}, false, nil
+	}
+	if err != nil {
+		return core.Diagnostics{}, false, fmt.Errorf("load diagnostics cache: %w", err)
+	}
+	var diagnostics core.Diagnostics
+	if err := json.Unmarshal(payload, &diagnostics); err != nil {
+		return core.Diagnostics{}, false, fmt.Errorf("decode diagnostics cache: %w", err)
+	}
+	updatedAt := time.UnixMilli(updatedMillis).UTC()
+	diagnostics.UpdatedAt = &updatedAt
+	return diagnostics, true, nil
 }
 
 func (s *Store) ensureSyncEnabledColumn(ctx context.Context) (err error) {

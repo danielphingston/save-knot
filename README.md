@@ -23,7 +23,8 @@ There is no SaveKnot account, hosted backend, central database, analytics servic
 - Recursive Windows registry backup and restore
 - Custom titles, notes, catalog remapping, pictures, save locations, file exclusions, and per-game backup policy
 - Configurable local backup location, per-game retention, periodic watched-game sync, optional game discovery, and per-user launch at login
-- Embedded localhost UI, native folder picker, discovery diagnostics, and server-sent activity events
+- On-demand sync that checkpoints changed watched games before uploading their pending snapshots
+- Embedded localhost UI, Windows tray controls, native folder picker, SQLite-cached discovery diagnostics, and server-sent activity events
 - Persistent rotating logs at `<data directory>/logs/saveknot.log`
 - OS credential-vault storage for the R2 secret access key
 
@@ -49,7 +50,7 @@ make build-windows
 
 The executable is written to `dist/saveknot-windows-amd64.exe`.
 
-The Windows release is linked as a GUI/background executable, so it does not leave a console window open. Run it, then open <http://127.0.0.1:32147>. For troubleshooting, inspect `%APPDATA%\SaveKnot\logs\saveknot.log`; use `-log-level debug` from PowerShell for more detail.
+The Windows release is linked as a GUI/background executable, so it does not leave a console window open. While it is running, use the SaveKnot notification-area icon to open the local webpage or exit cleanly. For troubleshooting, inspect `%APPDATA%\SaveKnot\logs\saveknot.log`; use `-log-level debug` from PowerShell for more detail.
 
 SaveKnot deliberately rejects non-loopback listen addresses.
 

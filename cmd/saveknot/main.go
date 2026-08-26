@@ -11,6 +11,7 @@ import (
 	"github.com/saveknot/saveknot/internal/app"
 	"github.com/saveknot/saveknot/internal/config"
 	"github.com/saveknot/saveknot/internal/logging"
+	"github.com/saveknot/saveknot/internal/platform"
 )
 
 func main() {
@@ -49,7 +50,7 @@ func run() int {
 		return 1
 	}
 	slog.Info("SaveKnot is running", "data", *dataDir, "log", logPath)
-	if err := application.Run(ctx); err != nil {
+	if err := platform.RunDesktop(ctx, application.WebURL(), application.Run, stop); err != nil {
 		slog.Error("run SaveKnot", "error", err)
 		return 1
 	}
