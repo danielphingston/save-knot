@@ -243,13 +243,59 @@ verify_go_toolchain() {
 }
 
 install_browser_tools() {
+	local browser_line='export AGENT_BROWSER_EXECUTABLE_PATH=/usr/bin/google-chrome-stable'
+	local browser_package
+	local browser_path="${AGENT_BROWSER_EXECUTABLE_PATH:-}"
+	local browser_version
+	local smoke_session='saveknot-setup-smoke'
+
 	command -v npm >/dev/null 2>&1 || fail "npm is required to install agent-browser"
 
 	log "installing agent-browser ${AGENT_BROWSER_VERSION}"
 	npm install --global --no-audit --no-fund "agent-browser@${AGENT_BROWSER_VERSION}"
-	agent-browser install --with-deps
+
+	if [[ -z "${browser_path}" ]]; then
+		case "$(uname -m)" in
+		x86_64 | amd64)
+			browser_path='/usr/bin/google-chrome-stable'
+			;;
+		*)
+			fail "automatic Chrome installation supports amd64; set AGENT_BROWSER_EXECUTABLE_PATH for $(uname -m)"
+			;;
+		esac
+	fi
+
+	if [[ ! -x "${browser_path}" ]]; then
+		[[ "${browser_path}" == '/usr/bin/google-chrome-stable' ]] || fail "configured browser is not executable: ${browser_path}"
+		command -v apt-get >/dev/null 2>&1 || fail "apt-get is required to install Google Chrome"
+		command -v dpkg-deb >/dev/null 2>&1 || fail "dpkg-deb is required to validate the Google Chrome package"
+		browser_package="${SETUP_TEMP_DIR}/google-chrome-stable_current_amd64.deb"
+		log "installing Google Chrome through the proxy-compatible system package path"
+		curl --fail --location --silent --show-error 'https://dl.google.com/linux/direct/google-chrome-stable_current_amd64.deb' --output "${browser_package}"
+		[[ "$(dpkg-deb --field "${browser_package}" Package)" == 'google-chrome-stable' ]] || fail "downloaded Chrome package has an unexpected identity"
+		[[ "$(dpkg-deb --field "${browser_package}" Architecture)" == 'amd64' ]] || fail "downloaded Chrome package has an unexpected architecture"
+		if [[ "$(id -u)" == "0" ]]; then
+			DEBIAN_FRONTEND=noninteractive apt-get update
+			DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends "${browser_package}"
+		elif command -v sudo >/dev/null 2>&1; then
+			sudo env DEBIAN_FRONTEND=noninteractive apt-get update
+			sudo env DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends "${browser_package}"
+		else
+			fail "Chrome dependencies require root access or sudo"
+		fi
+	fi
+	[[ -x "${browser_path}" ]] || fail "Chrome installation did not create ${browser_path}"
+
+	if [[ "${browser_path}" == '/usr/bin/google-chrome-stable' ]] && ! grep -Fqx "${browser_line}" "${HOME}/.bashrc"; then
+		printf '%s\n' "${browser_line}" >>"${HOME}/.bashrc"
+	fi
+	export AGENT_BROWSER_EXECUTABLE_PATH="${browser_path}"
 	agent-browser skills get core >/dev/null
-	log "verified $(agent-browser --version) with browser runtime and core skill"
+	agent-browser doctor --offline --quick
+	agent-browser --session "${smoke_session}" --executable-path "${browser_path}" open about:blank >/dev/null
+	agent-browser --session "${smoke_session}" close >/dev/null
+	browser_version="$("${browser_path}" --version)"
+	log "verified $(agent-browser --version) with ${browser_version} and core skill"
 }
 
 prefetch_project_tools() {
