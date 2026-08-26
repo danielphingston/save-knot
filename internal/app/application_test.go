@@ -86,6 +86,66 @@ func TestBuildNormalizesRelativeDataAndBackupPaths(t *testing.T) {
 	}
 }
 
+func TestRemapManualGameLinksCatalogWithoutReplacingCustomPaths(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	dataDir := t.TempDir()
+	paths := config.DataPaths(dataDir)
+	if err := config.Save(paths.Config, config.Config{
+		Listen: "127.0.0.1:0", LocalBackupDir: filepath.Join(dataDir, "blobs"),
+		RetentionKeep: 50, DeviceID: "test-device", R2: config.R2{Prefix: "saveknot"},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	manifest := "\"Uncharted: Legacy of Thieves Collection\":\n  files:\n    <home>/Saved Games/Uncharted Legacy of Thieves Collection/users: {}\n"
+	if err := os.WriteFile(paths.Catalog, []byte(manifest), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := catalog.CompileFile(ctx, paths.Catalog, paths.CatalogDB); err != nil {
+		t.Fatal(err)
+	}
+	application, err := Build(ctx, dataDir, "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if err := errors.Join(application.coordinator.Close(), application.database.Close()); err != nil {
+			t.Error(err)
+		}
+	})
+
+	game := core.Game{ID: "manual-uncharted", DisplayName: "Uncharted 4", Store: "custom", Enabled: true, SyncEnabled: true}
+	if err := application.database.UpsertGame(ctx, game); err != nil {
+		t.Fatal(err)
+	}
+	customPath := core.GamePath{
+		ID: "manual-path", GameID: game.ID, Source: "custom",
+		Template: filepath.Join(dataDir, "users"), Resolved: filepath.Join(dataDir, "users"), Enabled: true,
+	}
+	if err := application.database.AddPath(ctx, customPath); err != nil {
+		t.Fatal(err)
+	}
+
+	const catalogName = "Uncharted: Legacy of Thieves Collection"
+	if err := application.coordinator.RemapGame(ctx, game.ID, catalogName); err != nil {
+		t.Fatal(err)
+	}
+	linked, err := application.database.Game(ctx, game.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if linked.CatalogID != catalogName || linked.CatalogName != catalogName || linked.DisplayName != game.DisplayName {
+		t.Fatalf("manual game was not linked without changing its display name: %#v", linked)
+	}
+	linkedPaths, err := application.database.GamePaths(ctx, game.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(linkedPaths) != 1 || linkedPaths[0] != customPath {
+		t.Fatalf("manual catalog link changed custom paths: %#v", linkedPaths)
+	}
+}
+
 func TestCoordinatorStartOnlyWatchesRegisteredGames(t *testing.T) {
 	dataDir := t.TempDir()
 	xdgData := filepath.Join(dataDir, "xdg-data")

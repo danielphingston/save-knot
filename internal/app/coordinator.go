@@ -404,7 +404,15 @@ func (c *Coordinator) RemapGame(ctx context.Context, gameID, catalogID string) e
 		return err
 	}
 	if game.InstallPath == "" {
-		return errors.New("a manual game without an install location cannot be remapped; add save locations directly")
+		if game.Store != "custom" {
+			return errors.New("a discovered game without an install location cannot be remapped")
+		}
+		// Manual games already have explicit save locations. Link the catalog
+		// metadata without replacing those user-selected paths with paths that
+		// would require a detected installation to resolve safely.
+		game.CatalogID = definition.Name
+		game.CatalogName = definition.Name
+		return c.repository.UpsertGame(ctx, game)
 	}
 	root := filepath.Dir(game.InstallPath)
 	if game.Store == "steam" {
