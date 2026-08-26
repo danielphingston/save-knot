@@ -54,6 +54,17 @@ The Windows release is linked as a GUI/background executable, so it does not lea
 
 SaveKnot deliberately rejects non-loopback listen addresses.
 
+## Publish a release
+
+Push a semantic-version tag to build and publish a Windows AMD64 package through GitHub Actions:
+
+```sh
+git tag -a v0.1.0 -m "SaveKnot v0.1.0"
+git push origin v0.1.0
+```
+
+The workflow runs the tests, creates `saveknot_0.1.0_windows_amd64.zip` and `SHA256SUMS.txt`, and attaches them to a GitHub Release with generated release notes. A tag with a suffix such as `v0.2.0-rc.1` creates a prerelease. The workflow uses the repository's built-in `GITHUB_TOKEN`; no publishing secret is required.
+
 ## If your game list is empty
 
 Open **Settings → Discovery diagnostics**, then select **Scan now**. The panel separates the stages so an empty list is actionable:

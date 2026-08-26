@@ -1,0 +1,80 @@
+name: Publish release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  release:
+    name: Build and publish
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: write
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v6
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Validate release tag
+        shell: bash
+        run: |
+          if [[ ! "${GITHUB_REF_NAME}" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-[0-9A-Za-z.-]+)?(\+[0-9A-Za-z.-]+)?$ ]]; then
+            echo "Release tags must use semantic versioning, for example v1.2.3 or v1.2.3-rc.1."
+            exit 1
+          fi
+
+      - name: Test
+        run: go test ./...
+
+      - name: Build Windows package
+        shell: bash
+        run: |
+          make build-windows-amd64
+
+          version="${GITHUB_REF_NAME#v}"
+          archive="saveknot_${version}_windows_amd64.zip"
+
+          (
+            cd dist
+            zip "${archive}" saveknot-windows-amd64.exe
+            sha256sum "${archive}" > SHA256SUMS.txt
+          )
+
+          echo "archive=${archive}" >> "${GITHUB_OUTPUT}"
+        id: package
+
+      - name: Publish GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ARCHIVE: ${{ steps.package.outputs.archive }}
+        shell: bash
+        run: |
+          release_options=(
+            --verify-tag
+            --generate-notes
+            --title "SaveKnot ${GITHUB_REF_NAME}"
+          )
+
+          if [[ "${GITHUB_REF_NAME}" == *-* ]]; then
+            release_options+=(--prerelease)
+          fi
+
+          gh release create "${GITHUB_REF_NAME}" \
+            "dist/${ARCHIVE}" \
+            "dist/SHA256SUMS.txt" \
+            "${release_options[@]}"
