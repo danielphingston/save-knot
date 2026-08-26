@@ -1,6 +1,8 @@
 const state = {
   games: [], ignoredGames: [], status: null, activity: [],
   gameFilters: { query: '', watcher: 'all', sync: 'all', snapshots: 'all' },
+  syncRequestActive: false,
+  syncProgress: { active: false, phase: 'starting', completed: 0, total: 0 },
 };
 const root = document.querySelector('#app');
 
@@ -95,13 +97,42 @@ function visibleGames() {
   });
 }
 
+function syncProgressLabel() {
+  const progress = state.syncProgress;
+  if (!progress.active && state.status?.syncInProgress) return 'Sync already running…';
+  if (progress.phase === 'checking') return progress.total ? `Checking games ${progress.completed}/${progress.total}` : 'Checking watched games…';
+  if (progress.phase === 'uploading') return progress.total ? `Uploading snapshots ${progress.completed}/${progress.total}` : 'Checking for pending uploads…';
+  return 'Preparing sync…';
+}
+
+function updateSyncControl() {
+  const control = document.querySelector('.sync-now-control');
+  if (!control) return;
+  const busy = state.syncRequestActive || state.syncProgress.active || Boolean(state.status?.syncInProgress);
+  const progress = state.syncProgress;
+  const button = control.querySelector('#sync-all');
+  button.disabled = !state.status.r2Configured || busy;
+  button.textContent = busy ? 'Syncing…' : state.status.r2Configured ? 'Sync now' : 'Connect R2 to sync';
+  const progressArea = control.querySelector('.sync-progress-area');
+  progressArea.hidden = !busy;
+  progressArea.querySelector('small').textContent = syncProgressLabel();
+  const bar = progressArea.querySelector('progress');
+  if (progress.active && progress.total > 0) {
+    bar.max = progress.total;
+    bar.value = progress.completed;
+  } else {
+    bar.removeAttribute('value');
+  }
+  control.querySelector('.last-sync').textContent = `Last synced: ${formatTime(state.status.r2LastSynced)}`;
+}
+
 function gamesPage() {
   setActiveNav('games');
   const games = visibleGames();
   root.innerHTML = `
     <header class="page-head">
       <div><p class="eyebrow">Your library</p><h1>Game saves</h1><p class="subtle">Immutable checkpoints, kept close and synced safely.</p></div>
-      <div class="actions"><div class="sync-now-control"><button class="button" id="sync-all" title="Check watched games for changes, create snapshots, and upload pending snapshots" ${!state.status.r2Configured ? 'disabled' : ''}>${state.status.r2Configured ? 'Sync now' : 'Connect R2 to sync'}</button><small>${state.status.r2Configured ? `Last synced: ${escapeHTML(formatTime(state.status.r2LastSynced))}` : 'Last synced: Never'}</small></div><button class="button" id="scan-games">Scan for games</button><button class="button primary" id="add-game">+ Add game</button></div>
+      <div class="actions"><div class="sync-now-control" aria-live="polite"><button class="button" id="sync-all" title="Check watched games for changes, create snapshots, and upload pending snapshots">Sync now</button><div class="sync-progress-area" hidden><progress></progress><small>Preparing sync…</small></div><small class="last-sync">Last synced: ${escapeHTML(formatTime(state.status.r2LastSynced))}</small></div><button class="button" id="scan-games">Scan for games</button><button class="button primary" id="add-game">+ Add game</button></div>
     </header>
     ${state.games.length ? `<section class="library-tools" aria-label="Filter games"><label class="search-field" for="game-search">Search games</label><input id="game-search" type="search" placeholder="Search display or catalog name" value="${escapeHTML(state.gameFilters.query)}"><label for="watcher-filter">Backup mode</label><select id="watcher-filter"><option value="all">All modes</option><option value="watched" ${state.gameFilters.watcher === 'watched' ? 'selected' : ''}>Watched</option><option value="manual" ${state.gameFilters.watcher === 'manual' ? 'selected' : ''}>Manual backups</option></select><label for="sync-filter">Sync state</label><select id="sync-filter"><option value="all">All sync states</option><option value="pending" ${state.gameFilters.sync === 'pending' ? 'selected' : ''}>Pending</option><option value="current" ${state.gameFilters.sync === 'current' ? 'selected' : ''}>Up to date</option></select><label for="snapshot-filter">Backups</label><select id="snapshot-filter"><option value="all">All backup states</option><option value="yes" ${state.gameFilters.snapshots === 'yes' ? 'selected' : ''}>Has snapshots</option><option value="no" ${state.gameFilters.snapshots === 'no' ? 'selected' : ''}>No snapshots</option></select></section>${games.length ? `<section class="games">${games.map(game => `
       <a class="game-card" href="#/games/${encodeURIComponent(game.id)}">
@@ -109,17 +140,22 @@ function gamesPage() {
         <div class="card-body"><h2>${escapeHTML(game.displayName)}</h2><div class="card-meta"><span>${game.snapshotCount} snapshots</span><span>${escapeHTML(gameSyncLabel(game))}</span><span>${formatBytes(game.storedSize)}</span></div></div>
       </a>`).join('')}</section>` : '<section class="empty filtered-empty"><div><div class="empty-mark">⌕</div><h2>No games match these filters</h2><p class="subtle">Clear the filters to return to the full library.</p><button class="button" id="clear-game-filters">Clear filters</button></div></section>'}` : `
       <section class="empty"><div><div class="empty-mark">⌁</div><h2>No games tied in yet</h2><p class="subtle">Select Scan for games to check Steam, Epic, GOG, and existing local saves. You can also add any save folder yourself.</p><button class="button primary" id="empty-add">Add a custom game</button></div></section>`}`;
+  updateSyncControl();
   document.querySelector('#add-game').addEventListener('click', showAddGame);
   document.querySelector('#empty-add')?.addEventListener('click', showAddGame);
   document.querySelector('#sync-all').addEventListener('click', async event => {
-    const button = event.currentTarget; button.disabled = true; button.textContent = 'Syncing…';
+    if (state.syncRequestActive || state.syncProgress.active || state.status.syncInProgress) return;
+    state.syncRequestActive = true;
+    state.syncProgress = { active: true, phase: 'starting', completed: 0, total: 0 };
+    updateSyncControl();
     try {
       const result = await api('/api/sync', { method: 'POST', body: '{}' }); await loadShared(); gamesPage();
       const failed = result.backupFailed + result.failed;
       const summary = `${result.checkedGames} games checked · ${result.createdSnapshots} snapshots created · ${result.synced} uploaded`;
       toast(failed || result.error ? `${summary} · ${failed} failed${result.error ? ` · ${result.error}` : ''}` : summary, Boolean(failed || result.error));
     }
-    catch (error) { toast(error.message, true); button.disabled = false; button.textContent = 'Sync now'; }
+    catch (error) { toast(error.message, true); await loadShared().catch(() => {}); }
+    finally { state.syncRequestActive = false; state.syncProgress = { active: false, phase: 'starting', completed: 0, total: 0 }; if (location.hash === '' || location.hash === '#/games') gamesPage(); }
   });
   const updateFilter = (name, value) => { state.gameFilters[name] = value; gamesPage(); };
   document.querySelector('#game-search')?.addEventListener('input', event => { const cursor = event.currentTarget.selectionStart; updateFilter('query', event.currentTarget.value); const input = document.querySelector('#game-search'); input.focus(); input.setSelectionRange(cursor, cursor); });
@@ -432,6 +468,18 @@ const stream = new EventSource('/api/events');
 stream.onmessage = message => {
   const event = JSON.parse(message.data); state.activity.unshift(event); state.activity = state.activity.slice(0, 100);
   if (location.hash === '#/activity') activityPage();
+  if (event.type === 'sync.started') {
+    state.syncProgress = { active: true, phase: 'starting', completed: 0, total: 0 };
+    updateSyncControl();
+  }
+  if (event.type === 'sync.progress') {
+    state.syncProgress = { active: true, phase: event.data?.phase || 'starting', completed: Number(event.data?.completed || 0), total: Number(event.data?.total || 0) };
+    updateSyncControl();
+  }
+  if (event.type === 'sync.completed') {
+    state.syncProgress = { active: false, phase: 'starting', completed: 0, total: 0 };
+    loadShared().then(() => { if (location.hash === '' || location.hash === '#/games') gamesPage(); }).catch(() => {});
+  }
   if (['snapshot.completed', 'restore.completed', 'game.discovered'].includes(event.type)) loadShared().catch(() => {});
 };
 

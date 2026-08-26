@@ -110,6 +110,7 @@ type coordinatorFake struct {
 	repository *repositoryFake
 	syncResult core.SyncResult
 	syncErr    error
+	syncActive bool
 }
 
 func (c *coordinatorFake) Backup(context.Context, string) (core.Snapshot, error) {
@@ -123,6 +124,7 @@ func (c *coordinatorFake) ReconcileWatches(context.Context) { c.reconciled++ }
 func (c *coordinatorFake) SyncNow(context.Context) (core.SyncResult, error) {
 	return c.syncResult, c.syncErr
 }
+func (c *coordinatorFake) SyncInProgress() bool                                       { return c.syncActive }
 func (c *coordinatorFake) SyncGame(context.Context, string) error                     { return nil }
 func (c *coordinatorFake) DeleteSnapshot(context.Context, string, string, bool) error { return nil }
 func (c *coordinatorFake) SetGameHidden(_ context.Context, id string, hidden bool) error {
@@ -358,6 +360,16 @@ func TestSyncAllReportsPartialCompletion(t *testing.T) {
 	response := serveRequest(server, http.MethodPost, "/api/sync", `{}`)
 	if response.Code != http.StatusMultiStatus || !strings.Contains(response.Body.String(), `"synced":1`) || !strings.Contains(response.Body.String(), `"failed":1`) || !strings.Contains(response.Body.String(), "one upload failed") {
 		t.Fatalf("partial sync result was not reported: %d %s", response.Code, response.Body.String())
+	}
+	coordinator.syncErr = core.ErrSyncInProgress
+	response = serveRequest(server, http.MethodPost, "/api/sync", `{}`)
+	if response.Code != http.StatusConflict {
+		t.Fatalf("concurrent sync returned %d: %s", response.Code, response.Body.String())
+	}
+	coordinator.syncActive = true
+	status := serveRequest(server, http.MethodGet, "/api/status", "")
+	if !strings.Contains(status.Body.String(), `"syncInProgress":true`) {
+		t.Fatalf("active sync was not exposed: %s", status.Body.String())
 	}
 }
 

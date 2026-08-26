@@ -5,7 +5,10 @@ import (
 	"time"
 )
 
-var ErrGameNotFound = errors.New("game not found")
+var (
+	ErrGameNotFound   = errors.New("game not found")
+	ErrSyncInProgress = errors.New("a sync is already in progress")
+)
 
 type Game struct {
 	ID            string     `json:"id"`

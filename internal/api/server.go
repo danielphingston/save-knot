@@ -74,6 +74,7 @@ type backupCoordinator interface {
 
 type syncCoordinator interface {
 	SyncNow(context.Context) (core.SyncResult, error)
+	SyncInProgress() bool
 	SyncGame(context.Context, string) error
 	ReconcileRemote(context.Context) (remote.ReconcileResult, error)
 }
@@ -203,6 +204,7 @@ func (s *Server) status(writer http.ResponseWriter, request *http.Request) {
 		"deviceId":       cfg.DeviceID,
 		"r2Configured":   cfg.R2.CredentialID != "",
 		"r2State":        r2State,
+		"syncInProgress": s.sync.SyncInProgress(),
 		"r2LastSynced":   cfg.R2.LastSyncedAt,
 		"r2LastVerified": cfg.R2.LastVerifiedAt,
 		"r2LastFailure":  cfg.R2.LastFailureAt,
@@ -507,6 +509,10 @@ func (s *Server) syncGame(writer http.ResponseWriter, request *http.Request) {
 
 func (s *Server) syncAll(writer http.ResponseWriter, request *http.Request) {
 	result, err := s.sync.SyncNow(request.Context())
+	if errors.Is(err, core.ErrSyncInProgress) {
+		writeError(writer, http.StatusConflict, err)
+		return
+	}
 	if err != nil && result.CheckedGames == 0 && result.Eligible == 0 {
 		writeError(writer, http.StatusUnprocessableEntity, err)
 		return

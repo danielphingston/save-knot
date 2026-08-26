@@ -7,6 +7,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -266,6 +267,7 @@ func TestSyncSnapshotBatchContinuesAfterIndividualFailure(t *testing.T) {
 	snapshots := []core.Snapshot{{ID: "one", GameID: "game-a"}, {ID: "two", GameID: "game-b"}, {ID: "three", GameID: "game-c"}}
 	var attempted []string
 	var published []core.Event
+	var progress [][2]int
 	result, syncedGames, err := syncSnapshotBatch(snapshots, func(snapshot core.Snapshot) error {
 		attempted = append(attempted, snapshot.ID)
 		if snapshot.ID == "two" {
@@ -274,6 +276,8 @@ func TestSyncSnapshotBatchContinuesAfterIndividualFailure(t *testing.T) {
 		return nil
 	}, func(event core.Event) {
 		published = append(published, event)
+	}, func(completed, total int) {
+		progress = append(progress, [2]int{completed, total})
 	})
 	if err == nil || result.Eligible != 3 || result.Synced != 2 || result.Failed != 1 {
 		t.Fatalf("unexpected partial result: result=%#v err=%v", result, err)
@@ -283,6 +287,9 @@ func TestSyncSnapshotBatchContinuesAfterIndividualFailure(t *testing.T) {
 	}
 	if len(syncedGames) != 2 || len(published) != 3 || published[1].Type != "upload.failed" {
 		t.Fatalf("batch outcomes were not recorded: games=%#v events=%#v", syncedGames, published)
+	}
+	if !reflect.DeepEqual(progress, [][2]int{{0, 3}, {1, 3}, {2, 3}, {3, 3}}) {
+		t.Fatalf("upload progress was not reported: %#v", progress)
 	}
 }
 
@@ -299,6 +306,7 @@ func TestCheckpointWatchedGamesOnlyChecksEligibleGamesAndContinuesAfterFailure(t
 	}
 	var attempted []string
 	var published []core.Event
+	var progress [][2]int
 	result, err := checkpointWatchedGames(context.Background(), games, func(_ context.Context, gameID string) (core.Snapshot, error) {
 		attempted = append(attempted, gameID)
 		switch gameID {
@@ -313,6 +321,8 @@ func TestCheckpointWatchedGamesOnlyChecksEligibleGamesAndContinuesAfterFailure(t
 		}
 	}, func(event core.Event) {
 		published = append(published, event)
+	}, func(completed, total int) {
+		progress = append(progress, [2]int{completed, total})
 	})
 	if err == nil || !strings.Contains(err.Error(), `checkpoint "Failed": read failed`) {
 		t.Fatalf("checkpoint failure was not returned: %v", err)
@@ -325,5 +335,24 @@ func TestCheckpointWatchedGamesOnlyChecksEligibleGamesAndContinuesAfterFailure(t
 	}
 	if len(published) != 1 || published[0].Type != "snapshot.failed" || published[0].GameID != "failed" {
 		t.Fatalf("checkpoint failure event was not published: %#v", published)
+	}
+	if !reflect.DeepEqual(progress, [][2]int{{0, 4}, {1, 4}, {2, 4}, {3, 4}, {4, 4}}) {
+		t.Fatalf("checkpoint progress was not reported: %#v", progress)
+	}
+}
+
+func TestSyncNowRejectsConcurrentRun(t *testing.T) {
+	t.Parallel()
+	coordinator := &Coordinator{}
+	coordinator.syncNowActive.Store(true)
+	if !coordinator.SyncInProgress() {
+		t.Fatal("active sync was not reported")
+	}
+	if _, err := coordinator.SyncNow(context.Background()); !errors.Is(err, core.ErrSyncInProgress) {
+		t.Fatalf("concurrent sync returned %v", err)
+	}
+	coordinator.syncNowActive.Store(false)
+	if coordinator.SyncInProgress() {
+		t.Fatal("completed sync remained active")
 	}
 }

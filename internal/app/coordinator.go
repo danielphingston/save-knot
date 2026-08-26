@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/saveknot/saveknot/internal/catalog"
@@ -71,6 +72,7 @@ type Coordinator struct {
 	events          *events.Bus
 	watcher         *watcher.Manager
 	backupMu        sync.Mutex
+	syncNowActive   atomic.Bool
 	reconcileMu     sync.Mutex
 	diagnosticsMu   sync.RWMutex
 	diagnostics     core.Diagnostics
@@ -167,7 +169,7 @@ func (c *Coordinator) run(ctx context.Context) {
 			automation := c.settings.Config().Automation
 			if automation.PeriodicSyncEnabled && now.Sub(lastSync) >= time.Duration(automation.SyncIntervalMinutes)*time.Minute {
 				lastSync = now
-				if _, err := c.syncWatchedPending(ctx); err != nil && !errors.Is(err, settings.ErrR2NotConfigured) {
+				if _, err := c.SyncNow(ctx); err != nil && !errors.Is(err, settings.ErrR2NotConfigured) && !errors.Is(err, core.ErrSyncInProgress) {
 					slog.Warn("periodic sync of watched games", "error", err)
 				}
 			}
@@ -662,6 +664,10 @@ func (c *Coordinator) ReconcileRemote(ctx context.Context) (remote.ReconcileResu
 }
 
 func (c *Coordinator) SyncNow(ctx context.Context) (core.SyncResult, error) {
+	if !c.syncNowActive.CompareAndSwap(false, true) {
+		return core.SyncResult{}, core.ErrSyncInProgress
+	}
+	defer c.syncNowActive.Store(false)
 	if _, err := c.settings.R2(ctx); err != nil {
 		c.settings.RecordR2Failure(err)
 		return core.SyncResult{}, err
@@ -670,12 +676,32 @@ func (c *Coordinator) SyncNow(ctx context.Context) (core.SyncResult, error) {
 	if err != nil {
 		return core.SyncResult{}, err
 	}
-	result, backupErr := checkpointWatchedGames(ctx, games, c.Backup, c.events.Publish)
+	c.events.Publish(core.Event{Type: "sync.started"})
+	result, backupErr := checkpointWatchedGames(ctx, games, c.Backup, c.events.Publish, func(completed, total int) {
+		c.publishSyncProgress("checking", completed, total)
+	})
 	uploaded, uploadErr := c.syncWatchedPending(ctx)
 	result.Eligible = uploaded.Eligible
 	result.Synced = uploaded.Synced
 	result.Failed = uploaded.Failed
-	return result, errors.Join(backupErr, uploadErr)
+	syncErr := errors.Join(backupErr, uploadErr)
+	if syncErr == nil {
+		c.settings.RecordR2Sync()
+	}
+	completed := core.Event{Type: "sync.completed", Data: map[string]any{"result": result}}
+	if syncErr != nil {
+		completed.Message = syncErr.Error()
+	}
+	c.events.Publish(completed)
+	return result, syncErr
+}
+
+func (c *Coordinator) SyncInProgress() bool {
+	return c.syncNowActive.Load()
+}
+
+func (c *Coordinator) publishSyncProgress(phase string, completed, total int) {
+	c.events.Publish(core.Event{Type: "sync.progress", Data: map[string]any{"phase": phase, "completed": completed, "total": total}})
 }
 
 func checkpointWatchedGames(
@@ -683,9 +709,19 @@ func checkpointWatchedGames(
 	games []core.Game,
 	backup func(context.Context, string) (core.Snapshot, error),
 	publish func(core.Event),
+	progress func(completed, total int),
 ) (core.SyncResult, error) {
 	var result core.SyncResult
 	var failures []error
+	total := 0
+	for _, game := range games {
+		if game.Enabled && game.SyncEnabled && !game.Hidden {
+			total++
+		}
+	}
+	if progress != nil {
+		progress(0, total)
+	}
 	for _, game := range games {
 		if err := ctx.Err(); err != nil {
 			failures = append(failures, err)
@@ -707,6 +743,9 @@ func checkpointWatchedGames(
 			result.BackupFailed++
 			failures = append(failures, fmt.Errorf("checkpoint %q: %w", game.DisplayName, err))
 			publish(core.Event{Type: "snapshot.failed", GameID: game.ID, Message: err.Error()})
+		}
+		if progress != nil {
+			progress(result.CheckedGames, total)
 		}
 	}
 	return result, errors.Join(failures...)
@@ -730,14 +769,11 @@ func (c *Coordinator) syncPending(ctx context.Context, load func(context.Context
 	}
 	result, games, uploadErr := syncSnapshotBatch(pending, func(snapshot core.Snapshot) error {
 		return c.syncer.Upload(ctx, r2, snapshot)
-	}, c.events.Publish)
+	}, c.events.Publish, func(completed, total int) { c.publishSyncProgress("uploading", completed, total) })
 	for gameID := range games {
 		if err := c.applyRetention(ctx, gameID); err != nil {
 			uploadErr = errors.Join(uploadErr, err)
 		}
-	}
-	if result.Synced > 0 {
-		c.settings.RecordR2Sync()
 	}
 	if uploadErr != nil {
 		c.settings.RecordR2Failure(uploadErr)
@@ -745,20 +781,29 @@ func (c *Coordinator) syncPending(ctx context.Context, load func(context.Context
 	return result, uploadErr
 }
 
-func syncSnapshotBatch(snapshots []core.Snapshot, upload func(core.Snapshot) error, publish func(core.Event)) (core.SyncResult, map[string]struct{}, error) {
+func syncSnapshotBatch(snapshots []core.Snapshot, upload func(core.Snapshot) error, publish func(core.Event), progress func(completed, total int)) (core.SyncResult, map[string]struct{}, error) {
 	result := core.SyncResult{Eligible: len(snapshots)}
 	syncedGames := make(map[string]struct{})
 	var uploadErrors []error
+	if progress != nil {
+		progress(0, len(snapshots))
+	}
 	for _, snapshot := range snapshots {
 		if err := upload(snapshot); err != nil {
 			result.Failed++
 			uploadErrors = append(uploadErrors, err)
 			publish(core.Event{Type: "upload.failed", GameID: snapshot.GameID, Message: err.Error()})
+			if progress != nil {
+				progress(result.Synced+result.Failed, len(snapshots))
+			}
 			continue
 		}
 		result.Synced++
 		syncedGames[snapshot.GameID] = struct{}{}
 		publish(core.Event{Type: "upload.completed", GameID: snapshot.GameID, Data: map[string]any{"snapshotId": snapshot.ID}})
+		if progress != nil {
+			progress(result.Synced+result.Failed, len(snapshots))
+		}
 	}
 	return result, syncedGames, errors.Join(uploadErrors...)
 }
