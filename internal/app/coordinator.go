@@ -43,6 +43,10 @@ type pendingRepository interface {
 	SnapshotsBeyond(context.Context, string, int) ([]core.Snapshot, error)
 }
 
+type periodicPendingRepository interface {
+	PendingSnapshotsForWatchedGames(context.Context) ([]core.Snapshot, error)
+}
+
 type registryRepository interface {
 	ReplaceCatalogRegistry(context.Context, string, []core.RegistryPath) error
 	GamePolicy(context.Context, string) (core.BackupPolicy, error)
@@ -52,6 +56,7 @@ type Coordinator struct {
 	repository    repository
 	gameState     gameStateRepository
 	pending       pendingRepository
+	periodic      periodicPendingRepository
 	registry      registryRepository
 	snapshots     *snapshot.Service
 	syncer        *remote.Syncer
@@ -79,6 +84,7 @@ func NewCoordinator(
 	repository repository,
 	gameState gameStateRepository,
 	pending pendingRepository,
+	periodic periodicPendingRepository,
 	registry registryRepository,
 	snapshots *snapshot.Service,
 	syncer *remote.Syncer,
@@ -89,7 +95,7 @@ func NewCoordinator(
 	watchManager *watcher.Manager,
 ) *Coordinator {
 	return &Coordinator{
-		repository: repository, gameState: gameState, pending: pending, registry: registry, snapshots: snapshots, syncer: syncer, reconciler: reconciler, settings: settings,
+		repository: repository, gameState: gameState, pending: pending, periodic: periodic, registry: registry, snapshots: snapshots, syncer: syncer, reconciler: reconciler, settings: settings,
 		paths: paths, events: eventBus, watcher: watchManager,
 	}
 }
@@ -124,18 +130,28 @@ func (c *Coordinator) run(ctx context.Context) {
 		c.events.Publish(core.Event{Type: "storage.error", Message: err.Error()})
 	}
 	catalogTicker := time.NewTicker(24 * time.Hour)
-	syncTicker := time.NewTicker(5 * time.Minute)
+	automationTicker := time.NewTicker(time.Minute)
+	lastSync := time.Now()
+	lastDiscovery := time.Now()
 	defer catalogTicker.Stop()
-	defer syncTicker.Stop()
+	defer automationTicker.Stop()
 	for {
 		select {
 		case <-ctx.Done():
 			return
 		case <-catalogTicker.C:
 			c.refreshCatalog(ctx)
-		case <-syncTicker.C:
-			if _, err := c.SyncPending(ctx); err != nil && !errors.Is(err, settings.ErrR2NotConfigured) {
-				slog.Warn("retry pending R2 snapshots", "error", err)
+		case now := <-automationTicker.C:
+			automation := c.settings.Config().Automation
+			if automation.PeriodicSyncEnabled && now.Sub(lastSync) >= time.Duration(automation.SyncIntervalMinutes)*time.Minute {
+				lastSync = now
+				if _, err := c.syncWatchedPending(ctx); err != nil && !errors.Is(err, settings.ErrR2NotConfigured) {
+					slog.Warn("periodic sync of watched games", "error", err)
+				}
+			}
+			if automation.PeriodicDiscoveryEnabled && now.Sub(lastDiscovery) >= time.Duration(automation.DiscoveryIntervalMinutes)*time.Minute {
+				lastDiscovery = now
+				c.discover(ctx)
 			}
 		}
 	}
@@ -604,6 +620,14 @@ func (c *Coordinator) ReconcileRemote(ctx context.Context) (remote.ReconcileResu
 }
 
 func (c *Coordinator) SyncPending(ctx context.Context) (core.SyncResult, error) {
+	return c.syncPending(ctx, c.pending.PendingSnapshots)
+}
+
+func (c *Coordinator) syncWatchedPending(ctx context.Context) (core.SyncResult, error) {
+	return c.syncPending(ctx, c.periodic.PendingSnapshotsForWatchedGames)
+}
+
+func (c *Coordinator) syncPending(ctx context.Context, load func(context.Context) ([]core.Snapshot, error)) (core.SyncResult, error) {
 	c.backupMu.Lock()
 	defer c.backupMu.Unlock()
 	r2, err := c.settings.R2(ctx)
@@ -611,7 +635,7 @@ func (c *Coordinator) SyncPending(ctx context.Context) (core.SyncResult, error) 
 		c.settings.RecordR2Failure(err)
 		return core.SyncResult{}, err
 	}
-	pending, err := c.pending.PendingSnapshots(ctx)
+	pending, err := load(ctx)
 	if err != nil {
 		return core.SyncResult{}, err
 	}

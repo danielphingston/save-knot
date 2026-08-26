@@ -13,16 +13,38 @@ import (
 const DefaultManifestURL = "https://raw.githubusercontent.com/mtkennerly/ludusavi-manifest/master/data/manifest.yaml"
 
 type Config struct {
-	Listen         string   `json:"listen"`
-	ManifestURL    string   `json:"manifestUrl"`
-	SteamRoots     []string `json:"steamRoots,omitempty"`
-	EpicManifests  []string `json:"epicManifests,omitempty"`
-	GOGRoots       []string `json:"gogRoots,omitempty"`
-	LocalBackupDir string   `json:"localBackupDir,omitempty"`
-	LaunchAtLogin  bool     `json:"launchAtLogin"`
-	RetentionKeep  int      `json:"retentionKeep"`
-	DeviceID       string   `json:"deviceId"`
-	R2             R2       `json:"r2"`
+	Listen         string     `json:"listen"`
+	ManifestURL    string     `json:"manifestUrl"`
+	SteamRoots     []string   `json:"steamRoots,omitempty"`
+	EpicManifests  []string   `json:"epicManifests,omitempty"`
+	GOGRoots       []string   `json:"gogRoots,omitempty"`
+	LocalBackupDir string     `json:"localBackupDir,omitempty"`
+	LaunchAtLogin  bool       `json:"launchAtLogin"`
+	RetentionKeep  int        `json:"retentionKeep"`
+	Automation     Automation `json:"automation"`
+	DeviceID       string     `json:"deviceId"`
+	R2             R2         `json:"r2"`
+}
+
+type Automation struct {
+	PeriodicSyncEnabled      bool `json:"periodicSyncEnabled"`
+	SyncIntervalMinutes      int  `json:"syncIntervalMinutes"`
+	PeriodicDiscoveryEnabled bool `json:"periodicDiscoveryEnabled"`
+	DiscoveryIntervalMinutes int  `json:"discoveryIntervalMinutes"`
+}
+
+func DefaultAutomation() Automation {
+	return Automation{PeriodicSyncEnabled: true, SyncIntervalMinutes: 5, DiscoveryIntervalMinutes: 60}
+}
+
+func (a Automation) Validate() error {
+	if a.SyncIntervalMinutes < 1 || a.SyncIntervalMinutes > 10_080 {
+		return errors.New("sync interval must be between 1 minute and 7 days")
+	}
+	if a.DiscoveryIntervalMinutes < 5 || a.DiscoveryIntervalMinutes > 43_200 {
+		return errors.New("game search interval must be between 5 minutes and 30 days")
+	}
+	return nil
 }
 
 type R2 struct {
@@ -77,7 +99,7 @@ func Load(path string) (Config, error) {
 	//nolint:gosec // path is the application-owned config location chosen during bootstrap.
 	data, err := os.ReadFile(path)
 	if errors.Is(err, os.ErrNotExist) {
-		return Config{Listen: "127.0.0.1:32147", ManifestURL: DefaultManifestURL, RetentionKeep: 50, R2: R2{Prefix: "saveknot"}}, nil
+		return Config{Listen: "127.0.0.1:32147", ManifestURL: DefaultManifestURL, RetentionKeep: 50, Automation: DefaultAutomation(), R2: R2{Prefix: "saveknot"}}, nil
 	}
 	if err != nil {
 		return Config{}, fmt.Errorf("read config: %w", err)
@@ -97,6 +119,11 @@ func Load(path string) (Config, error) {
 	}
 	if cfg.RetentionKeep == 0 {
 		cfg.RetentionKeep = 50
+	}
+	// Configurations written before automation was configurable have no interval
+	// fields. Preserve the existing five-minute retry behavior when migrating.
+	if cfg.Automation.SyncIntervalMinutes == 0 && cfg.Automation.DiscoveryIntervalMinutes == 0 {
+		cfg.Automation = DefaultAutomation()
 	}
 	return cfg, nil
 }

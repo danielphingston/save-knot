@@ -73,6 +73,36 @@ func TestStoreGamePathsAndSnapshots(t *testing.T) {
 	}
 }
 
+func TestPeriodicSyncSelectsOnlyWatchedGames(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	store, err := Open(ctx, filepath.Join(t.TempDir(), "state.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if err := store.Close(); err != nil {
+			t.Error(err)
+		}
+	})
+	for _, game := range []core.Game{
+		{ID: "watched", DisplayName: "Watched", Store: "custom", Enabled: true, SyncEnabled: true},
+		{ID: "manual", DisplayName: "Manual", Store: "custom", Enabled: false, SyncEnabled: true},
+		{ID: "local", DisplayName: "Local", Store: "custom", Enabled: true, SyncEnabled: false},
+	} {
+		if err := store.UpsertGame(ctx, game); err != nil {
+			t.Fatal(err)
+		}
+		if err := store.SaveSnapshot(ctx, core.Snapshot{Version: 1, ID: "snapshot-" + game.ID, GameID: game.ID, CreatedAt: time.Now(), RemoteState: "local"}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	pending, err := store.PendingSnapshotsForWatchedGames(ctx)
+	if err != nil || len(pending) != 1 || pending[0].GameID != "watched" {
+		t.Fatalf("periodic sync selection was not limited to watched games: snapshots=%#v err=%v", pending, err)
+	}
+}
+
 //nolint:gocognit // The linear lifecycle assertions are clearer together as one storage regression journey.
 func TestHiddenGameLifecyclePreservesDataAndStaysOutOfSync(t *testing.T) {
 	t.Parallel()

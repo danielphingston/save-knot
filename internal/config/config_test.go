@@ -13,7 +13,7 @@ func TestLoadDefaultsAndRoundTrip(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if cfg.Listen != "127.0.0.1:32147" || cfg.ManifestURL != DefaultManifestURL || cfg.R2.Prefix != "saveknot" {
+	if cfg.Listen != "127.0.0.1:32147" || cfg.ManifestURL != DefaultManifestURL || cfg.R2.Prefix != "saveknot" || !cfg.Automation.PeriodicSyncEnabled || cfg.Automation.SyncIntervalMinutes != 5 {
 		t.Fatalf("unexpected defaults: %#v", cfg)
 	}
 	cfg.DeviceID = "device-a"
@@ -34,6 +34,21 @@ func TestLoadDefaultsAndRoundTrip(t *testing.T) {
 	}
 	if info.Mode().Perm()&0o077 != 0 {
 		t.Fatalf("config is accessible outside the user: %o", info.Mode().Perm())
+	}
+}
+
+func TestLoadMigratesAutomationDefaults(t *testing.T) {
+	t.Parallel()
+	path := filepath.Join(t.TempDir(), "config.json")
+	if err := os.WriteFile(path, []byte(`{"retentionKeep":50}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !cfg.Automation.PeriodicSyncEnabled || cfg.Automation.PeriodicDiscoveryEnabled || cfg.Automation.DiscoveryIntervalMinutes != 60 {
+		t.Fatalf("legacy automation was not migrated: %#v", cfg.Automation)
 	}
 }
 

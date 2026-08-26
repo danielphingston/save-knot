@@ -269,8 +269,12 @@ func TestGameLifecycleRecoveryAndSettingsAPI(t *testing.T) {
 	if retention.Code != http.StatusNoContent {
 		t.Fatalf("retention update failed: %d %s", retention.Code, retention.Body.String())
 	}
+	automation := serveRequest(server, http.MethodPut, "/api/settings/automation", `{"periodicSyncEnabled":false,"syncIntervalMinutes":30,"periodicDiscoveryEnabled":true,"discoveryIntervalMinutes":120}`)
+	if automation.Code != http.StatusNoContent {
+		t.Fatalf("automation update failed: %d %s", automation.Code, automation.Body.String())
+	}
 	status := serveRequest(server, http.MethodGet, "/api/status", "")
-	if !strings.Contains(status.Body.String(), `"retentionKeep":51`) || !strings.Contains(status.Body.String(), `"r2State":"configured"`) {
+	if !strings.Contains(status.Body.String(), `"retentionKeep":51`) || !strings.Contains(status.Body.String(), `"periodicDiscoveryEnabled":true`) || !strings.Contains(status.Body.String(), `"r2State":"configured"`) {
 		t.Fatalf("status did not expose persisted settings: %s", status.Body.String())
 	}
 	manager.RecordR2Success()

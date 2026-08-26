@@ -207,14 +207,21 @@ function settingsPage() {
   const diagnostics = state.status.diagnostics || {};
   const catalog = diagnostics.catalog || {};
   const discovery = diagnostics.discovery || {};
+  const automation = state.status.automation || {};
   const r2Health = state.status.r2State === 'verified'
     ? `Verified ${formatTime(state.status.r2LastVerified)}`
     : state.status.r2State === 'unavailable'
       ? `Unavailable since ${formatTime(state.status.r2LastFailure)}${state.status.r2LastError ? ` · ${state.status.r2LastError}` : ''}`
       : state.status.r2Configured ? 'Configured, but not yet verified by this version' : 'Not configured';
   root.innerHTML = `
-    <header class="page-head"><div><p class="eyebrow">Private by design</p><h1>Storage</h1><p class="subtle">SaveKnot connects straight from this device to your bucket.</p></div></header>
+    <header class="page-head"><div><p class="eyebrow">Make SaveKnot yours</p><h1>Settings</h1><p class="subtle">Control when backups move, how games are found, and where your data lives.</p></div></header>
     <section class="settings-grid">
+      <form class="settings-card settings-card-wide" id="automation-form"><div class="settings-card-head"><div><p class="eyebrow">Background tasks</p><h2>Automatic sync & discovery</h2><p class="subtle">These schedules are independent. Turn on only the help you want.</p></div><span class="status-pill">Runs on this device</span></div>
+        <div class="automation-grid">
+          <div class="automation-option"><label class="switch-row"><span><strong>Sync watched games</strong><small>Upload pending snapshots only for games that are being watched.</small></span><input type="checkbox" name="periodicSyncEnabled" ${automation.periodicSyncEnabled ? 'checked' : ''}></label><label for="sync-interval">Check every</label><div class="input-suffix"><input id="sync-interval" type="number" min="1" max="10080" name="syncIntervalMinutes" value="${escapeHTML(automation.syncIntervalMinutes || 5)}"><span>minutes</span></div></div>
+          <div class="automation-option"><label class="switch-row"><span><strong>Search for new save games</strong><small>Rescan Steam, Epic, GOG, and known local save locations.</small></span><input type="checkbox" name="periodicDiscoveryEnabled" ${automation.periodicDiscoveryEnabled ? 'checked' : ''}></label><label for="discovery-interval">Search every</label><div class="input-suffix"><input id="discovery-interval" type="number" min="5" max="43200" name="discoveryIntervalMinutes" value="${escapeHTML(automation.discoveryIntervalMinutes || 60)}"><span>minutes</span></div></div>
+        </div><div class="form-actions"><span class="save-hint">Changes apply without restarting SaveKnot.</span><button class="button primary" type="submit">Save automation</button></div>
+      </form>
       <form class="settings-card" id="r2-form"><h2>Cloudflare R2</h2><p class="subtle">Use a bucket-scoped token with Object Read & Write permission.</p>
         <div class="form-grid">
           <div class="field"><label for="account">Account ID</label><input id="account" name="accountId" required value="${escapeHTML(r2.accountId || '')}"></div>
@@ -224,14 +231,12 @@ function settingsPage() {
           <div class="field full"><label for="prefix">Object prefix</label><input id="prefix" name="prefix" value="${escapeHTML(r2.prefix || 'saveknot')}"></div>
         </div><div class="callout r2-health"><strong>${escapeHTML(r2Health)}</strong><br>Configuration, recent verification, and current availability are reported separately.</div><div class="form-actions">${state.status.r2Configured ? '<button class="button danger" type="button" id="disconnect-r2">Disconnect R2</button>' : ''}<button class="button primary" type="submit">Test & connect</button></div>
       </form>
-      <form class="settings-card" id="local-form"><h2>Local storage & discovery</h2><p class="subtle">Choose where compressed local blobs live and optionally add Steam installation roots.</p>
+      <form class="settings-card" id="local-form"><h2>Device & local storage</h2><p class="subtle">Choose where local backups live and how SaveKnot behaves on this device.</p>
         <div class="form-grid">
           <div class="field full"><label for="local-backups">Local backup location</label><div class="actions"><input id="local-backups" name="localBackupDir" required value="${escapeHTML(state.status.localBackupDir || '')}"><button class="button browse" type="button" data-target="local-backups">Browse…</button></div></div>
-          <div class="field full"><label for="steam-roots">Extra Steam roots</label><textarea id="steam-roots" name="steamRoots" placeholder="One absolute folder per line">${escapeHTML((state.status.steamRoots || []).join('\n'))}</textarea><span class="help">SaveKnot also checks Steam's Windows registry entries and standard locations automatically.</span></div>
-          <div class="field full"><label for="epic-manifests">Extra Epic manifest folders</label><textarea id="epic-manifests" name="epicManifests" placeholder="One absolute folder per line">${escapeHTML((state.status.epicManifests || []).join('\n'))}</textarea></div>
-          <div class="field full"><label for="gog-roots">Extra GOG game roots</label><textarea id="gog-roots" name="gogRoots" placeholder="One absolute folder per line">${escapeHTML((state.status.gogRoots || []).join('\n'))}</textarea></div>
-          <div class="field full"><label><input type="checkbox" name="launchAtLogin" ${state.status.launchAtLogin ? 'checked' : ''}> Launch SaveKnot when I sign in</label></div>
+          <div class="field full"><label class="switch-row compact"><span><strong>Launch when I sign in</strong><small>Keep automatic backups running without opening SaveKnot yourself.</small></span><input type="checkbox" name="launchAtLogin" ${state.status.launchAtLogin ? 'checked' : ''}></label></div>
           <div class="field"><label for="retention">Snapshots kept per game</label><input id="retention" type="number" min="1" max="10000" name="retentionKeep" value="${escapeHTML(state.status.retentionKeep || 50)}"></div>
+          <details class="advanced-settings field full"><summary>Custom launcher locations</summary><p class="help">Only add these when a launcher is installed somewhere SaveKnot cannot detect.</p><div class="form-grid"><div class="field full"><label for="steam-roots">Extra Steam roots</label><textarea id="steam-roots" name="steamRoots" placeholder="One absolute folder per line">${escapeHTML((state.status.steamRoots || []).join('\n'))}</textarea></div><div class="field full"><label for="epic-manifests">Extra Epic manifest folders</label><textarea id="epic-manifests" name="epicManifests" placeholder="One absolute folder per line">${escapeHTML((state.status.epicManifests || []).join('\n'))}</textarea></div><div class="field full"><label for="gog-roots">Extra GOG game roots</label><textarea id="gog-roots" name="gogRoots" placeholder="One absolute folder per line">${escapeHTML((state.status.gogRoots || []).join('\n'))}</textarea></div></div></details>
         </div><div class="form-actions"><button class="button primary" type="submit">Save local settings</button></div>
       </form>
       <div class="settings-card"><h2>Discovery diagnostics</h2><p class="subtle">Use these counts to diagnose an empty game list.</p>
@@ -241,6 +246,13 @@ function settingsPage() {
       <div class="settings-card"><h2>Ignored and removed games</h2><p class="subtle">These games stay out of the library and discovery scans. Snapshots and customizations are preserved.</p><div class="panel ignored-games">${state.ignoredGames.length ? state.ignoredGames.map(game => `<div class="row"><div><strong>${escapeHTML(game.displayName)}</strong><small>${game.store === 'custom' ? 'Removed custom game' : 'Ignored discovered game'} · ${game.snapshotCount} snapshots</small></div><button class="button small restore-game" data-game="${escapeHTML(game.id)}">Restore to library</button></div>`).join('') : '<div class="row"><div><strong>No ignored games</strong><small>Games removed from the library will appear here.</small></div></div>'}</div></div>
       <div class="settings-card"><h2>No middleman</h2><p class="subtle">There is no SaveKnot account, hosted API, telemetry collector, or central database.</p><div class="callout">The local daemon uploads content-addressed blobs first and publishes an immutable snapshot manifest last. An interrupted upload cannot create a valid partial backup.</div></div>
     </section>`;
+  document.querySelector('#automation-form').addEventListener('submit', async event => {
+    event.preventDefault(); const form = new FormData(event.currentTarget); const button = event.submitter; button.disabled = true;
+    try {
+      await api('/api/settings/automation', { method: 'PUT', body: JSON.stringify({ periodicSyncEnabled: form.get('periodicSyncEnabled') === 'on', syncIntervalMinutes: Number(form.get('syncIntervalMinutes')), periodicDiscoveryEnabled: form.get('periodicDiscoveryEnabled') === 'on', discoveryIntervalMinutes: Number(form.get('discoveryIntervalMinutes')) }) });
+      await loadShared(); settingsPage(); toast('Automation schedule saved');
+    } catch (error) { toast(error.message, true); button.disabled = false; }
+  });
   document.querySelector('#r2-form').addEventListener('submit', async event => {
     event.preventDefault(); const button = event.submitter; button.disabled = true; button.textContent = 'Connecting…';
     try { const data = Object.fromEntries(new FormData(event.currentTarget)); await api('/api/r2', { method: 'POST', body: JSON.stringify(data) }); toast('R2 connection verified and saved'); await loadShared(); settingsPage(); }
