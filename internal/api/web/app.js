@@ -80,7 +80,10 @@ async function loadShared() {
 }
 
 function gameSyncLabel(game) {
-  if (!state.status.r2Configured) return 'R2 unavailable';
+  if (!state.status.r2Configured) {
+    if (!game.syncEnabled) return 'Remote sync off';
+    return `${game.pendingSnapshotCount ? `${game.pendingSnapshotCount} pending · ` : ''}Syncs after R2 is connected`;
+  }
   if (!game.syncEnabled) return 'Sync off';
   return game.pendingSnapshotCount ? `${game.pendingSnapshotCount} pending` : 'Up to date';
 }
@@ -109,12 +112,19 @@ function updateSyncControl() {
   const control = document.querySelector('.sync-now-control');
   if (!control) return;
   const busy = state.syncRequestActive || state.syncProgress.active || Boolean(state.status?.syncInProgress);
+  const connectedBusy = state.status.r2Configured && busy;
   const progress = state.syncProgress;
   const button = control.querySelector('#sync-all');
-  button.disabled = !state.status.r2Configured || busy;
-  button.textContent = busy ? 'Syncing…' : state.status.r2Configured ? 'Sync now' : 'Connect R2 to sync';
+  button.disabled = connectedBusy;
+  button.textContent = !state.status.r2Configured ? 'Connect R2 to sync' : busy ? 'Syncing…' : 'Sync now';
+  button.title = state.status.r2Configured
+    ? 'Check watched games for changes, create snapshots, and upload pending snapshots'
+    : 'Open R2 settings. Pending snapshots will sync after R2 is connected.';
+  button.setAttribute('aria-label', state.status.r2Configured
+    ? busy ? 'Syncing watched games' : 'Sync watched games now'
+    : 'Connect R2 to sync; pending snapshots will sync after R2 is connected');
   const progressArea = control.querySelector('.sync-progress-area');
-  progressArea.hidden = !busy;
+  progressArea.hidden = !connectedBusy;
   progressArea.querySelector('small').textContent = syncProgressLabel();
   const bar = progressArea.querySelector('progress');
   if (progress.active && progress.total > 0) {
@@ -123,15 +133,20 @@ function updateSyncControl() {
   } else {
     bar.removeAttribute('value');
   }
-  control.querySelector('.last-sync').textContent = `Last synced: ${formatTime(state.status.r2LastSynced)}`;
+  control.querySelector('.last-sync').textContent = state.status.r2Configured
+    ? `Last synced: ${formatTime(state.status.r2LastSynced)}`
+    : 'Currently local only · Sync starts after R2 is connected';
 }
 
 function gamesPage() {
   setActiveNav('games');
   const games = visibleGames();
+  const librarySummary = state.status.r2Configured
+    ? 'Immutable checkpoints, kept close and synced safely.'
+    : 'Immutable local checkpoints. Remote sync starts after R2 is connected.';
   root.innerHTML = `
     <header class="page-head">
-      <div><p class="eyebrow">Your library</p><h1>Game saves</h1><p class="subtle">Immutable checkpoints, kept close and synced safely.</p></div>
+      <div><p class="eyebrow">Your library</p><h1>Game saves</h1><p class="subtle">${escapeHTML(librarySummary)}</p></div>
       <div class="actions"><div class="sync-now-control" aria-live="polite"><button class="button" id="sync-all" title="Check watched games for changes, create snapshots, and upload pending snapshots">Sync now</button><div class="sync-progress-area" hidden><progress></progress><small>Preparing sync…</small></div><small class="last-sync">Last synced: ${escapeHTML(formatTime(state.status.r2LastSynced))}</small></div><button class="button" id="scan-games">Scan for games</button><button class="button primary" id="add-game">+ Add game</button></div>
     </header>
     ${state.games.length ? `<section class="library-tools" aria-label="Filter games"><label class="search-field" for="game-search">Search games</label><input id="game-search" type="search" placeholder="Search display or catalog name" value="${escapeHTML(state.gameFilters.query)}"><label for="watcher-filter">Backup mode</label><select id="watcher-filter"><option value="all">All modes</option><option value="watched" ${state.gameFilters.watcher === 'watched' ? 'selected' : ''}>Watched</option><option value="manual" ${state.gameFilters.watcher === 'manual' ? 'selected' : ''}>Manual backups</option></select><label for="sync-filter">Sync state</label><select id="sync-filter"><option value="all">All sync states</option><option value="pending" ${state.gameFilters.sync === 'pending' ? 'selected' : ''}>Pending</option><option value="current" ${state.gameFilters.sync === 'current' ? 'selected' : ''}>Up to date</option></select><label for="snapshot-filter">Backups</label><select id="snapshot-filter"><option value="all">All backup states</option><option value="yes" ${state.gameFilters.snapshots === 'yes' ? 'selected' : ''}>Has snapshots</option><option value="no" ${state.gameFilters.snapshots === 'no' ? 'selected' : ''}>No snapshots</option></select></section>${games.length ? `<section class="games">${games.map(game => `
@@ -144,6 +159,7 @@ function gamesPage() {
   document.querySelector('#add-game').addEventListener('click', showAddGame);
   document.querySelector('#empty-add')?.addEventListener('click', showAddGame);
   document.querySelector('#sync-all').addEventListener('click', async event => {
+    if (!state.status.r2Configured) { location.hash = '#/settings/r2'; return; }
     if (state.syncRequestActive || state.syncProgress.active || state.status.syncInProgress) return;
     state.syncRequestActive = true;
     state.syncProgress = { active: true, phase: 'starting', completed: 0, total: 0 };
@@ -176,6 +192,10 @@ async function gamePage(id) {
   const [{ game, paths, registry, exclusions, policy }, snapshots] = await Promise.all([api(`/api/games/${encodeURIComponent(id)}`), api(`/api/games/${encodeURIComponent(id)}/snapshots`)]);
   const canSync = state.status.r2Configured && game.syncEnabled && game.pendingSnapshotCount > 0;
   const syncLabel = !state.status.r2Configured ? 'Connect R2 to sync' : !game.syncEnabled ? 'Sync disabled' : game.pendingSnapshotCount ? `Sync pending (${game.pendingSnapshotCount})` : 'Up to date';
+  const syncDisabled = state.status.r2Configured && !canSync;
+  const syncDescription = game.syncEnabled
+    ? `Currently local only. This game's pending snapshots will sync after R2 is connected.`
+    : 'Currently local only. Remote sync will remain off after R2 is connected unless you enable it in Customize.';
   root.innerHTML = `
     <a class="subtle" href="#/games">← All games</a>
     <section class="detail-head section">
@@ -184,7 +204,8 @@ async function gamePage(id) {
         <p class="eyebrow">${escapeHTML(game.store)} ${game.storeId ? `· ${escapeHTML(game.storeId)}` : ''}</p>
         <h1>${escapeHTML(game.displayName)}</h1>
         <p class="subtle">${escapeHTML(game.notes || 'Watching for changes and preserving each distinct version.')}</p>
-        <div class="actions"><button class="button primary" id="backup">Back up locally</button><button class="button" id="sync" ${canSync ? '' : 'disabled'}>${escapeHTML(syncLabel)}</button><button class="button" id="edit">Customize</button><button class="button danger" id="remove-game">${game.store === 'custom' ? 'Remove from library' : 'Ignore this game'}</button></div>
+        <div class="actions"><button class="button primary" id="backup">Back up locally</button><button class="button" id="sync" ${syncDisabled ? 'disabled' : ''}${state.status.r2Configured ? '' : ' aria-describedby="game-sync-status" aria-label="Connect R2 to sync; this game is currently local only"'}>${escapeHTML(syncLabel)}</button><button class="button" id="edit">Customize</button><button class="button danger" id="remove-game">${game.store === 'custom' ? 'Remove from library' : 'Ignore this game'}</button></div>
+        ${state.status.r2Configured ? '' : `<p class="help" id="game-sync-status">${escapeHTML(syncDescription)}</p>`}
         <div class="stats"><div class="stat"><strong>${snapshots.length}</strong><small>Snapshots</small></div><div class="stat"><strong>${formatBytes(game.storedSize)}</strong><small>Stored</small></div><div class="stat"><strong>${formatTime(game.lastChange)}</strong><small>Last changed</small></div><div class="stat"><strong>${formatTime(game.lastBackup)}</strong><small>Last backup</small></div></div>
       </div>
     </section>
@@ -202,6 +223,7 @@ async function gamePage(id) {
     catch (error) { toast(error.message, true); button.disabled = false; }
   });
   document.querySelector('#sync').addEventListener('click', async event => {
+    if (!state.status.r2Configured) { location.hash = '#/settings/r2'; return; }
     const button = event.currentTarget; button.disabled = true;
     try { await api(`/api/games/${encodeURIComponent(id)}/sync`, { method: 'POST', body: '{}' }); toast('Pending snapshots synced'); await loadShared(); gamePage(id); }
     catch (error) { toast(error.message, true); button.disabled = false; }
@@ -248,6 +270,9 @@ function settingsPage() {
   const catalog = diagnostics.catalog || {};
   const discovery = diagnostics.discovery || {};
   const automation = state.status.automation || {};
+  const automationSyncHelp = state.status.r2Configured
+    ? 'Upload pending snapshots only for games that are being watched.'
+    : 'Currently local only. This preference is saved; watched games will sync after R2 is connected.';
   const r2Health = state.status.r2State === 'verified'
     ? `Verified ${formatTime(state.status.r2LastVerified)}`
     : state.status.r2State === 'unavailable'
@@ -258,18 +283,18 @@ function settingsPage() {
     <section class="settings-grid">
       <form class="settings-card settings-card-wide" id="automation-form"><div class="settings-card-head"><div><p class="eyebrow">Background tasks</p><h2>Automatic sync & discovery</h2><p class="subtle">These schedules are independent. Turn on only the help you want.</p></div><span class="status-pill">Runs on this device</span></div>
         <div class="automation-grid">
-          <div class="automation-option"><label class="switch-row"><span><strong>Sync watched games</strong><small>Upload pending snapshots only for games that are being watched.</small></span><input type="checkbox" name="periodicSyncEnabled" ${automation.periodicSyncEnabled ? 'checked' : ''}></label><label for="sync-interval">Check every</label><div class="input-suffix"><input id="sync-interval" type="number" min="1" max="10080" name="syncIntervalMinutes" value="${escapeHTML(automation.syncIntervalMinutes || 5)}"><span>minutes</span></div></div>
+          <div class="automation-option"><label class="switch-row"><span><strong>Sync watched games when R2 is connected</strong><small>${escapeHTML(automationSyncHelp)}</small></span><input type="checkbox" name="periodicSyncEnabled" ${automation.periodicSyncEnabled ? 'checked' : ''}></label><label for="sync-interval">Check every</label><div class="input-suffix"><input id="sync-interval" type="number" min="1" max="10080" name="syncIntervalMinutes" value="${escapeHTML(automation.syncIntervalMinutes || 5)}"><span>minutes</span></div></div>
           <div class="automation-option"><label class="switch-row"><span><strong>Search for new save games</strong><small>Rescan Steam, Epic, GOG, and known local save locations.</small></span><input type="checkbox" name="periodicDiscoveryEnabled" ${automation.periodicDiscoveryEnabled ? 'checked' : ''}></label><label for="discovery-interval">Search every</label><div class="input-suffix"><input id="discovery-interval" type="number" min="5" max="43200" name="discoveryIntervalMinutes" value="${escapeHTML(automation.discoveryIntervalMinutes || 60)}"><span>minutes</span></div></div>
         </div><div class="form-actions"><span class="save-hint">Changes apply without restarting SaveKnot.</span><button class="button primary" type="submit">Save automation</button></div>
       </form>
-      <form class="settings-card" id="r2-form"><h2>Cloudflare R2</h2><p class="subtle">Use a bucket-scoped token with Object Read & Write permission.</p>
+      <form class="settings-card" id="r2-form" tabindex="-1" aria-labelledby="r2-heading" aria-describedby="r2-help r2-health"><h2 id="r2-heading">Cloudflare R2</h2><p class="subtle" id="r2-help">Connect R2 to start remote sync. Until then, snapshots remain local and saved sync preferences are deferred.</p>
         <div class="form-grid">
           <div class="field"><label for="account">Account ID</label><input id="account" name="accountId" required value="${escapeHTML(r2.accountId || '')}"></div>
           <div class="field"><label for="bucket">Bucket</label><input id="bucket" name="bucket" required value="${escapeHTML(r2.bucket || '')}"></div>
           <div class="field full"><label for="key">Access key ID</label><input id="key" name="accessKeyId" required autocomplete="off" value="${escapeHTML(r2.accessKeyId || '')}"></div>
           <div class="field full"><label for="secret">Secret access key</label><input id="secret" type="password" name="secretAccessKey" required autocomplete="new-password"><span class="help">Stored in your operating system credential vault, never in SQLite or config.json.</span></div>
           <div class="field full"><label for="prefix">Object prefix</label><input id="prefix" name="prefix" value="${escapeHTML(r2.prefix || 'saveknot')}"></div>
-        </div><div class="callout r2-health"><strong>${escapeHTML(r2Health)}</strong><br>Configuration, recent verification, and current availability are reported separately.</div><div class="form-actions">${state.status.r2Configured ? '<button class="button danger" type="button" id="disconnect-r2">Disconnect R2</button>' : ''}<button class="button primary" type="submit">Test & connect</button></div>
+        </div><div class="callout r2-health" id="r2-health"><strong>${escapeHTML(r2Health)}</strong><br>Configuration, recent verification, and current availability are reported separately.</div><div class="form-actions">${state.status.r2Configured ? '<button class="button danger" type="button" id="disconnect-r2">Disconnect R2</button>' : ''}<button class="button primary" type="submit">Test & connect</button></div>
       </form>
       <form class="settings-card" id="local-form"><h2>Device & local storage</h2><p class="subtle">Choose where local backups live and how SaveKnot behaves on this device.</p>
         <div class="form-grid">
@@ -410,7 +435,7 @@ function showAddExclusion(game) {
 function showEditGame(game, policy) {
   const element = modal(`<div><p class="eyebrow">Customize</p><h2>${escapeHTML(game.displayName)}</h2></div>`); const body = element.querySelector('.modal');
   const catalogHelp = game.store === 'custom' ? 'Links this manual entry to a Ludusavi title. Your custom save locations stay unchanged.' : 'Change this only when SaveKnot matched the wrong game.';
-  body.insertAdjacentHTML('beforeend', `<form id="edit-form"><div class="form-grid"><div class="field full"><label for="edit-display-name">Display name</label><input id="edit-display-name" name="displayName" required value="${escapeHTML(game.displayName)}"></div><div class="field full"><label for="edit-catalog">Ludusavi catalog mapping</label><input id="edit-catalog" name="catalogId" list="catalog-options" value="${escapeHTML(game.catalogId || '')}" placeholder="Search catalog title"><datalist id="catalog-options"></datalist><span class="help">${escapeHTML(catalogHelp)}</span></div><div class="field full"><label for="edit-notes">Notes</label><textarea id="edit-notes" name="notes">${escapeHTML(game.notes || '')}</textarea></div><div class="field full"><label><input type="checkbox" name="enabled" ${game.enabled ? 'checked' : ''}> Watch for changes and create automatic local backups</label></div><div class="field full"><label><input type="checkbox" name="syncEnabled" ${game.syncEnabled ? 'checked' : ''}> Sync this game's pending snapshots to R2</label></div><div class="field"><label for="edit-quiet">Quiet debounce (seconds)</label><input id="edit-quiet" type="number" min="1" name="quietSeconds" value="${policy.quietSeconds}"></div><div class="field"><label for="edit-gap">Minimum snapshot gap (seconds)</label><input id="edit-gap" type="number" min="0" name="minGapSeconds" value="${policy.minGapSeconds}"></div><div class="field"><label for="edit-dirty">Maximum dirty duration (seconds)</label><input id="edit-dirty" type="number" min="1" name="maxDirtySeconds" value="${policy.maxDirtySeconds}"></div><div class="field full"><label for="edit-image">Custom picture</label><input id="edit-image" type="file" name="image" accept="image/png,image/jpeg,image/gif,image/webp">${String(game.image || '').startsWith('/artwork/') ? '<button class="button danger reset-image" type="button">Remove custom picture</button>' : ''}</div></div><div class="form-actions"><button class="button primary" type="submit">Save changes</button></div></form>`);
+  body.insertAdjacentHTML('beforeend', `<form id="edit-form"><div class="form-grid"><div class="field full"><label for="edit-display-name">Display name</label><input id="edit-display-name" name="displayName" required value="${escapeHTML(game.displayName)}"></div><div class="field full"><label for="edit-catalog">Ludusavi catalog mapping</label><input id="edit-catalog" name="catalogId" list="catalog-options" value="${escapeHTML(game.catalogId || '')}" placeholder="Search catalog title"><datalist id="catalog-options"></datalist><span class="help">${escapeHTML(catalogHelp)}</span></div><div class="field full"><label for="edit-notes">Notes</label><textarea id="edit-notes" name="notes">${escapeHTML(game.notes || '')}</textarea></div><div class="field full"><label><input type="checkbox" name="enabled" ${game.enabled ? 'checked' : ''}> Watch for changes and create automatic local backups</label></div><div class="field full"><label><input type="checkbox" name="syncEnabled" ${game.syncEnabled ? 'checked' : ''}> Sync this game's pending snapshots when R2 is connected</label>${state.status.r2Configured ? '' : '<span class="help">Currently local only. This preference is saved and will take effect after R2 is connected.</span>'}</div><div class="field"><label for="edit-quiet">Quiet debounce (seconds)</label><input id="edit-quiet" type="number" min="1" name="quietSeconds" value="${policy.quietSeconds}"></div><div class="field"><label for="edit-gap">Minimum snapshot gap (seconds)</label><input id="edit-gap" type="number" min="0" name="minGapSeconds" value="${policy.minGapSeconds}"></div><div class="field"><label for="edit-dirty">Maximum dirty duration (seconds)</label><input id="edit-dirty" type="number" min="1" name="maxDirtySeconds" value="${policy.maxDirtySeconds}"></div><div class="field full"><label for="edit-image">Custom picture</label><input id="edit-image" type="file" name="image" accept="image/png,image/jpeg,image/gif,image/webp">${String(game.image || '').startsWith('/artwork/') ? '<button class="button danger reset-image" type="button">Remove custom picture</button>' : ''}</div></div><div class="form-actions"><button class="button primary" type="submit">Save changes</button></div></form>`);
   const catalogInput = body.querySelector('input[name="catalogId"]'); let catalogTimer;
   const suggestCatalog = () => { clearTimeout(catalogTimer); catalogTimer = setTimeout(async () => { try { const choices = await api(`/api/catalog?q=${encodeURIComponent(catalogInput.value)}`); body.querySelector('#catalog-options').innerHTML = choices.map(choice => `<option value="${escapeHTML(choice.id)}"></option>`).join(''); } catch { /* Suggestions are optional; submit still validates the mapping. */ } }, 200); };
   catalogInput.addEventListener('input', suggestCatalog); suggestCatalog();
@@ -446,13 +471,16 @@ function showRemoveGame(game) {
 
 async function route() {
   const parts = (location.hash || '#/games').slice(2).split('/');
+  const focusR2Settings = parts[0] === 'settings' && parts[1] === 'r2';
   try {
     await loadShared();
     if (parts[0] === 'settings') settingsPage();
     else if (parts[0] === 'activity') activityPage();
     else if (parts[0] === 'games' && parts[1]) await gamePage(decodeURIComponent(parts[1]));
     else gamesPage();
-    root.focus({ preventScroll: true });
+    const focusTarget = focusR2Settings ? document.querySelector('#r2-form') : root;
+    focusTarget.focus({ preventScroll: true });
+    if (focusR2Settings) focusTarget.scrollIntoView({ behavior: 'smooth', block: 'center' });
   } catch (error) {
     if (error.status === 404 && parts[0] === 'games' && parts[1]) {
       root.innerHTML = '<section class="empty"><div><div class="empty-mark">?</div><h2>Game not found</h2><p class="subtle">This game may have been removed or ignored.</p><a class="button primary" href="#/games">Back to games</a></div></section>';

@@ -90,6 +90,147 @@ func TestBuildNormalizesRelativeDataAndBackupPaths(t *testing.T) {
 	}
 }
 
+func TestBackupPublishesSkippedWhenNoFilesExist(t *testing.T) {
+	application, _ := buildBackupTestApplication(t)
+	game := core.Game{ID: "empty", DisplayName: "Empty", Store: "custom", Enabled: true, SyncEnabled: true}
+	if err := application.database.UpsertGame(context.Background(), game); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := application.coordinator.Backup(context.Background(), game.ID); !errors.Is(err, snapshot.ErrNoFiles) {
+		t.Fatalf("backup returned %v", err)
+	}
+	events := assertSnapshotEvents(t, application.coordinator, "snapshot.started", "snapshot.skipped")
+	if events[1].Message != snapshot.ErrNoFiles.Error() {
+		t.Fatalf("skip message = %q, want %q", events[1].Message, snapshot.ErrNoFiles)
+	}
+}
+
+func TestBackupPublishesSkippedWhenSaveIsUnchanged(t *testing.T) {
+	application, paths := buildBackupTestApplication(t)
+	game := core.Game{ID: "unchanged", DisplayName: "Unchanged", Store: "custom", Enabled: true, SyncEnabled: true}
+	if err := application.database.UpsertGame(context.Background(), game); err != nil {
+		t.Fatal(err)
+	}
+	saveFile := filepath.Join(paths.Root, "save.dat")
+	if err := os.WriteFile(saveFile, []byte("save data"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := application.database.AddPath(context.Background(), core.GamePath{ID: "unchanged-path", GameID: game.ID, Source: "custom", Template: saveFile, Resolved: saveFile, Enabled: true}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := application.coordinator.Backup(context.Background(), game.ID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := application.coordinator.Backup(context.Background(), game.ID); !errors.Is(err, snapshot.ErrUnchanged) {
+		t.Fatalf("second backup returned %v", err)
+	}
+	events := assertSnapshotEvents(t, application.coordinator, "snapshot.started", "snapshot.completed", "snapshot.started", "snapshot.skipped")
+	if events[3].Message != snapshot.ErrUnchanged.Error() {
+		t.Fatalf("skip message = %q, want %q", events[3].Message, snapshot.ErrUnchanged)
+	}
+}
+
+func TestBackupPublishesFailedForStorageError(t *testing.T) {
+	application, paths := buildBackupTestApplication(t)
+	game := core.Game{ID: "failed", DisplayName: "Failed", Store: "custom", Enabled: true, SyncEnabled: true}
+	if err := application.database.UpsertGame(context.Background(), game); err != nil {
+		t.Fatal(err)
+	}
+	saveFile := filepath.Join(paths.Root, "save.dat")
+	if err := os.WriteFile(saveFile, []byte("save data"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := application.database.AddPath(context.Background(), core.GamePath{ID: "failed-path", GameID: game.ID, Source: "custom", Template: saveFile, Resolved: saveFile, Enabled: true}); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Remove(paths.Blobs); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(paths.Blobs, []byte("not a directory"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := application.coordinator.Backup(context.Background(), game.ID); err == nil {
+		t.Fatal("backup unexpectedly succeeded")
+	}
+	assertSnapshotEvents(t, application.coordinator, "snapshot.started", "snapshot.failed")
+}
+
+func TestAutomaticBackupDoesNotDuplicateTerminalEvent(t *testing.T) {
+	application, _ := buildBackupTestApplication(t)
+	game := core.Game{ID: "watched-empty", DisplayName: "Watched Empty", Store: "custom", Enabled: true, SyncEnabled: true}
+	if err := application.database.UpsertGame(context.Background(), game); err != nil {
+		t.Fatal(err)
+	}
+
+	application.coordinator.automaticBackup(context.Background(), game.ID)
+	assertSnapshotEvents(t, application.coordinator, "snapshot.started", "snapshot.skipped")
+}
+
+func TestCheckpointDoesNotDuplicateBackupTerminalEvent(t *testing.T) {
+	application, _ := buildBackupTestApplication(t)
+	game := core.Game{ID: "sync-empty", DisplayName: "Sync Empty", Store: "custom", Enabled: true, SyncEnabled: true}
+	if err := application.database.UpsertGame(context.Background(), game); err != nil {
+		t.Fatal(err)
+	}
+
+	result, err := checkpointWatchedGames(context.Background(), []core.Game{game}, application.coordinator.Backup, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.NoFilesGames != 1 {
+		t.Fatalf("unexpected checkpoint result: %#v", result)
+	}
+	assertSnapshotEvents(t, application.coordinator, "snapshot.started", "snapshot.skipped")
+}
+
+func buildBackupTestApplication(t *testing.T) (*Application, config.Paths) {
+	t.Helper()
+	dataDir := t.TempDir()
+	paths := config.DataPaths(dataDir)
+	if err := config.Save(paths.Config, config.Config{
+		Listen: "127.0.0.1:0", LocalBackupDir: paths.Blobs,
+		RetentionKeep: 50, DeviceID: "test-device", R2: config.R2{Prefix: "saveknot"},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	application, err := Build(context.Background(), dataDir, "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if err := errors.Join(application.coordinator.Close(), application.database.Close()); err != nil {
+			t.Error(err)
+		}
+	})
+	return application, paths
+}
+
+func assertSnapshotEvents(t *testing.T, coordinator *Coordinator, eventTypes ...string) []core.Event {
+	t.Helper()
+	eventStream, unsubscribe := coordinator.events.Subscribe(0)
+	unsubscribe()
+	var actual []core.Event
+	for event := range eventStream {
+		if strings.HasPrefix(event.Type, "snapshot.") {
+			actual = append(actual, event)
+		}
+	}
+	if len(actual) != len(eventTypes) {
+		t.Fatalf("snapshot events = %#v, want types %v", actual, eventTypes)
+	}
+	for index, eventType := range eventTypes {
+		if actual[index].Type != eventType {
+			t.Fatalf("snapshot event %d = %#v, want type %q", index, actual[index], eventType)
+		}
+	}
+	if terminal := actual[len(actual)-1]; terminal.Type != "snapshot.completed" && terminal.Message == "" {
+		t.Fatalf("terminal event does not include its outcome message: %#v", terminal)
+	}
+	return actual
+}
+
 func TestBuildLoadsCachedDiscoveryDiagnostics(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()
@@ -305,7 +446,6 @@ func TestCheckpointWatchedGamesOnlyChecksEligibleGamesAndContinuesAfterFailure(t
 		{ID: "hidden", DisplayName: "Hidden", Enabled: true, SyncEnabled: true, Hidden: true},
 	}
 	var attempted []string
-	var published []core.Event
 	var progress [][2]int
 	result, err := checkpointWatchedGames(context.Background(), games, func(_ context.Context, gameID string) (core.Snapshot, error) {
 		attempted = append(attempted, gameID)
@@ -319,8 +459,6 @@ func TestCheckpointWatchedGamesOnlyChecksEligibleGamesAndContinuesAfterFailure(t
 		default:
 			return core.Snapshot{ID: "new-snapshot", GameID: gameID}, nil
 		}
-	}, func(event core.Event) {
-		published = append(published, event)
 	}, func(completed, total int) {
 		progress = append(progress, [2]int{completed, total})
 	})
@@ -332,9 +470,6 @@ func TestCheckpointWatchedGamesOnlyChecksEligibleGamesAndContinuesAfterFailure(t
 	}
 	if len(attempted) != 4 || attempted[3] != "failed" {
 		t.Fatalf("ineligible games were checked: %#v", attempted)
-	}
-	if len(published) != 1 || published[0].Type != "snapshot.failed" || published[0].GameID != "failed" {
-		t.Fatalf("checkpoint failure event was not published: %#v", published)
 	}
 	if !reflect.DeepEqual(progress, [][2]int{{0, 4}, {1, 4}, {2, 4}, {3, 4}, {4, 4}}) {
 		t.Fatalf("checkpoint progress was not reported: %#v", progress)

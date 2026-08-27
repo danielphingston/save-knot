@@ -125,22 +125,23 @@ func NewCoordinator(
 }
 
 func (c *Coordinator) Start(ctx context.Context) {
-	c.watcher.Start(ctx, func(jobContext context.Context, gameID string) {
-		created, err := c.Backup(jobContext, gameID)
-		if err != nil && !errors.Is(err, snapshot.ErrNoFiles) && !errors.Is(err, snapshot.ErrUnchanged) {
-			c.events.Publish(core.Event{Type: "snapshot.failed", GameID: gameID, Message: err.Error()})
-			slog.Error("automatic snapshot failed", "game_id", gameID, "error", err)
-			return
-		}
-		if err == nil {
-			if syncErr := c.automaticSync(jobContext, created); syncErr != nil {
-				c.events.Publish(core.Event{Type: "upload.failed", GameID: gameID, Message: syncErr.Error()})
-				slog.Error("automatic R2 sync failed", "game_id", gameID, "snapshot_id", created.ID, "error", syncErr)
-			}
-		}
-	})
+	c.watcher.Start(ctx, c.automaticBackup)
 	c.ReconcileWatches(ctx)
 	go c.run(ctx)
+}
+
+func (c *Coordinator) automaticBackup(ctx context.Context, gameID string) {
+	created, err := c.Backup(ctx, gameID)
+	if err != nil {
+		if !errors.Is(err, snapshot.ErrNoFiles) && !errors.Is(err, snapshot.ErrUnchanged) {
+			slog.Error("automatic snapshot failed", "game_id", gameID, "error", err)
+		}
+		return
+	}
+	if syncErr := c.automaticSync(ctx, created); syncErr != nil {
+		c.events.Publish(core.Event{Type: "upload.failed", GameID: gameID, Message: syncErr.Error()})
+		slog.Error("automatic R2 sync failed", "game_id", gameID, "snapshot_id", created.ID, "error", syncErr)
+	}
 }
 
 func (c *Coordinator) Close() error {
@@ -565,6 +566,11 @@ func (c *Coordinator) Backup(ctx context.Context, gameID string) (core.Snapshot,
 	c.events.Publish(core.Event{Type: "snapshot.started", GameID: gameID})
 	created, err := c.snapshots.Create(ctx, game)
 	if err != nil {
+		eventType := "snapshot.failed"
+		if errors.Is(err, snapshot.ErrNoFiles) || errors.Is(err, snapshot.ErrUnchanged) {
+			eventType = "snapshot.skipped"
+		}
+		c.events.Publish(core.Event{Type: eventType, GameID: gameID, Message: err.Error()})
 		return core.Snapshot{}, err
 	}
 	c.events.Publish(core.Event{Type: "snapshot.completed", GameID: gameID, Data: map[string]any{"snapshotId": created.ID, "remote": false}})
@@ -677,7 +683,7 @@ func (c *Coordinator) SyncNow(ctx context.Context) (core.SyncResult, error) {
 		return core.SyncResult{}, err
 	}
 	c.events.Publish(core.Event{Type: "sync.started"})
-	result, backupErr := checkpointWatchedGames(ctx, games, c.Backup, c.events.Publish, func(completed, total int) {
+	result, backupErr := checkpointWatchedGames(ctx, games, c.Backup, func(completed, total int) {
 		c.publishSyncProgress("checking", completed, total)
 	})
 	uploaded, uploadErr := c.syncWatchedPending(ctx)
@@ -708,7 +714,6 @@ func checkpointWatchedGames(
 	ctx context.Context,
 	games []core.Game,
 	backup func(context.Context, string) (core.Snapshot, error),
-	publish func(core.Event),
 	progress func(completed, total int),
 ) (core.SyncResult, error) {
 	var result core.SyncResult
@@ -742,7 +747,6 @@ func checkpointWatchedGames(
 		default:
 			result.BackupFailed++
 			failures = append(failures, fmt.Errorf("checkpoint %q: %w", game.DisplayName, err))
-			publish(core.Event{Type: "snapshot.failed", GameID: game.ID, Message: err.Error()})
 		}
 		if progress != nil {
 			progress(result.CheckedGames, total)
