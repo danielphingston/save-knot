@@ -16,6 +16,8 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"runtime"
+	"strconv"
 	"strings"
 	"time"
 
@@ -33,7 +35,7 @@ const (
 	maxImage    = 5 << 20
 )
 
-//go:embed web
+//go:embed web/index.html web/styles.css web/app.js web/helpers.mjs
 var webFiles embed.FS
 
 type gameReader interface {
@@ -181,6 +183,7 @@ func (s *Server) routes(mux *http.ServeMux) {
 	mux.HandleFunc("POST /api/r2", s.configureR2)
 	mux.HandleFunc("DELETE /api/r2", s.disconnectR2)
 	mux.HandleFunc("GET /api/events", s.eventStream)
+	mux.HandleFunc("GET /api/activity", s.activity)
 	mux.Handle("GET /artwork/", http.StripPrefix("/artwork/", http.FileServer(http.Dir(s.artworkDir))))
 	assets, err := fs.Sub(webFiles, "web")
 	if err != nil {
@@ -242,7 +245,82 @@ func (s *Server) listGames(writer http.ResponseWriter, request *http.Request) {
 	if games == nil {
 		games = []core.Game{}
 	}
+	for index := range games {
+		if games[index].SourceCount == 0 {
+			continue
+		}
+		games[index].AvailableSources, err = s.availableSources(request.Context(), games[index].ID)
+		if err != nil {
+			writeError(writer, http.StatusInternalServerError, err)
+			return
+		}
+	}
 	writeJSON(writer, http.StatusOK, games)
+}
+
+var errSaveFileFound = errors.New("save file found")
+
+func hasSaveFiles(root string) bool {
+	info, err := os.Stat(root)
+	if err != nil {
+		return false
+	}
+	if info.Mode().IsRegular() {
+		return true
+	}
+	if !info.IsDir() {
+		return false
+	}
+	err = filepath.WalkDir(root, func(_ string, entry fs.DirEntry, walkErr error) error {
+		if walkErr != nil {
+			return walkErr
+		}
+		if entry.Type().IsRegular() {
+			return errSaveFileFound
+		}
+		return nil
+	})
+	return errors.Is(err, errSaveFileFound)
+}
+
+func markAvailablePaths(paths []core.GamePath) {
+	for index := range paths {
+		paths[index].HasFiles = hasSaveFiles(paths[index].Resolved)
+	}
+}
+
+func countAvailableSources(paths []core.GamePath, registryPaths []core.RegistryPath) int {
+	count := 0
+	for _, path := range paths {
+		if path.Enabled && path.HasFiles {
+			count++
+		}
+	}
+	if runtime.GOOS != "windows" {
+		return count
+	}
+	for _, path := range registryPaths {
+		if path.Enabled {
+			count++
+		}
+	}
+	return count
+}
+
+func (s *Server) availableSources(ctx context.Context, gameID string) (int, error) {
+	paths, err := s.sources.GamePaths(ctx, gameID)
+	if err != nil {
+		return 0, err
+	}
+	markAvailablePaths(paths)
+	if runtime.GOOS != "windows" {
+		return countAvailableSources(paths, nil), nil
+	}
+	registryPaths, err := s.sources.GameRegistry(ctx, gameID)
+	if err != nil {
+		return 0, err
+	}
+	return countAvailableSources(paths, registryPaths), nil
 }
 
 func (s *Server) game(writer http.ResponseWriter, request *http.Request) {
@@ -282,6 +360,8 @@ func (s *Server) game(writer http.ResponseWriter, request *http.Request) {
 	if paths == nil {
 		paths = []core.GamePath{}
 	}
+	markAvailablePaths(paths)
+	game.AvailableSources = countAvailableSources(paths, registryPaths)
 	if registryPaths == nil {
 		registryPaths = []core.RegistryPath{}
 	}
@@ -674,21 +754,75 @@ func (s *Server) disconnectR2(writer http.ResponseWriter, _ *http.Request) {
 	writer.WriteHeader(http.StatusNoContent)
 }
 
+func (s *Server) activity(writer http.ResponseWriter, request *http.Request) {
+	offset := 0
+	if value := request.URL.Query().Get("offset"); value != "" {
+		parsed, err := strconv.Atoi(value)
+		if err != nil || parsed < 0 {
+			writeError(writer, http.StatusBadRequest, errors.New("invalid activity offset"))
+			return
+		}
+		offset = parsed
+	}
+	until := time.Now().UTC()
+	if value := request.URL.Query().Get("until"); value != "" {
+		parsed, err := time.Parse(time.RFC3339Nano, value)
+		if err != nil || parsed.After(until) {
+			writeError(writer, http.StatusBadRequest, errors.New("invalid activity timestamp"))
+			return
+		}
+		until = parsed
+	}
+	entries, total := s.events.HistoryPageMatching(until, offset, 50, userVisibleActivity)
+	writeJSON(writer, http.StatusOK, map[string]any{"events": entries, "total": total, "until": until, "offset": offset})
+}
+
+func userVisibleActivity(event core.Event) bool {
+	switch event.Type {
+	case "catalog.updated", "restore.started", "snapshot.skipped", "snapshot.started", "storage.reconcile.started", "sync.progress", "sync.started":
+		return false
+	default:
+		return true
+	}
+}
+
 func (s *Server) eventStream(writer http.ResponseWriter, request *http.Request) {
 	flusher, ok := writer.(http.Flusher)
 	if !ok {
 		writeError(writer, http.StatusInternalServerError, errors.New("streaming is not supported"))
 		return
 	}
+	// Streams outlive the normal response timeout. Idle heartbeats below keep
+	// disconnected clients detectable without replaying stored activity.
+	if err := http.NewResponseController(writer).SetWriteDeadline(time.Time{}); err != nil && !errors.Is(err, http.ErrNotSupported) {
+		slog.Warn("configure event stream deadline", "error", err)
+		return
+	}
 	writer.Header().Set("Content-Type", "text/event-stream")
 	writer.Header().Set("Cache-Control", "no-cache")
 	writer.Header().Set("Connection", "keep-alive")
-	eventChannel, unsubscribe := s.events.Subscribe(16)
+	subscribe := s.events.Subscribe
+	if request.URL.Query().Get("live") == "true" {
+		subscribe = s.events.SubscribeLive
+	}
+	eventChannel, unsubscribe := subscribe(16)
 	defer unsubscribe()
+	// Send headers immediately so the client can detect reconnections while idle.
+	if _, err := fmt.Fprint(writer, ": connected\n\n"); err != nil {
+		return
+	}
+	flusher.Flush()
+	heartbeat := time.NewTicker(25 * time.Second)
+	defer heartbeat.Stop()
 	for {
 		select {
 		case <-request.Context().Done():
 			return
+		case <-heartbeat.C:
+			if _, err := fmt.Fprint(writer, ": keepalive\n\n"); err != nil {
+				return
+			}
+			flusher.Flush()
 		case event := <-eventChannel:
 			data, err := json.Marshal(event)
 			if err != nil {

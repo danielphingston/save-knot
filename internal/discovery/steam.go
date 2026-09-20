@@ -30,6 +30,7 @@ type SteamGame struct {
 	Name       string
 	InstallDir string
 	Library    string
+	Roots      []string
 }
 
 func SteamRoots(configured []string) []string {
@@ -82,7 +83,14 @@ func DiscoverSteam(ctx context.Context, roots []string) ([]SteamGame, error) {
 	if err != nil {
 		return nil, err
 	}
-	return discoverSteamLibraries(ctx, libraries)
+	games, err := discoverSteamLibraries(ctx, libraries)
+	if err != nil {
+		return nil, err
+	}
+	for index := range games {
+		games[index].Roots = roots
+	}
+	return games, nil
 }
 
 func steamLibraries(roots []string) ([]string, error) {
@@ -220,7 +228,42 @@ func CatalogGame(installed SteamGame, definition catalog.Definition, now time.Ti
 	if err != nil {
 		return core.Game{}, nil, err
 	}
+	if installed.AppID == "570" {
+		paths = appendDotaSettingsPaths(identifier, installed, base, paths)
+	}
 	return game, paths, nil
+}
+
+func appendDotaSettingsPaths(gameID string, installed SteamGame, base string, paths []core.GamePath) []core.GamePath {
+	seen := make(map[string]struct{}, len(paths))
+	for _, path := range paths {
+		seen[filepath.Clean(path.Resolved)] = struct{}{}
+	}
+	add := func(template, resolved string) {
+		resolved = filepath.Clean(resolved)
+		if _, ok := seen[resolved]; ok {
+			return
+		}
+		if info, err := os.Stat(resolved); err != nil || !info.IsDir() {
+			return
+		}
+		seen[resolved] = struct{}{}
+		paths = append(paths, core.GamePath{
+			ID: stableID(gameID, template, resolved), GameID: gameID, Source: "catalog",
+			Template: template, Resolved: resolved, Enabled: true,
+		})
+	}
+	add("<base>/game/dota/cfg", filepath.Join(base, "game", "dota", "cfg"))
+	for _, root := range SteamRoots(append([]string{installed.Library}, installed.Roots...)) {
+		matches, err := filepath.Glob(filepath.Join(root, "userdata", "*", "570", "remote"))
+		if err != nil {
+			continue
+		}
+		for _, match := range matches {
+			add("<root>/userdata/<storeUserId>/570/remote", match)
+		}
+	}
+	return paths
 }
 
 func mergeSecondaryManifest(primary catalog.Definition, base string) (catalog.Definition, error) {

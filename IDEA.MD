@@ -959,22 +959,25 @@ I'd use:
 ```text
 Go
 +
-React/Vite
+plain HTML/CSS/JavaScript
 +
 embedded static assets
 ```
 
-Compile frontend:
+Keep the browser files directly in:
 
 ```text
-web/dist/
+internal/api/web/
 ```
 
 Then:
 
 ```go
-//go:embed web/dist/*
+//go:embed web/index.html web/styles.css web/app.js web/helpers.mjs
 ```
+
+This keeps the local UI small and removes the frontend framework, bundler, and
+package-install step from normal builds.
 
 The binary serves it at:
 

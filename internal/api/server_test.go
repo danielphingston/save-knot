@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"io/fs"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -21,6 +22,19 @@ import (
 type repositoryFake struct {
 	games []core.Game
 	paths []core.GamePath
+}
+
+func TestHasSaveFilesDistinguishesMissingAndEmptyLocations(t *testing.T) {
+	root := t.TempDir()
+	if hasSaveFiles(filepath.Join(root, "missing")) || hasSaveFiles(root) {
+		t.Fatal("missing or empty save location reported data")
+	}
+	if err := os.WriteFile(filepath.Join(root, "save.dat"), []byte("save"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if !hasSaveFiles(root) {
+		t.Fatal("existing save file was not detected")
+	}
 }
 
 func (r *repositoryFake) ListGames(context.Context) ([]core.Game, error) { return r.games, nil }
@@ -164,6 +178,23 @@ func TestServerIsLoopbackOnly(t *testing.T) {
 	}
 	if err := validateLoopback("0.0.0.0:32147"); err == nil {
 		t.Fatal("public listen address was accepted")
+	}
+}
+
+func TestEmbeddedUIAppServesIndexAndSPAFallback(t *testing.T) {
+	t.Parallel()
+	assets, err := fs.Sub(webFiles, "web")
+	if err != nil {
+		t.Fatal(err)
+	}
+	handler := spaHandler(assets)
+	for _, target := range []string{"/", "/settings/r2"} {
+		request := httptest.NewRequestWithContext(context.Background(), http.MethodGet, target, nil)
+		response := httptest.NewRecorder()
+		handler.ServeHTTP(response, request)
+		if response.Code != http.StatusOK || !strings.Contains(response.Body.String(), `id="app"`) || !strings.Contains(response.Body.String(), `/app.js`) {
+			t.Fatalf("embedded app was not served for %s: %d %s", target, response.Code, response.Body.String())
+		}
 	}
 }
 

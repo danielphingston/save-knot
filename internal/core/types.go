@@ -11,24 +11,26 @@ var (
 )
 
 type Game struct {
-	ID            string     `json:"id"`
-	CatalogID     string     `json:"catalogId,omitempty"`
-	CatalogName   string     `json:"catalogName,omitempty"`
-	DisplayName   string     `json:"displayName"`
-	Store         string     `json:"store"`
-	StoreID       string     `json:"storeId,omitempty"`
-	InstallPath   string     `json:"installPath,omitempty"`
-	Image         string     `json:"image,omitempty"`
-	Notes         string     `json:"notes,omitempty"`
-	Enabled       bool       `json:"enabled"`
-	SyncEnabled   bool       `json:"syncEnabled"`
-	Hidden        bool       `json:"hidden,omitempty"`
-	LastSeen      *time.Time `json:"lastSeen,omitempty"`
-	LastChange    *time.Time `json:"lastChange,omitempty"`
-	LastBackup    *time.Time `json:"lastBackup,omitempty"`
-	SnapshotCount int        `json:"snapshotCount"`
-	StoredSize    int64      `json:"storedSize"`
-	PendingCount  int        `json:"pendingSnapshotCount"`
+	ID               string     `json:"id"`
+	CatalogID        string     `json:"catalogId,omitempty"`
+	CatalogName      string     `json:"catalogName,omitempty"`
+	DisplayName      string     `json:"displayName"`
+	Store            string     `json:"store"`
+	StoreID          string     `json:"storeId,omitempty"`
+	InstallPath      string     `json:"installPath,omitempty"`
+	Image            string     `json:"image,omitempty"`
+	Notes            string     `json:"notes,omitempty"`
+	Enabled          bool       `json:"enabled"`
+	SyncEnabled      bool       `json:"syncEnabled"`
+	Hidden           bool       `json:"hidden,omitempty"`
+	LastSeen         *time.Time `json:"lastSeen,omitempty"`
+	LastChange       *time.Time `json:"lastChange,omitempty"`
+	LastBackup       *time.Time `json:"lastBackup,omitempty"`
+	SnapshotCount    int        `json:"snapshotCount"`
+	StoredSize       int64      `json:"storedSize"`
+	PendingCount     int        `json:"pendingSnapshotCount"`
+	SourceCount      int        `json:"sourceCount"`
+	AvailableSources int        `json:"availableSources"`
 }
 
 type SyncResult struct {
@@ -50,6 +52,7 @@ type GamePath struct {
 	Template string `json:"template"`
 	Resolved string `json:"resolved"`
 	Enabled  bool   `json:"enabled"`
+	HasFiles bool   `json:"hasFiles"`
 }
 
 type RegistryPath struct {
@@ -139,6 +142,8 @@ type Event struct {
 	Timestamp time.Time      `json:"timestamp"`
 	Data      map[string]any `json:"data,omitempty"`
 }
+
+const ActivityRetention = 30 * 24 * time.Hour
 
 type Diagnostics struct {
 	Catalog   CatalogDiagnostics   `json:"catalog"`

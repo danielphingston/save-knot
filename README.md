@@ -24,13 +24,13 @@ There is no SaveKnot account, hosted backend, central database, analytics servic
 - Custom titles, notes, catalog remapping, pictures, save locations, file exclusions, and per-game backup policy
 - Configurable local backup location, per-game retention, periodic watched-game sync, optional game discovery, and per-user launch at login
 - On-demand sync that checkpoints changed watched games before uploading their pending snapshots
-- Embedded localhost UI, Windows tray controls, native folder picker, SQLite-cached discovery diagnostics, and server-sent activity events
+- Embedded localhost UI, Windows tray controls, native folder picker, SQLite-cached discovery diagnostics, and a local activity log retained for 30 days across restarts
 - Persistent rotating logs at `<data directory>/logs/saveknot.log`
 - OS credential-vault storage for the R2 secret access key
 
 ## Run it
 
-Requirements: Go 1.26 or newer.
+Requirements: Go 1.26 or newer. Node.js 22 or newer is only needed to run the optional UI regression tests; building the application needs no Node.js or npm.
 
 ```sh
 go run ./cmd/saveknot
@@ -49,6 +49,10 @@ make build-windows
 ```
 
 The executable is written to `dist/saveknot-windows-amd64.exe`.
+
+The plain HTML, CSS, and JavaScript UI lives in `internal/api/web/` and is embedded directly by Go. Run `make build` after editing it, or restart `go run ./cmd/saveknot`. There is no frontend bundler, framework, package installation, or separate development server. `make ui-check` runs dependency-free JavaScript checks and regression tests.
+
+The UI renders games, snapshots, file lists, and activity in bounded pages. Artwork loads lazily; file details exist only while expanded. Live updates use one event connection, pause while the tab is hidden, and preserve open forms. The complete 30-day activity log remains available through paginated history.
 
 The Windows release is linked as a GUI/background executable, so it does not leave a console window open. While it is running, use the SaveKnot notification-area icon to open the local webpage or exit cleanly. For troubleshooting, inspect `%APPDATA%\SaveKnot\logs\saveknot.log`; use `-log-level debug` from PowerShell for more detail.
 
@@ -79,6 +83,8 @@ Open **Settings → Discovery diagnostics**, then select **Scan now**. The panel
 Ludusavi is the save-definition catalog, not a rich store-metadata API. SaveKnot consumes its canonical title, aliases, store IDs, installation aliases, file/registry rules, constraints, and path placeholders. Steam cover art is derived separately from a matched Steam app ID; custom pictures always override it. Ludusavi does not supply descriptions or cover images.
 
 Game discovery is manual by default. SaveKnot refreshes its compact catalog in the background, and searches launchers and local save locations when you select **Scan for games** or **Scan now**. You can independently enable a periodic search in **Settings → Automatic sync & discovery**. Between scans, it watches only enabled save locations already registered in the local database.
+
+The Games tab highlights titles with no readable save files at their configured locations. Open a game to inspect each location or add one manually. Use the **Game view** selector to switch between the library and ignored games; restoring an ignored game keeps its snapshots and customizations.
 
 ## Connect R2
 
@@ -156,7 +162,7 @@ Dependencies are intentionally narrow and each owns a boundary the standard libr
 
 ## Scope and tradeoffs
 
-- The embedded UI uses plain HTML, CSS, and JavaScript. This keeps the release to one Go build and avoids a Node production toolchain; a framework can be introduced when UI complexity justifies it.
+- The embedded UI uses plain HTML, CSS, and JavaScript with native dialogs and no runtime dependencies. DOM updates are explicit; regression tests cover helpers and backend contracts. Large lists are paginated to limit browser memory.
 - Discovery checks store manifests first. The deeper catalog scan is bounded and only evaluates user-anchored rules whose literal parent directory exists; install-root rules are not expanded blindly across the full catalog.
 - Snapshot manifests reference logical source keys, not absolute catalog paths. A restore requires the corresponding save location to be configured on that device.
 - R2 reconciliation intentionally lists snapshot manifests only at startup/manual boundaries. This minimizes Class A operations while still allowing a fresh device to recover remote history.

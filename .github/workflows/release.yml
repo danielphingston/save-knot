@@ -30,6 +30,11 @@ jobs:
           go-version-file: go.mod
           cache: true
 
+      - name: Set up Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: 22
+
       - name: Validate release tag
         shell: bash
         run: |
@@ -39,7 +44,9 @@ jobs:
           fi
 
       - name: Test
-        run: go test ./...
+        run: |
+          make ui-check
+          go test ./...
 
       - name: Build Windows package
         shell: bash
