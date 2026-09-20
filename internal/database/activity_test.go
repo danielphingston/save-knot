@@ -33,18 +33,21 @@ func TestActivityEventsSurviveReopenAndExpire(t *testing.T) {
 			t.Error(err)
 		}
 	}()
-	events, err := store.LoadEvents(ctx, now)
+	events, total, err := store.LoadEventPage(ctx, now.Add(time.Second), 0, 50)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(events) != 1 || events[0].Type != event.Type || events[0].GameID != event.GameID || events[0].Data["snapshotId"] != "snapshot-a" {
+	if total != 1 || len(events) != 1 || events[0].Type != event.Type || events[0].GameID != event.GameID || events[0].Data["snapshotId"] != "snapshot-a" {
 		t.Fatalf("event did not survive restart: %#v", events)
 	}
-	events, err = store.LoadEvents(ctx, now.Add(ActivityRetention+time.Second))
+	if err := store.PruneEvents(ctx, now.Add(ActivityRetention+time.Second), nil); err != nil {
+		t.Fatal(err)
+	}
+	events, total, err = store.LoadEventPage(ctx, now.Add(ActivityRetention+time.Second), 0, 50)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(events) != 0 {
+	if total != 0 || len(events) != 0 {
 		t.Fatalf("expired events were retained: %#v", events)
 	}
 }

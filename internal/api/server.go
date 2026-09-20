@@ -773,17 +773,12 @@ func (s *Server) activity(writer http.ResponseWriter, request *http.Request) {
 		}
 		until = parsed
 	}
-	entries, total := s.events.HistoryPageMatching(until, offset, 50, userVisibleActivity)
-	writeJSON(writer, http.StatusOK, map[string]any{"events": entries, "total": total, "until": until, "offset": offset})
-}
-
-func userVisibleActivity(event core.Event) bool {
-	switch event.Type {
-	case "catalog.updated", "restore.started", "snapshot.skipped", "snapshot.started", "storage.reconcile.started", "sync.progress", "sync.started":
-		return false
-	default:
-		return true
+	entries, total, err := s.events.ActivityPage(request.Context(), until, offset, 50)
+	if err != nil {
+		writeError(writer, http.StatusInternalServerError, err)
+		return
 	}
+	writeJSON(writer, http.StatusOK, map[string]any{"events": entries, "total": total, "until": until, "offset": offset})
 }
 
 func (s *Server) eventStream(writer http.ResponseWriter, request *http.Request) {
@@ -801,11 +796,7 @@ func (s *Server) eventStream(writer http.ResponseWriter, request *http.Request) 
 	writer.Header().Set("Content-Type", "text/event-stream")
 	writer.Header().Set("Cache-Control", "no-cache")
 	writer.Header().Set("Connection", "keep-alive")
-	subscribe := s.events.Subscribe
-	if request.URL.Query().Get("live") == "true" {
-		subscribe = s.events.SubscribeLive
-	}
-	eventChannel, unsubscribe := subscribe(16)
+	eventChannel, unsubscribe := s.events.Subscribe(16)
 	defer unsubscribe()
 	// Send headers immediately so the client can detect reconnections while idle.
 	if _, err := fmt.Fprint(writer, ": connected\n\n"); err != nil {

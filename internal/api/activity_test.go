@@ -5,17 +5,31 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/saveknot/saveknot/internal/core"
+	"github.com/saveknot/saveknot/internal/database"
 	"github.com/saveknot/saveknot/internal/events"
 )
 
 func TestActivityPagesAreBoundedAndValidateCursors(t *testing.T) {
 	t.Parallel()
-	bus := events.New()
+	store, err := database.Open(context.Background(), filepath.Join(t.TempDir(), "state.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if err := store.Close(); err != nil {
+			t.Error(err)
+		}
+	})
+	bus, err := events.NewPersistent(context.Background(), store)
+	if err != nil {
+		t.Fatal(err)
+	}
 	now := time.Now().UTC().Add(-time.Minute)
 	for index := range 125 {
 		bus.Publish(core.Event{Type: "snapshot.completed", Timestamp: now.Add(time.Duration(index) * time.Millisecond)})
