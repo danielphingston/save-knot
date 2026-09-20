@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"time"
@@ -21,6 +22,7 @@ import (
 
 type Application struct {
 	database    *database.Store
+	eventBus    *events.Bus
 	coordinator *Coordinator
 	server      *api.Server
 	webURL      string
@@ -68,7 +70,10 @@ func Build(ctx context.Context, dataDir, listenOverride string) (*Application, e
 		closeErr := repository.Close()
 		return nil, errors.Join(err, closeErr)
 	}
-	eventBus := events.New()
+	eventBus, err := events.NewPersistent(ctx, repository)
+	if err != nil {
+		return nil, errors.Join(err, watchManager.Close(), repository.Close())
+	}
 	snapshotService := snapshot.New(repository, repository, cfg.LocalBackupDir, settingsManager.Config().DeviceID)
 	syncer := remote.NewSyncer(repository)
 	reconciler := remote.NewReconciler(repository)
@@ -79,7 +84,7 @@ func Build(ctx context.Context, dataDir, listenOverride string) (*Application, e
 		return nil, errors.Join(err, watchManager.Close(), repository.Close())
 	}
 	return &Application{
-		database: repository, coordinator: coordinator, server: server,
+		database: repository, eventBus: eventBus, coordinator: coordinator, server: server,
 		webURL: "http://" + settingsManager.Config().Listen,
 	}, nil
 }
@@ -92,10 +97,21 @@ func (a *Application) Run(ctx context.Context) error {
 	a.coordinator.Start(ctx)
 	serverErrors := a.server.Start()
 	var runErr error
-	select {
-	case <-ctx.Done():
-	case err := <-serverErrors:
-		runErr = err
+	pruneTicker := time.NewTicker(time.Hour)
+	defer pruneTicker.Stop()
+	running := true
+	for running {
+		select {
+		case <-ctx.Done():
+			running = false
+		case err := <-serverErrors:
+			runErr = err
+			running = false
+		case now := <-pruneTicker.C:
+			if err := a.eventBus.Prune(ctx, now); err != nil && ctx.Err() == nil {
+				slog.Warn("prune activity history", "error", err)
+			}
+		}
 	}
 	shutdownContext, cancel := context.WithTimeout(context.WithoutCancel(ctx), 10*time.Second)
 	defer cancel()

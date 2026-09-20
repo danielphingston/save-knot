@@ -1,4 +1,8 @@
-.PHONY: build build-windows build-windows-amd64 fmt fmt-check lint mod-check test test-race cover check
+.PHONY: build build-windows build-windows-amd64 ui-check fmt fmt-check lint mod-check test test-race cover check
+
+ui-check:
+	node --check internal/api/web/app.js
+	node --test internal/api/web/*.test.mjs
 
 build:
 	go build ./cmd/saveknot
@@ -30,5 +34,5 @@ test-race:
 cover:
 	go test -cover ./...
 
-check: fmt-check lint mod-check test test-race
+check: ui-check fmt-check lint mod-check test test-race
 	git diff --check

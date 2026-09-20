@@ -8,6 +8,7 @@
   <link rel="stylesheet" href="/styles.css">
 </head>
 <body>
+  <a class="skip-link" href="#app">Skip to content</a>
   <div class="shell">
     <aside class="rail">
       <a class="brand" href="#/games" aria-label="SaveKnot home">
@@ -19,12 +20,12 @@
         <a href="#/activity" data-route="activity"><span aria-hidden="true">↻</span> Activity</a>
         <a href="#/settings" data-route="settings"><span aria-hidden="true">⚙</span> Settings</a>
       </nav>
-      <div class="rail-status">
+      <p id="live-status" class="live-status" role="status">Connecting to SaveKnot…</p><div class="rail-status">
         <span id="connection-dot" class="dot warn"></span>
         <div><strong id="connection-title">Local only</strong><small id="connection-detail">R2 not connected</small></div>
       </div>
     </aside>
-    <main id="app" tabindex="-1"></main>
+    <div class="workspace"><section id="updates" class="update-banner" aria-label="Background updates" hidden><span>New activity is available.</span><button class="button small" id="refresh-page">Refresh view</button></section><main id="app" tabindex="-1"></main></div>
   </div>
   <div id="toast-region" class="toasts" aria-live="polite"></div>
   <script type="module" src="/app.js"></script>

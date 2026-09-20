@@ -47,6 +47,30 @@ func TestSteamParsingAndCatalogResolution(t *testing.T) {
 	}
 }
 
+func TestDotaSettingsAreFoundOutsideStaleManifestPath(t *testing.T) {
+	root := t.TempDir()
+	base := filepath.Join(root, "steamapps", "common", "dota 2 beta")
+	currentConfig := filepath.Join(base, "game", "dota", "cfg")
+	accountSettings := filepath.Join(root, "userdata", "12345", "570", "remote")
+	for _, path := range []string{currentConfig, accountSettings} {
+		if err := os.MkdirAll(path, 0o700); err != nil {
+			t.Fatal(err)
+		}
+	}
+	definition := catalog.Definition{Name: "Dota 2", Files: map[string]catalog.FileRule{"<base>/dota/cfg": {}}}
+	_, paths, err := CatalogGame(SteamGame{AppID: "570", InstallDir: "dota 2 beta", Library: root}, definition, time.Now())
+	if err != nil {
+		t.Fatal(err)
+	}
+	found := map[string]bool{}
+	for _, path := range paths {
+		found[path.Resolved] = true
+	}
+	if !found[currentConfig] || !found[accountSettings] {
+		t.Fatalf("Dota settings locations were missed: %#v", paths)
+	}
+}
+
 func TestParseLibraryFolders(t *testing.T) {
 	t.Parallel()
 	path := filepath.Join(t.TempDir(), "libraryfolders.vdf")

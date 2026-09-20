@@ -97,10 +97,13 @@ func TestBackupPublishesSkippedWhenNoFilesExist(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if _, err := application.coordinator.Backup(context.Background(), game.ID); !errors.Is(err, snapshot.ErrNoFiles) {
-		t.Fatalf("backup returned %v", err)
+	var backupErr error
+	events := captureSnapshotEvents(t, application.coordinator, func() {
+		_, backupErr = application.coordinator.Backup(context.Background(), game.ID)
+	}, "snapshot.started", "snapshot.skipped")
+	if !errors.Is(backupErr, snapshot.ErrNoFiles) {
+		t.Fatalf("backup returned %v", backupErr)
 	}
-	events := assertSnapshotEvents(t, application.coordinator, "snapshot.started", "snapshot.skipped")
 	if events[1].Message != snapshot.ErrNoFiles.Error() {
 		t.Fatalf("skip message = %q, want %q", events[1].Message, snapshot.ErrNoFiles)
 	}
@@ -119,13 +122,17 @@ func TestBackupPublishesSkippedWhenSaveIsUnchanged(t *testing.T) {
 	if err := application.database.AddPath(context.Background(), core.GamePath{ID: "unchanged-path", GameID: game.ID, Source: "custom", Template: saveFile, Resolved: saveFile, Enabled: true}); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := application.coordinator.Backup(context.Background(), game.ID); err != nil {
-		t.Fatal(err)
+	var firstErr, secondErr error
+	events := captureSnapshotEvents(t, application.coordinator, func() {
+		_, firstErr = application.coordinator.Backup(context.Background(), game.ID)
+		_, secondErr = application.coordinator.Backup(context.Background(), game.ID)
+	}, "snapshot.started", "snapshot.completed", "snapshot.started", "snapshot.skipped")
+	if firstErr != nil {
+		t.Fatal(firstErr)
 	}
-	if _, err := application.coordinator.Backup(context.Background(), game.ID); !errors.Is(err, snapshot.ErrUnchanged) {
-		t.Fatalf("second backup returned %v", err)
+	if !errors.Is(secondErr, snapshot.ErrUnchanged) {
+		t.Fatalf("second backup returned %v", secondErr)
 	}
-	events := assertSnapshotEvents(t, application.coordinator, "snapshot.started", "snapshot.completed", "snapshot.started", "snapshot.skipped")
 	if events[3].Message != snapshot.ErrUnchanged.Error() {
 		t.Fatalf("skip message = %q, want %q", events[3].Message, snapshot.ErrUnchanged)
 	}
@@ -151,10 +158,13 @@ func TestBackupPublishesFailedForStorageError(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if _, err := application.coordinator.Backup(context.Background(), game.ID); err == nil {
+	var backupErr error
+	captureSnapshotEvents(t, application.coordinator, func() {
+		_, backupErr = application.coordinator.Backup(context.Background(), game.ID)
+	}, "snapshot.started", "snapshot.failed")
+	if backupErr == nil {
 		t.Fatal("backup unexpectedly succeeded")
 	}
-	assertSnapshotEvents(t, application.coordinator, "snapshot.started", "snapshot.failed")
 }
 
 func TestAutomaticBackupDoesNotDuplicateTerminalEvent(t *testing.T) {
@@ -164,8 +174,9 @@ func TestAutomaticBackupDoesNotDuplicateTerminalEvent(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	application.coordinator.automaticBackup(context.Background(), game.ID)
-	assertSnapshotEvents(t, application.coordinator, "snapshot.started", "snapshot.skipped")
+	captureSnapshotEvents(t, application.coordinator, func() {
+		application.coordinator.automaticBackup(context.Background(), game.ID)
+	}, "snapshot.started", "snapshot.skipped")
 }
 
 func TestCheckpointDoesNotDuplicateBackupTerminalEvent(t *testing.T) {
@@ -175,14 +186,17 @@ func TestCheckpointDoesNotDuplicateBackupTerminalEvent(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	result, err := checkpointWatchedGames(context.Background(), []core.Game{game}, application.coordinator.Backup, nil)
-	if err != nil {
-		t.Fatal(err)
+	var result core.SyncResult
+	var checkpointErr error
+	captureSnapshotEvents(t, application.coordinator, func() {
+		result, checkpointErr = checkpointWatchedGames(context.Background(), []core.Game{game}, application.coordinator.Backup, nil)
+	}, "snapshot.started", "snapshot.skipped")
+	if checkpointErr != nil {
+		t.Fatal(checkpointErr)
 	}
 	if result.NoFilesGames != 1 {
 		t.Fatalf("unexpected checkpoint result: %#v", result)
 	}
-	assertSnapshotEvents(t, application.coordinator, "snapshot.started", "snapshot.skipped")
 }
 
 func buildBackupTestApplication(t *testing.T) (*Application, config.Paths) {
@@ -207,9 +221,10 @@ func buildBackupTestApplication(t *testing.T) (*Application, config.Paths) {
 	return application, paths
 }
 
-func assertSnapshotEvents(t *testing.T, coordinator *Coordinator, eventTypes ...string) []core.Event {
+func captureSnapshotEvents(t *testing.T, coordinator *Coordinator, action func(), eventTypes ...string) []core.Event {
 	t.Helper()
-	eventStream, unsubscribe := coordinator.events.Subscribe(0)
+	eventStream, unsubscribe := coordinator.events.Subscribe(len(eventTypes))
+	action()
 	unsubscribe()
 	var actual []core.Event
 	for event := range eventStream {

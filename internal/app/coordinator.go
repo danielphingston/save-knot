@@ -139,7 +139,7 @@ func (c *Coordinator) automaticBackup(ctx context.Context, gameID string) {
 		return
 	}
 	if syncErr := c.automaticSync(ctx, created); syncErr != nil {
-		c.events.Publish(core.Event{Type: "upload.failed", GameID: gameID, Message: syncErr.Error()})
+		c.events.PublishContext(ctx, core.Event{Type: "upload.failed", GameID: gameID, Message: syncErr.Error()})
 		slog.Error("automatic R2 sync failed", "game_id", gameID, "snapshot_id", created.ID, "error", syncErr)
 	}
 }
@@ -152,7 +152,7 @@ func (c *Coordinator) run(ctx context.Context) {
 	c.refreshCatalog(ctx)
 	if _, err := c.ReconcileRemote(ctx); err != nil && !errors.Is(err, settings.ErrR2NotConfigured) {
 		slog.Error("startup R2 reconciliation failed", "error", err)
-		c.events.Publish(core.Event{Type: "storage.error", Message: err.Error()})
+		c.events.PublishContext(ctx, core.Event{Type: "storage.error", Message: err.Error()})
 	}
 	catalogTicker := time.NewTicker(24 * time.Hour)
 	automationTicker := time.NewTicker(time.Minute)
@@ -191,12 +191,12 @@ func (c *Coordinator) refreshCatalog(ctx context.Context) {
 		slog.Error("refresh Ludusavi catalog", "url", cfg.ManifestURL, "cache", c.paths.Catalog, "error", err)
 		c.setCatalogDiagnostics(ctx, checked, false, 0, err)
 		if indexErr := catalog.EnsureIndex(ctx, c.paths.Catalog, c.paths.CatalogDB); indexErr != nil {
-			c.events.Publish(core.Event{Type: "catalog.failed", Message: err.Error()})
+			c.events.PublishContext(ctx, core.Event{Type: "catalog.failed", Message: err.Error()})
 			return
 		}
 	} else if updated {
 		slog.Info("Ludusavi catalog updated", "cache", c.paths.Catalog)
-		c.events.Publish(core.Event{Type: "catalog.updated"})
+		c.events.PublishContext(ctx, core.Event{Type: "catalog.updated"})
 	}
 	count, err := (catalog.Index{Path: c.paths.CatalogDB}).Count(ctx)
 	if err != nil {
@@ -224,7 +224,7 @@ func (c *Coordinator) discover(ctx context.Context) {
 	if err != nil {
 		slog.Error("discover Steam games", "roots", roots, "error", err)
 		c.setDiscoveryDiagnostics(ctx, core.DiscoveryDiagnostics{LastRun: &now, SteamRoots: roots, LastError: err.Error()})
-		c.events.Publish(core.Event{Type: "discovery.failed", Message: err.Error()})
+		c.events.PublishContext(ctx, core.Event{Type: "discovery.failed", Message: err.Error()})
 		return
 	}
 	matched, registered, matchedNames, unmatched := c.registerSteamGames(ctx, index, installed, now)
@@ -308,7 +308,7 @@ func (c *Coordinator) registerSteamGame(ctx context.Context, installation discov
 		return false
 	}
 	if isNew {
-		c.events.Publish(core.Event{Type: "game.discovered", GameID: game.ID})
+		c.events.PublishContext(ctx, core.Event{Type: "game.discovered", GameID: game.ID})
 	}
 	return true
 }
@@ -333,7 +333,7 @@ func (c *Coordinator) registerLocalSaves(ctx context.Context, index catalog.Inde
 		}
 		registered++
 		if isNew {
-			c.events.Publish(core.Event{Type: "game.discovered", GameID: found.Game.ID})
+			c.events.PublishContext(ctx, core.Event{Type: "game.discovered", GameID: found.Game.ID})
 		}
 	}
 	return len(localGames), registered, duration, nil
@@ -381,7 +381,7 @@ func (c *Coordinator) registerInstalledGames(ctx context.Context, index catalog.
 		}
 		registered++
 		if isNew {
-			c.events.Publish(core.Event{Type: "game.discovered", GameID: game.ID})
+			c.events.PublishContext(ctx, core.Event{Type: "game.discovered", GameID: game.ID})
 		}
 	}
 	return matched, registered
@@ -563,17 +563,17 @@ func (c *Coordinator) Backup(ctx context.Context, gameID string) (core.Snapshot,
 	if game.Hidden {
 		return core.Snapshot{}, core.ErrGameNotFound
 	}
-	c.events.Publish(core.Event{Type: "snapshot.started", GameID: gameID})
+	c.events.PublishContext(ctx, core.Event{Type: "snapshot.started", GameID: gameID})
 	created, err := c.snapshots.Create(ctx, game)
 	if err != nil {
 		eventType := "snapshot.failed"
 		if errors.Is(err, snapshot.ErrNoFiles) || errors.Is(err, snapshot.ErrUnchanged) {
 			eventType = "snapshot.skipped"
 		}
-		c.events.Publish(core.Event{Type: eventType, GameID: gameID, Message: err.Error()})
+		c.events.PublishContext(ctx, core.Event{Type: eventType, GameID: gameID, Message: err.Error()})
 		return core.Snapshot{}, err
 	}
-	c.events.Publish(core.Event{Type: "snapshot.completed", GameID: gameID, Data: map[string]any{"snapshotId": created.ID, "remote": false}})
+	c.events.PublishContext(ctx, core.Event{Type: "snapshot.completed", GameID: gameID, Data: map[string]any{"snapshotId": created.ID, "remote": false}})
 	if err := c.applyLocalRetention(ctx, gameID); err != nil {
 		slog.Error("apply snapshot retention", "game_id", gameID, "error", err)
 	}
@@ -642,12 +642,12 @@ func (c *Coordinator) Restore(ctx context.Context, gameID, snapshotID string) (c
 		}
 		c.settings.RecordR2Success()
 	}
-	c.events.Publish(core.Event{Type: "restore.started", GameID: gameID})
+	c.events.PublishContext(ctx, core.Event{Type: "restore.started", GameID: gameID})
 	preRestore, err := c.snapshots.Restore(ctx, game, snapshotID)
 	if err != nil {
 		return core.Snapshot{}, err
 	}
-	c.events.Publish(core.Event{Type: "restore.completed", GameID: gameID, Data: map[string]any{"snapshotId": snapshotID}})
+	c.events.PublishContext(ctx, core.Event{Type: "restore.completed", GameID: gameID, Data: map[string]any{"snapshotId": snapshotID}})
 	return preRestore, nil
 }
 
@@ -657,14 +657,14 @@ func (c *Coordinator) ReconcileRemote(ctx context.Context) (remote.ReconcileResu
 		c.settings.RecordR2Failure(err)
 		return remote.ReconcileResult{}, err
 	}
-	c.events.Publish(core.Event{Type: "storage.reconcile.started"})
+	c.events.PublishContext(ctx, core.Event{Type: "storage.reconcile.started"})
 	result, err := c.reconciler.Reconcile(ctx, r2)
 	if err != nil {
 		c.settings.RecordR2Failure(err)
 		return result, err
 	}
 	c.settings.RecordR2Success()
-	c.events.Publish(core.Event{Type: "storage.reconcile.completed", Data: map[string]any{"objects": result.Objects, "snapshots": result.Snapshots, "skipped": result.Skipped, "games": result.Games}})
+	c.events.PublishContext(ctx, core.Event{Type: "storage.reconcile.completed", Data: map[string]any{"objects": result.Objects, "snapshots": result.Snapshots, "skipped": result.Skipped, "games": result.Games}})
 	slog.Info("R2 snapshot reconciliation completed", "objects", result.Objects, "snapshots", result.Snapshots, "skipped", result.Skipped, "games", result.Games)
 	return result, nil
 }
@@ -682,9 +682,9 @@ func (c *Coordinator) SyncNow(ctx context.Context) (core.SyncResult, error) {
 	if err != nil {
 		return core.SyncResult{}, err
 	}
-	c.events.Publish(core.Event{Type: "sync.started"})
+	c.events.PublishContext(ctx, core.Event{Type: "sync.started"})
 	result, backupErr := checkpointWatchedGames(ctx, games, c.Backup, func(completed, total int) {
-		c.publishSyncProgress("checking", completed, total)
+		c.publishSyncProgress(ctx, "checking", completed, total)
 	})
 	uploaded, uploadErr := c.syncWatchedPending(ctx)
 	result.Eligible = uploaded.Eligible
@@ -698,7 +698,7 @@ func (c *Coordinator) SyncNow(ctx context.Context) (core.SyncResult, error) {
 	if syncErr != nil {
 		completed.Message = syncErr.Error()
 	}
-	c.events.Publish(completed)
+	c.events.PublishContext(ctx, completed)
 	return result, syncErr
 }
 
@@ -706,8 +706,8 @@ func (c *Coordinator) SyncInProgress() bool {
 	return c.syncNowActive.Load()
 }
 
-func (c *Coordinator) publishSyncProgress(phase string, completed, total int) {
-	c.events.Publish(core.Event{Type: "sync.progress", Data: map[string]any{"phase": phase, "completed": completed, "total": total}})
+func (c *Coordinator) publishSyncProgress(ctx context.Context, phase string, completed, total int) {
+	c.events.PublishContext(ctx, core.Event{Type: "sync.progress", Data: map[string]any{"phase": phase, "completed": completed, "total": total}})
 }
 
 func checkpointWatchedGames(
@@ -773,7 +773,9 @@ func (c *Coordinator) syncPending(ctx context.Context, load func(context.Context
 	}
 	result, games, uploadErr := syncSnapshotBatch(pending, func(snapshot core.Snapshot) error {
 		return c.syncer.Upload(ctx, r2, snapshot)
-	}, c.events.Publish, func(completed, total int) { c.publishSyncProgress("uploading", completed, total) })
+	}, func(event core.Event) { c.events.PublishContext(ctx, event) }, func(completed, total int) {
+		c.publishSyncProgress(ctx, "uploading", completed, total)
+	})
 	for gameID := range games {
 		if err := c.applyRetention(ctx, gameID); err != nil {
 			uploadErr = errors.Join(uploadErr, err)
@@ -893,7 +895,7 @@ func (c *Coordinator) applyRetention(ctx context.Context, gameID string) error {
 		if err := c.pending.DeleteSnapshot(ctx, target.ID); err != nil {
 			return err
 		}
-		c.events.Publish(core.Event{Type: "snapshot.retained", GameID: gameID, Data: map[string]any{"deletedSnapshotId": target.ID}})
+		c.events.PublishContext(ctx, core.Event{Type: "snapshot.retained", GameID: gameID, Data: map[string]any{"deletedSnapshotId": target.ID}})
 	}
 	return nil
 }
@@ -922,7 +924,7 @@ func (c *Coordinator) syncOne(ctx context.Context, target core.Snapshot) error {
 		return err
 	}
 	c.settings.RecordR2Sync()
-	c.events.Publish(core.Event{Type: "upload.completed", GameID: target.GameID, Data: map[string]any{"snapshotId": target.ID}})
+	c.events.PublishContext(ctx, core.Event{Type: "upload.completed", GameID: target.GameID, Data: map[string]any{"snapshotId": target.ID}})
 	return nil
 }
 
@@ -936,7 +938,7 @@ func (c *Coordinator) uploadAll(ctx context.Context, r2 *remote.R2, snapshots []
 			return err
 		}
 		uploaded = true
-		c.events.Publish(core.Event{Type: "upload.completed", GameID: pendingSnapshot.GameID, Data: map[string]any{"snapshotId": pendingSnapshot.ID}})
+		c.events.PublishContext(ctx, core.Event{Type: "upload.completed", GameID: pendingSnapshot.GameID, Data: map[string]any{"snapshotId": pendingSnapshot.ID}})
 	}
 	if uploaded {
 		c.settings.RecordR2Sync()
@@ -970,6 +972,6 @@ func (c *Coordinator) DeleteSnapshot(ctx context.Context, gameID, snapshotID str
 	if err := c.pending.DeleteSnapshot(ctx, snapshotID); err != nil {
 		return err
 	}
-	c.events.Publish(core.Event{Type: "snapshot.deleted", GameID: gameID, Data: map[string]any{"snapshotId": snapshotID, "remote": remoteToo}})
+	c.events.PublishContext(ctx, core.Event{Type: "snapshot.deleted", GameID: gameID, Data: map[string]any{"snapshotId": snapshotID, "remote": remoteToo}})
 	return nil
 }

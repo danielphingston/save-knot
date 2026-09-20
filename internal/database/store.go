@@ -107,6 +107,12 @@ func (s *Store) initialize(ctx context.Context) error {
 			payload BLOB NOT NULL,
 			updated_at INTEGER NOT NULL
 		)`,
+		`CREATE TABLE IF NOT EXISTS activity_events (
+			id INTEGER PRIMARY KEY AUTOINCREMENT,
+			timestamp INTEGER NOT NULL,
+			payload BLOB NOT NULL
+		)`,
+		`CREATE INDEX IF NOT EXISTS activity_events_timestamp ON activity_events(timestamp)`,
 	}
 	for _, statement := range statements {
 		if _, err := s.db.ExecContext(ctx, statement); err != nil {
@@ -445,7 +451,9 @@ func (s *Store) listGames(ctx context.Context, hidden bool) (games []core.Game, 
 		g.id, g.catalog_id, g.catalog_name, g.display_name, g.store, g.store_id, g.install_path,
 		g.image, g.notes, g.enabled, g.sync_enabled, g.hidden, g.last_seen, g.last_change, g.last_backup,
 		COUNT(s.id), COALESCE(SUM(s.stored_size), 0),
-		COALESCE(SUM(CASE WHEN s.remote_state != 'synced' THEN 1 ELSE 0 END), 0)
+		COALESCE(SUM(CASE WHEN s.remote_state != 'synced' THEN 1 ELSE 0 END), 0),
+		(SELECT COUNT(*) FROM game_paths p WHERE p.game_id = g.id AND p.enabled = 1)
+		+ (SELECT COUNT(*) FROM game_registry r WHERE r.game_id = g.id AND r.enabled = 1)
 	FROM games g LEFT JOIN snapshots s ON s.game_id = g.id
 	WHERE g.hidden = ? GROUP BY g.id ORDER BY g.display_name COLLATE NOCASE`, hidden)
 	if err != nil {
@@ -470,7 +478,9 @@ func (s *Store) Game(ctx context.Context, id string) (core.Game, error) {
 		g.id, g.catalog_id, g.catalog_name, g.display_name, g.store, g.store_id, g.install_path,
 		g.image, g.notes, g.enabled, g.sync_enabled, g.hidden, g.last_seen, g.last_change, g.last_backup,
 		COUNT(s.id), COALESCE(SUM(s.stored_size), 0),
-		COALESCE(SUM(CASE WHEN s.remote_state != 'synced' THEN 1 ELSE 0 END), 0)
+		COALESCE(SUM(CASE WHEN s.remote_state != 'synced' THEN 1 ELSE 0 END), 0),
+		(SELECT COUNT(*) FROM game_paths p WHERE p.game_id = g.id AND p.enabled = 1)
+		+ (SELECT COUNT(*) FROM game_registry r WHERE r.game_id = g.id AND r.enabled = 1)
 	FROM games g LEFT JOIN snapshots s ON s.game_id = g.id WHERE g.id = ? GROUP BY g.id`, id)
 	game, err := scanGame(row)
 	if errors.Is(err, sql.ErrNoRows) {
@@ -490,7 +500,7 @@ func scanGame(row scanner) (core.Game, error) {
 	if err := row.Scan(
 		&game.ID, &game.CatalogID, &game.CatalogName, &game.DisplayName, &game.Store, &game.StoreID,
 		&game.InstallPath, &game.Image, &game.Notes, &enabled, &syncEnabled, &hidden, &lastSeen, &lastChange, &lastBackup,
-		&game.SnapshotCount, &game.StoredSize, &game.PendingCount,
+		&game.SnapshotCount, &game.StoredSize, &game.PendingCount, &game.SourceCount,
 	); err != nil {
 		return core.Game{}, fmt.Errorf("scan game: %w", err)
 	}
