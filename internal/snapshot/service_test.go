@@ -1,8 +1,11 @@
 package snapshot
 
 import (
+	"archive/zip"
+	"bytes"
 	"context"
 	"errors"
+	"io"
 	"os"
 	"path/filepath"
 	"testing"
@@ -10,6 +13,75 @@ import (
 	"github.com/saveknot/saveknot/internal/core"
 	"github.com/saveknot/saveknot/internal/database"
 )
+
+func TestExportRemoteSnapshotWithoutConfiguredGamePaths(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	root := t.TempDir()
+	store, err := database.Open(ctx, filepath.Join(root, "state.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if err := store.Close(); err != nil {
+			t.Error(err)
+		}
+	})
+
+	saveDirectory := filepath.Join(root, "computer-a-saves")
+	if err := os.MkdirAll(saveDirectory, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(saveDirectory, "slot.dat"), []byte("remote save data"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	game := core.Game{ID: "game-a", DisplayName: "Game A", Store: "custom", Enabled: false}
+	if err := store.UpsertGame(ctx, game); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.AddPath(ctx, core.GamePath{ID: "path-a", GameID: game.ID, Source: "custom", Template: saveDirectory, Resolved: saveDirectory, Enabled: true}); err != nil {
+		t.Fatal(err)
+	}
+	service := New(store, store, filepath.Join(root, "blobs"), "computer-a")
+	created, err := service.Create(ctx, game)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.DeletePath(ctx, game.ID, "path-a"); err != nil {
+		t.Fatal(err)
+	}
+
+	var archive bytes.Buffer
+	if err := service.Export(ctx, game.ID, created.ID, &archive); err != nil {
+		t.Fatalf("export failed without an installed save path: %v", err)
+	}
+	reader, err := zip.NewReader(bytes.NewReader(archive.Bytes()), int64(archive.Len()))
+	if err != nil {
+		t.Fatalf("export was not a zip archive: %v", err)
+	}
+	var saveFile *zip.File
+	for _, file := range reader.File {
+		if filepath.Base(file.Name) == "slot.dat" {
+			saveFile = file
+			break
+		}
+	}
+	if saveFile == nil {
+		t.Fatalf("export did not contain snapshot save file: %#v", reader.File)
+	}
+	file, err := saveFile.Open()
+	if err != nil {
+		t.Fatal(err)
+	}
+	data, readErr := io.ReadAll(file)
+	closeErr := file.Close()
+	if err := errors.Join(readErr, closeErr); err != nil {
+		t.Fatal(err)
+	}
+	if string(data) != "remote save data" {
+		t.Fatalf("exported file has wrong content: %q", data)
+	}
+}
 
 func TestCreateDeduplicatesAndRestorePreservesCurrentState(t *testing.T) {
 	t.Parallel()

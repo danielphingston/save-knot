@@ -194,6 +194,7 @@ async function gamePage(id, snapshotPage = 0) {
   const syncDescription = game.syncEnabled
     ? `Currently local only. This game's pending snapshots will sync after R2 is connected.`
     : 'Currently local only. Remote sync will remain off after R2 is connected unless you enable it in Customize.';
+  const comparison = snapshots.length > 1 ? `<div class="snapshot-compare" aria-label="Compare saved versions"><div class="field"><label for="compare-left">Compare version</label><select id="compare-left">${snapshots.map(snapshot => `<option value="${escapeHTML(snapshot.id)}">${formatTime(snapshot.createdAt)} · ${escapeHTML(snapshot.deviceId || 'unknown device')}</option>`).join('')}</select></div><span class="compare-with">with</span><div class="field"><label for="compare-right">Against version</label><select id="compare-right">${snapshots.map((snapshot, index) => `<option value="${escapeHTML(snapshot.id)}" ${index === 1 ? 'selected' : ''}>${formatTime(snapshot.createdAt)} · ${escapeHTML(snapshot.deviceId || 'unknown device')}</option>`).join('')}</select></div><button class="button small" id="compare-snapshots">Compare</button></div><div id="snapshot-comparison" class="snapshot-comparison" aria-live="polite"></div>` : '';
   acknowledgeUpdates();
   root.innerHTML = `
     <a class="subtle" href="#/games">← All games</a>
@@ -205,12 +206,13 @@ async function gamePage(id, snapshotPage = 0) {
         <p class="subtle">${escapeHTML(game.notes || 'Watching for changes and preserving each distinct version.')}</p>
         <div class="actions"><button class="button primary" id="backup" ${game.availableSources === 0 ? 'disabled' : ''}>Back up locally</button><button class="button" id="sync" ${syncDisabled ? 'disabled' : ''}${state.status.r2Configured ? '' : ' aria-describedby="game-sync-status" aria-label="Connect R2 to sync; this game is currently local only"'}>${escapeHTML(syncLabel)}</button><button class="button" id="edit">Customize</button><button class="button danger" id="remove-game">${game.store === 'custom' ? 'Remove from library' : 'Ignore this game'}</button></div>
         ${game.availableSources === 0 ? `<p class="source-warning" role="status">${game.sourceCount === 0 ? 'No save locations were found.' : 'The configured save locations contain no files.'} Add or check your save locations below before backing up.</p>` : ''}
+        ${game.availableSources === 0 && snapshots.some(snapshot => snapshot.remoteState === 'synced') ? '<p class="help" role="status">This game has no save folder on this computer. Online backups are available below; use Download archive to save a portable copy.</p>' : ''}
         ${state.status.r2Configured ? '' : `<p class="help" id="game-sync-status">${escapeHTML(syncDescription)}</p>`}
         <div class="stats"><div class="stat"><strong>${snapshots.length}</strong><small>Snapshots</small></div><div class="stat"><strong>${formatBytes(game.storedSize)}</strong><small>Stored</small></div><div class="stat"><strong>${formatTime(game.lastChange)}</strong><small>Last changed</small></div><div class="stat"><strong>${formatTime(game.lastBackup)}</strong><small>Last backup</small></div></div>
       </div>
     </section>
-    <section class="section"><div class="section-title"><h2>Backups</h2><span class="subtle">Newest first</span></div>${pagination(page.page, page.pages, page.total, 'snapshots')}
-      <div class="panel">${snapshots.length ? page.items.map((snapshot, index) => `<div class="snapshot-entry"><div class="row"><div><strong>${formatTime(snapshot.createdAt)}</strong><small>${countLabel(snapshot.files.length, 'file')} · ${formatBytes(snapshot.originalSize)}</small></div><div class="actions"><span class="state ${snapshot.remoteState === 'synced' ? '' : 'local'}">${snapshot.remoteState === 'synced' ? 'In R2' : 'On this device'}</span><button class="button small restore" data-snapshot="${escapeHTML(snapshot.id)}">Restore</button><button class="button small delete-snapshot" data-snapshot="${escapeHTML(snapshot.id)}" data-remote="${snapshot.remoteState === 'synced'}">Delete</button></div></div>${snapshotDetails(snapshot, snapshotOffset + index)}</div>`).join('') : '<div class="row"><div><strong>No snapshots yet</strong><small>Use Back up locally, or let the watcher catch the next save.</small></div></div>'}</div>
+    <section class="section"><div class="section-title"><h2>Backups</h2><span class="subtle">Newest first · other versions stay preserved</span></div>${comparison}${pagination(page.page, page.pages, page.total, 'snapshots')}
+      <div class="panel">${snapshots.length ? page.items.map((snapshot, index) => `<div class="snapshot-entry"><div class="row"><div><strong>${formatTime(snapshot.createdAt)}${snapshot.active ? ' <span class="active-master">Active master</span>' : ''}</strong><small>${countLabel(snapshot.files.length, 'file')} · ${formatBytes(snapshot.originalSize)} · Device ${escapeHTML(snapshot.deviceId || 'unknown')} · Snapshot ID ${escapeHTML(snapshot.id.slice(0, 12))}</small></div><div class="actions"><span class="state ${snapshot.remoteState === 'synced' ? '' : 'local'}">${snapshot.remoteState === 'synced' ? 'Online backup' : 'On this device'}</span>${snapshot.remoteState === 'synced' ? `<a class="button small" href="/api/games/${encodeURIComponent(id)}/snapshots/${encodeURIComponent(snapshot.id)}/download" download>Download archive</a>` : ''}${snapshot.active ? '' : `<button class="button small set-active-snapshot" data-snapshot="${escapeHTML(snapshot.id)}">Make active master</button>`}<button class="button small restore" data-snapshot="${escapeHTML(snapshot.id)}">Restore</button><button class="button small delete-snapshot" data-snapshot="${escapeHTML(snapshot.id)}" data-remote="${snapshot.remoteState === 'synced'}">Delete</button></div></div>${snapshotDetails(snapshot, snapshotOffset + index)}</div>`).join('') : '<div class="row"><div><strong>No snapshots yet</strong><small>Use Back up locally, or let the watcher catch the next save.</small></div></div>'}</div>
     </section>
     <section class="section"><div class="section-title"><h2>Save locations</h2><button class="button small" id="add-path">+ Add location</button></div>
       <div class="panel">${(paths || []).map(path => `<div class="row"><div><strong>${escapeHTML(path.resolved)}</strong><small>${path.hasFiles ? 'Save files found' : 'No save files found'}</small></div><div class="actions"><span class="state">${path.enabled ? 'Included' : 'Excluded'}</span><button class="button small toggle-path" data-path="${escapeHTML(path.id)}" data-enabled="${path.enabled}">${path.enabled ? 'Exclude' : 'Include'}</button>${path.source === 'custom' ? `<button class="button small remove-path" data-path="${escapeHTML(path.id)}">Remove</button>` : ''}</div></div>`).join('') || '<div class="row"><div><strong>No save locations configured</strong><small>Add a location to resume local backups.</small></div></div>'}</div>
@@ -230,6 +232,15 @@ async function gamePage(id, snapshotPage = 0) {
   });
   document.querySelector('#edit').addEventListener('click', () => showEditGame(game, policy));
   document.querySelector('#remove-game').addEventListener('click', () => showRemoveGame(game));
+  document.querySelector('#compare-snapshots')?.addEventListener('click', () => {
+    const left = snapshots.find(snapshot => snapshot.id === document.querySelector('#compare-left').value);
+    const right = snapshots.find(snapshot => snapshot.id === document.querySelector('#compare-right').value);
+    const output = document.querySelector('#snapshot-comparison');
+    if (!left || !right || left.id === right.id) { output.innerHTML = '<p class="help">Choose two different versions to compare.</p>'; return; }
+    const changes = snapshotChanges(left, right);
+    const registryChanged = (left.registry?.hash || '') !== (right.registry?.hash || '');
+    output.innerHTML = `<div class="callout"><strong>${formatTime(left.createdAt)} · ${escapeHTML(left.deviceId || 'unknown device')}</strong> compared with <strong>${formatTime(right.createdAt)} · ${escapeHTML(right.deviceId || 'unknown device')}</strong><p class="help">File changes are shown below. ${registryChanged ? 'Windows registry data also differs between these versions.' : 'Windows registry data matches between these versions.'}</p><div class="file-list">${changes.map(file => `<div><span class="file-state ${file.state}">${escapeHTML(file.state)}</span><code title="${escapeHTML(file.path)}">${escapeHTML(file.path)}</code><small>${formatBytes(file.size)}</small></div>`).join('') || '<p class="help">These versions contain the same files.</p>'}</div></div>`;
+  });
   document.querySelector('#add-path').addEventListener('click', () => showAddPath(game));
   document.querySelector('#add-exclusion').addEventListener('click', () => showAddExclusion(game));
   document.querySelectorAll('.toggle-path').forEach(button => button.addEventListener('click', async () => {
@@ -252,6 +263,13 @@ async function gamePage(id, snapshotPage = 0) {
     if (!confirm('Restore this version? SaveKnot will snapshot your current files first.')) return;
     button.disabled = true;
     try { await api(`/api/games/${encodeURIComponent(id)}/restore/${encodeURIComponent(button.dataset.snapshot)}`, { method: 'POST', body: '{}' }); toast('Save restored; previous files were preserved as a snapshot'); await loadShared(); gamePage(id); }
+    catch (error) { toast(error.message, true); button.disabled = false; }
+  }));
+  document.querySelectorAll('.set-active-snapshot').forEach(button => button.addEventListener('click', async () => {
+    const selected = snapshots.find(snapshot => snapshot.id === button.dataset.snapshot);
+    if (!selected || !confirm(`Make the backup from ${formatTime(selected.createdAt)} on device ${selected.deviceId || 'unknown'} the active master for ${game.displayName}? This changes the preferred version across devices. The other snapshots stay preserved and can still be compared, downloaded, or restored.`)) return;
+    button.disabled = true;
+    try { await api(`/api/games/${encodeURIComponent(id)}/active-snapshot`, { method: 'PUT', body: JSON.stringify({ snapshotId: selected.id }) }); toast('Active master changed; other snapshots remain preserved'); await loadShared(); gamePage(id, snapshotPage); }
     catch (error) { toast(error.message, true); button.disabled = false; }
   }));
   document.querySelectorAll('.delete-snapshot').forEach(button => button.addEventListener('click', async () => {

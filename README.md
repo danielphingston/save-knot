@@ -101,7 +101,9 @@ R2 objects use this layout:
 ```text
 <prefix>/v1/
 ├── blobs/sha256/<first-two-hash-characters>/<sha256>.zst
-└── games/<game-id>/snapshots/<snapshot-id>.json
+└── games/<game-id>/
+    ├── snapshots/<snapshot-id>.json
+    └── active-selections/<event-id>.json
 ```
 
 Blobs are immutable by their SHA-256 name. A snapshot becomes visible remotely only after all of its blobs have uploaded successfully.
@@ -126,6 +128,57 @@ Application lifecycle
 Interfaces exist only at real I/O boundaries: repository consumption, object storage, and secret storage. Concrete types are used everywhere else. The initial modules are compiled into one binary; a future external plugin boundary should use a versioned process or WASM protocol rather than Go's platform-limited `plugin` ABI.
 
 The database is local operational state. The immutable objects in R2 are the durable backup format.
+
+### R2 and multiple computers
+
+Each installation keeps its own database, device ID, save locations, and local
+blobs. Connecting the same R2 bucket and object prefix imports remote snapshot
+history and active-selection events at startup; **Refresh from R2** imports them
+on demand. Remote history is refreshed at those boundaries, not on every
+background sync. Snapshot blobs download only when you restore a snapshot or
+export it as a ZIP. The archive includes the manifest and save files and can be
+downloaded even when that game or its save paths are not installed on this
+computer.
+
+The snapshot history lets you compare versions by device, date, file changes,
+and size. Choose **Set active master** on the version you want to prefer. This
+writes an immutable selection event to R2 when connected; otherwise it stays
+local and uploads on the next **Sync now**. Other computers learn about that
+choice at startup or the next **Refresh from R2**. If devices select different
+versions while offline, all events remain available and SaveKnot resolves the
+effective choice deterministically by selection time, then device ID and event
+ID. Choosing a master changes the preferred version; it does not merge or
+rewrite save files. You can still compare, download, or restore the other
+versions. Restore first captures the current files as a local pre-restore
+snapshot.
+
+The destination computer needs a matching save location configured to restore
+a snapshot. Ludusavi paths use their logical template, so the resolved absolute
+folder may differ by computer. Custom paths use their absolute path as the
+source identity; restoring a custom-path snapshot to a different path requires
+matching that original path. A custom game created separately on each computer
+also gets a different game ID. Connect R2 and import the existing remote game
+before adding its destination save location.
+
+Snapshot retention removes only this device's excess unsynced snapshots. Synced snapshots, versions created on other devices, and snapshots referenced by selection events remain preserved until you explicitly delete them. The active master must be changed before its snapshot can be deleted. **Sync now** and configured periodic syncs
+upload pending snapshots and selection events; watched games can also upload a
+new snapshot after a save changes.
+
+Run the two-computer R2 protocol test locally with Docker:
+
+```sh
+make test-r2-e2e
+```
+
+This starts a disposable MinIO S3 server and bucket, creates separate local
+databases and save folders, tests backup/upload/import/download/restore in both
+directions, verifies pre-restore recovery and repeated reconciliation, rejects
+a damaged blob, then removes the container. Wrangler's local R2 binding does
+not expose the S3 API used by SaveKnot. To run the same test against a real R2
+bucket instead, set `SAVEKNOT_E2E_R2_ACCOUNT_ID`, `SAVEKNOT_E2E_R2_BUCKET`,
+`SAVEKNOT_E2E_R2_ACCESS_KEY_ID`, and `SAVEKNOT_E2E_R2_SECRET_ACCESS_KEY`, then run
+`go test ./internal/remote -run '^TestR2TwoDevicesEndToEnd$' -count=1 -v`.
+The test uses a unique object prefix and removes its test objects afterward.
 
 ## Quality gate
 
@@ -165,6 +218,6 @@ Dependencies are intentionally narrow and each owns a boundary the standard libr
 - The embedded UI uses plain HTML, CSS, and JavaScript with native dialogs and no runtime dependencies. DOM updates are explicit; regression tests cover helpers and backend contracts. Large lists are paginated to limit browser memory.
 - Discovery checks store manifests first. The deeper catalog scan is bounded and only evaluates user-anchored rules whose literal parent directory exists; install-root rules are not expanded blindly across the full catalog.
 - Snapshot manifests reference logical source keys, not absolute catalog paths. A restore requires the corresponding save location to be configured on that device.
-- R2 reconciliation intentionally lists snapshot manifests only at startup/manual boundaries. This minimizes Class A operations while still allowing a fresh device to recover remote history.
+- R2 reconciliation lists snapshot manifests and active-selection events at startup or when you choose **Refresh from R2**. Background sync uploads local changes without listing the bucket, minimizing Class A operations while allowing a fresh device to recover remote history on those refresh boundaries.
 
 See [`IDEA.MD`](IDEA.MD) for the complete product direction.

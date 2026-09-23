@@ -232,3 +232,15 @@ input[type="checkbox"] { width: auto; accent-color: var(--accent); margin-right:
 @media (prefers-reduced-motion: reduce) {
   *, *::before, *::after { animation: none !important; transition: none !important; scroll-behavior: auto !important; }
 }
+
+.snapshot-compare { display: grid; grid-template-columns: minmax(160px, 1fr) auto minmax(160px, 1fr) auto; gap: 12px; align-items: end; margin: 14px 0; padding: 14px; border: 1px solid var(--line); border-radius: 12px; background: var(--panel); }
+.compare-with { align-self: center; color: var(--muted); font-size: 12px; }
+.snapshot-comparison:empty { display: none; }
+.snapshot-comparison { margin: 12px 0; }
+.snapshot-comparison .callout { overflow-wrap: anywhere; }
+.snapshot-comparison .file-list { max-height: 350px; overflow: auto; }
+.active-master { display: inline-block; margin-left: 8px; padding: 3px 7px; border-radius: 99px; color: var(--accent); background: rgba(199,243,106,.09); font-size: 10px; font-weight: 750; vertical-align: middle; }
+@media (max-width: 760px) {
+  .snapshot-compare { grid-template-columns: 1fr; }
+  .compare-with { display: none; }
+}

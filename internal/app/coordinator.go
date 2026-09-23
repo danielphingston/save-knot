@@ -1,9 +1,12 @@
 package app
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"os"
 	"path"
@@ -46,6 +49,11 @@ type pendingRepository interface {
 	Snapshot(context.Context, string) (core.Snapshot, error)
 	DeleteSnapshot(context.Context, string) error
 	SnapshotsBeyond(context.Context, string, int) ([]core.Snapshot, error)
+}
+
+type activeSelectionRepository interface {
+	SaveActiveSelection(context.Context, core.ActiveSelection) error
+	ActiveSelections(context.Context, string) ([]core.ActiveSelection, error)
 }
 
 type periodicPendingRepository interface {
@@ -605,7 +613,8 @@ func (c *Coordinator) applyLocalRetention(ctx context.Context, gameID string) er
 		return err
 	}
 	for _, target := range excess {
-		if target.RemoteState == "synced" {
+		// Retention is local-device scoped. Keep versions authored by other computers.
+		if target.DeviceID != c.settings.Config().DeviceID || target.RemoteState == "synced" {
 			continue
 		}
 		if err := c.pending.DeleteSnapshot(ctx, target.ID); err != nil {
@@ -613,6 +622,84 @@ func (c *Coordinator) applyLocalRetention(ctx context.Context, gameID string) er
 		}
 	}
 	return nil
+}
+
+func (c *Coordinator) ExportSnapshot(ctx context.Context, gameID, snapshotID string, destination io.Writer) error {
+	target, err := c.pending.Snapshot(ctx, snapshotID)
+	if err != nil {
+		return err
+	}
+	if target.GameID != gameID {
+		return errors.New("snapshot does not belong to this game")
+	}
+	needed, err := c.syncer.NeedsDownload(ctx, target)
+	if err != nil {
+		return err
+	}
+	if needed {
+		r2, err := c.settings.R2(ctx)
+		if err != nil {
+			return fmt.Errorf("load R2 connection to export remote snapshot: %w", err)
+		}
+		if err := c.syncer.EnsureLocal(ctx, r2, target, c.snapshots.BlobRoot()); err != nil {
+			c.settings.RecordR2Failure(err)
+			return fmt.Errorf("download snapshot blobs for export: %w", err)
+		}
+		c.settings.RecordR2Success()
+	}
+	return c.snapshots.Export(ctx, gameID, snapshotID, destination)
+}
+
+func (c *Coordinator) SetActiveSnapshot(ctx context.Context, gameID, snapshotID string) error {
+	c.backupMu.Lock()
+	defer c.backupMu.Unlock()
+	game, err := c.repository.Game(ctx, gameID)
+	if err != nil {
+		return err
+	}
+	if game.Hidden {
+		return core.ErrGameNotFound
+	}
+	target, err := c.pending.Snapshot(ctx, snapshotID)
+	if err != nil {
+		return err
+	}
+	if target.GameID != gameID {
+		return errors.New("snapshot does not belong to this game")
+	}
+	selectionStore, ok := c.pending.(activeSelectionRepository)
+	if !ok {
+		return errors.New("active snapshot selection is unavailable")
+	}
+	now := time.Now().UTC()
+	id, err := core.NewID(now)
+	if err != nil {
+		return err
+	}
+	selection := core.ActiveSelection{ID: id, GameID: gameID, SnapshotID: snapshotID, DeviceID: c.settings.Config().DeviceID, SelectedAt: now}
+	if err := selectionStore.SaveActiveSelection(ctx, selection); err != nil {
+		return err
+	}
+	c.events.PublishContext(ctx, core.Event{Type: "snapshot.active", GameID: gameID, Data: map[string]any{"snapshotId": snapshotID, "selectionId": id}})
+	r2, err := c.settings.R2(ctx)
+	if errors.Is(err, settings.ErrR2NotConfigured) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	return uploadSelection(ctx, r2, selection)
+}
+
+func uploadSelection(ctx context.Context, writer interface {
+	Put(context.Context, string, string, string, io.Reader, int64) error
+}, selection core.ActiveSelection) error {
+	data, err := json.Marshal(selection)
+	if err != nil {
+		return err
+	}
+	key := path.Join("games", selection.GameID, "active-selections", selection.ID+".json")
+	return writer.Put(ctx, key, "application/json", "", bytes.NewReader(data), int64(len(data)))
 }
 
 func (c *Coordinator) Restore(ctx context.Context, gameID, snapshotID string) (core.Snapshot, error) {
@@ -687,6 +774,14 @@ func (c *Coordinator) SyncNow(ctx context.Context) (core.SyncResult, error) {
 		c.publishSyncProgress(ctx, "checking", completed, total)
 	})
 	uploaded, uploadErr := c.syncWatchedPending(ctx)
+	if selectionStore, ok := c.pending.(activeSelectionRepository); ok {
+		selectionsUploaded, selectionErr := c.uploadActiveSelections(ctx, selectionStore)
+		if selectionErr != nil {
+			uploadErr = errors.Join(uploadErr, selectionErr)
+		} else if selectionsUploaded > 0 {
+			c.settings.RecordR2Sync()
+		}
+	}
 	result.Eligible = uploaded.Eligible
 	result.Synced = uploaded.Synced
 	result.Failed = uploaded.Failed
@@ -700,6 +795,31 @@ func (c *Coordinator) SyncNow(ctx context.Context) (core.SyncResult, error) {
 	}
 	c.events.PublishContext(ctx, completed)
 	return result, syncErr
+}
+
+func (c *Coordinator) uploadActiveSelections(ctx context.Context, store activeSelectionRepository) (int, error) {
+	r2, err := c.settings.R2(ctx)
+	if err != nil {
+		return 0, err
+	}
+	games, err := c.repository.ListGames(ctx)
+	if err != nil {
+		return 0, err
+	}
+	total := 0
+	for _, game := range games {
+		selections, err := store.ActiveSelections(ctx, game.ID)
+		if err != nil {
+			return total, err
+		}
+		for _, selection := range selections {
+			if err := uploadSelection(ctx, r2, selection); err != nil {
+				return total, err
+			}
+			total++
+		}
+	}
+	return total, nil
 }
 
 func (c *Coordinator) SyncInProgress() bool {
@@ -873,24 +993,11 @@ func (c *Coordinator) applyRetention(ctx context.Context, gameID string) error {
 	if err != nil {
 		return err
 	}
-	r2, err := c.retentionRemote(ctx, excess)
-	if errors.Is(err, settings.ErrR2NotConfigured) {
-		r2 = nil
-	} else if err != nil {
-		c.settings.RecordR2Failure(err)
-		return err
-	}
 	for _, target := range excess {
-		if target.RemoteState == "synced" && r2 == nil {
+		// A synced manifest may have active-selection references this device has not
+		// reconciled yet. Automatic retention never deletes remote history.
+		if target.DeviceID != c.settings.Config().DeviceID || target.RemoteState == "synced" {
 			continue
-		}
-		if target.RemoteState == "synced" {
-			key := path.Join("games", target.GameID, "snapshots", target.ID+".json")
-			if err := r2.Delete(ctx, key); err != nil {
-				c.settings.RecordR2Failure(err)
-				return err
-			}
-			c.settings.RecordR2Success()
 		}
 		if err := c.pending.DeleteSnapshot(ctx, target.ID); err != nil {
 			return err
@@ -898,20 +1005,6 @@ func (c *Coordinator) applyRetention(ctx context.Context, gameID string) error {
 		c.events.PublishContext(ctx, core.Event{Type: "snapshot.retained", GameID: gameID, Data: map[string]any{"deletedSnapshotId": target.ID}})
 	}
 	return nil
-}
-
-func (c *Coordinator) retentionRemote(ctx context.Context, snapshots []core.Snapshot) (*remote.R2, error) {
-	for _, target := range snapshots {
-		if target.RemoteState != "synced" {
-			continue
-		}
-		r2, err := c.settings.R2(ctx)
-		if errors.Is(err, settings.ErrR2NotConfigured) {
-			return nil, settings.ErrR2NotConfigured
-		}
-		return r2, err
-	}
-	return nil, settings.ErrR2NotConfigured
 }
 
 func (c *Coordinator) syncOne(ctx context.Context, target core.Snapshot) error {
@@ -955,6 +1048,15 @@ func (c *Coordinator) DeleteSnapshot(ctx context.Context, gameID, snapshotID str
 	}
 	if target.GameID != gameID {
 		return errors.New("snapshot does not belong to this game")
+	}
+	if selections, ok := c.pending.(activeSelectionRepository); ok {
+		active, err := selections.ActiveSelections(ctx, gameID)
+		if err != nil {
+			return err
+		}
+		if len(active) > 0 && active[len(active)-1].SnapshotID == snapshotID {
+			return errors.New("cannot delete the active snapshot; select another version first")
+		}
 	}
 	if remoteToo && target.RemoteState == "synced" {
 		r2, err := c.settings.R2(ctx)

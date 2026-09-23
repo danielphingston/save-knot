@@ -1,10 +1,12 @@
 package snapshot
 
 import (
+	"archive/zip"
 	"context"
 	"crypto/sha256"
 	"database/sql"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"hash"
@@ -386,6 +388,79 @@ func copyWithHash(destination io.Writer, digest hash.Hash, source io.Reader) (in
 func sourceKey(path core.GamePath) string {
 	digest := sha256.Sum256([]byte(path.Source + "\x00" + path.Template))
 	return hex.EncodeToString(digest[:12])
+}
+
+// Export writes a portable ZIP containing the manifest and verified save data.
+// It deliberately does not require this device to have the game's paths configured.
+func (s *Service) Export(ctx context.Context, gameID, snapshotID string, destination io.Writer) error {
+	target, err := s.repository.Snapshot(ctx, snapshotID)
+	if err != nil {
+		return err
+	}
+	if target.GameID != gameID {
+		return errors.New("snapshot does not belong to this game")
+	}
+	w := zip.NewWriter(destination)
+	manifest, err := json.MarshalIndent(target, "", "  ")
+	if err != nil {
+		return err
+	}
+	entry, err := w.Create("manifest.json")
+	if err == nil {
+		_, err = entry.Write(manifest)
+	}
+	if err != nil {
+		return errors.Join(err, w.Close())
+	}
+	for _, file := range target.Files {
+		if err := ctx.Err(); err != nil {
+			return errors.Join(err, w.Close())
+		}
+		name := filepath.ToSlash(filepath.Clean(filepath.FromSlash(file.Path)))
+		if file.RootFile {
+			name = filepath.Base(name)
+		}
+		if name == "." || name == ".." || filepath.IsAbs(name) || strings.HasPrefix(name, "../") {
+			return errors.Join(fmt.Errorf("unsafe snapshot path %q", file.Path), w.Close())
+		}
+		if file.SourceKey == "" || strings.ContainsAny(file.SourceKey, "/\\") || file.SourceKey == "." || file.SourceKey == ".." {
+			return errors.Join(fmt.Errorf("unsafe snapshot source key %q", file.SourceKey), w.Close())
+		}
+		name = "files/" + file.SourceKey + "/" + name
+		blobPath, err := s.repository.BlobPath(ctx, file.Hash)
+		if err != nil {
+			return errors.Join(err, w.Close())
+		}
+		data, err := readCompressedBlob(blobPath, file.Hash, file.Size)
+		if err != nil {
+			return errors.Join(err, w.Close())
+		}
+		entry, err := w.Create(name)
+		if err == nil {
+			_, err = entry.Write(data)
+		}
+		if err != nil {
+			return errors.Join(err, w.Close())
+		}
+	}
+	if target.Registry != nil {
+		blobPath, err := s.repository.BlobPath(ctx, target.Registry.Hash)
+		if err != nil {
+			return errors.Join(err, w.Close())
+		}
+		data, err := readCompressedBlob(blobPath, target.Registry.Hash, target.Registry.Size)
+		if err != nil {
+			return errors.Join(err, w.Close())
+		}
+		entry, err := w.Create("registry.json")
+		if err == nil {
+			_, err = entry.Write(data)
+		}
+		if err != nil {
+			return errors.Join(err, w.Close())
+		}
+	}
+	return w.Close()
 }
 
 func (s *Service) Restore(ctx context.Context, game core.Game, snapshotID string) (core.Snapshot, error) {

@@ -166,6 +166,8 @@ func (s *Server) routes(mux *http.ServeMux) {
 	mux.HandleFunc("POST /api/games/{id}/image", s.uploadImage)
 	mux.HandleFunc("DELETE /api/games/{id}/image", s.resetImage)
 	mux.HandleFunc("GET /api/games/{id}/snapshots", s.listSnapshots)
+	mux.HandleFunc("PUT /api/games/{id}/active-snapshot", s.setActiveSnapshot)
+	mux.HandleFunc("GET /api/games/{id}/snapshots/{snapshot}/download", s.downloadSnapshot)
 	mux.HandleFunc("POST /api/games/{id}/backup", s.backup)
 	mux.HandleFunc("POST /api/games/{id}/sync", s.syncGame)
 	mux.HandleFunc("POST /api/games/{id}/restore/{snapshot}", s.restore)
@@ -568,6 +570,62 @@ func (s *Server) listSnapshots(writer http.ResponseWriter, request *http.Request
 		snapshots = []core.Snapshot{}
 	}
 	writeJSON(writer, http.StatusOK, snapshots)
+}
+
+func (s *Server) setActiveSnapshot(writer http.ResponseWriter, request *http.Request) {
+	var input struct {
+		SnapshotID string `json:"snapshotId"`
+	}
+	if !decodeJSON(writer, request, &input) {
+		return
+	}
+	coordinator, ok := s.backups.(interface {
+		SetActiveSnapshot(context.Context, string, string) error
+	})
+	if !ok {
+		writeError(writer, http.StatusNotImplemented, errors.New("active snapshot selection is unavailable"))
+		return
+	}
+	if err := coordinator.SetActiveSnapshot(request.Context(), request.PathValue("id"), input.SnapshotID); err != nil {
+		writeError(writer, http.StatusUnprocessableEntity, err)
+		return
+	}
+	writer.WriteHeader(http.StatusNoContent)
+}
+
+func (s *Server) downloadSnapshot(writer http.ResponseWriter, request *http.Request) {
+	coordinator, ok := s.backups.(interface {
+		ExportSnapshot(context.Context, string, string, io.Writer) error
+	})
+	if !ok {
+		writeError(writer, http.StatusNotImplemented, errors.New("snapshot export is unavailable"))
+		return
+	}
+	archive, err := os.CreateTemp("", "saveknot-snapshot-*.zip")
+	if err != nil {
+		writeError(writer, http.StatusInternalServerError, err)
+		return
+	}
+	archivePath := archive.Name()
+	defer os.Remove(archivePath)
+	if err := coordinator.ExportSnapshot(request.Context(), request.PathValue("id"), request.PathValue("snapshot"), archive); err != nil {
+		_ = archive.Close()
+		writeError(writer, http.StatusUnprocessableEntity, err)
+		return
+	}
+	if _, err := archive.Seek(0, io.SeekStart); err != nil {
+		_ = archive.Close()
+		writeError(writer, http.StatusInternalServerError, err)
+		return
+	}
+	writer.Header().Set("Content-Type", "application/zip")
+	writer.Header().Set("Content-Disposition", `attachment; filename="snapshot-`+request.PathValue("snapshot")+`.zip"`)
+	if _, err := io.Copy(writer, archive); err != nil {
+		slog.Error("send snapshot archive", "game_id", request.PathValue("id"), "snapshot_id", request.PathValue("snapshot"), "error", err)
+	}
+	if err := archive.Close(); err != nil {
+		slog.Error("close snapshot archive", "error", err)
+	}
 }
 
 func (s *Server) backup(writer http.ResponseWriter, request *http.Request) {

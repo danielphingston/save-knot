@@ -1,4 +1,4 @@
-.PHONY: build build-windows build-windows-amd64 ui-check fmt fmt-check lint mod-check test test-race cover check
+.PHONY: build build-windows build-windows-amd64 ui-check fmt fmt-check lint mod-check test test-race test-r2-e2e cover check
 
 ui-check:
 	node --check internal/api/web/app.js
@@ -30,6 +30,9 @@ test:
 
 test-race:
 	go test -race ./...
+
+test-r2-e2e:
+	bash scripts/test-r2-e2e.sh
 
 cover:
 	go test -cover ./...

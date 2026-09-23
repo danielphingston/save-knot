@@ -22,6 +22,7 @@ type remoteCatalog interface {
 }
 
 type reconciliationRepository interface {
+	SaveActiveSelection(context.Context, core.ActiveSelection) error
 	EnsureRemoteGame(context.Context, core.Game) error
 	HasSnapshot(context.Context, string) (bool, error)
 	ImportSnapshot(context.Context, core.Snapshot) error
@@ -49,7 +50,13 @@ func (r *Reconciler) Reconcile(ctx context.Context, catalog remoteCatalog) (Reco
 	}
 	result := ReconcileResult{Objects: len(objects)}
 	games := make(map[string]struct{})
+	var selectionObjects []Object
+	availableSnapshots := make(map[string]bool)
 	for _, object := range objects {
+		if _, _, ok := activeSelectionObjectIdentity(object.Key); ok {
+			selectionObjects = append(selectionObjects, object)
+			continue
+		}
 		if !strings.Contains(object.Key, "/snapshots/") || path.Ext(object.Key) != ".json" {
 			continue
 		}
@@ -63,6 +70,7 @@ func (r *Reconciler) Reconcile(ctx context.Context, catalog remoteCatalog) (Reco
 		}
 		if exists {
 			games[gameID] = struct{}{}
+			availableSnapshots[snapshotID] = true
 			result.Skipped++
 			continue
 		}
@@ -85,11 +93,68 @@ func (r *Reconciler) Reconcile(ctx context.Context, catalog remoteCatalog) (Reco
 		if err := r.repository.ImportSnapshot(ctx, snapshot); err != nil {
 			return result, err
 		}
+		availableSnapshots[snapshot.ID] = true
 		games[snapshot.GameID] = struct{}{}
 		result.Snapshots++
 	}
+	for _, object := range selectionObjects {
+		gameID, eventID, _ := activeSelectionObjectIdentity(object.Key)
+		selection, err := readRemoteSelection(ctx, catalog, object)
+		if err != nil {
+			return result, err
+		}
+		if selection.GameID != gameID || selection.ID != eventID {
+			return result, fmt.Errorf("remote active selection %q identity does not match its object key", object.Key)
+		}
+		// Deleting a snapshot leaves its immutable event object behind. Ignore stale
+		// events for missing snapshots so a fresh device can still reconcile history.
+		if !availableSnapshots[selection.SnapshotID] {
+			continue
+		}
+		if err := r.repository.SaveActiveSelection(ctx, selection); err != nil {
+			return result, fmt.Errorf("import active selection %q: %w", eventID, err)
+		}
+	}
 	result.Games = len(games)
 	return result, nil
+}
+
+func activeSelectionObjectIdentity(key string) (string, string, bool) {
+	parts := strings.Split(key, "/")
+	if len(parts) != 4 || parts[0] != "games" || parts[2] != "active-selections" || path.Ext(parts[3]) != ".json" {
+		return "", "", false
+	}
+	gameID, eventID := parts[1], strings.TrimSuffix(parts[3], ".json")
+	if !objectIDPattern.MatchString(gameID) || !objectIDPattern.MatchString(eventID) {
+		return "", "", false
+	}
+	return gameID, eventID, true
+}
+
+func readRemoteSelection(ctx context.Context, catalog remoteCatalog, object Object) (core.ActiveSelection, error) {
+	if object.Size > 1<<20 {
+		return core.ActiveSelection{}, fmt.Errorf("remote active selection %q is too large", object.Key)
+	}
+	body, _, err := catalog.Get(ctx, object.Key)
+	if err != nil {
+		return core.ActiveSelection{}, err
+	}
+	data, readErr := io.ReadAll(io.LimitReader(body, (1<<20)+1))
+	closeErr := body.Close()
+	if err := errors.Join(readErr, closeErr); err != nil {
+		return core.ActiveSelection{}, fmt.Errorf("read remote active selection: %w", err)
+	}
+	var selection core.ActiveSelection
+	if len(data) > 1<<20 {
+		return selection, fmt.Errorf("remote active selection %q is too large", object.Key)
+	}
+	if err := json.Unmarshal(data, &selection); err != nil {
+		return selection, fmt.Errorf("decode remote active selection: %w", err)
+	}
+	if selection.ID == "" || selection.GameID == "" || selection.SnapshotID == "" || selection.DeviceID == "" || selection.SelectedAt.IsZero() {
+		return selection, fmt.Errorf("remote active selection %q has invalid identity", object.Key)
+	}
+	return selection, nil
 }
 
 func snapshotObjectIdentity(key string) (string, string, bool) {

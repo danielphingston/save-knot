@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"io"
 	"io/fs"
 	"net/http"
 	"net/http/httptest"
@@ -20,8 +21,9 @@ import (
 )
 
 type repositoryFake struct {
-	games []core.Game
-	paths []core.GamePath
+	games     []core.Game
+	paths     []core.GamePath
+	snapshots []core.Snapshot
 }
 
 func TestHasSaveFilesDistinguishesMissingAndEmptyLocations(t *testing.T) {
@@ -73,8 +75,14 @@ func (r *repositoryFake) GamePolicy(context.Context, string) (core.BackupPolicy,
 	return core.DefaultBackupPolicy(), nil
 }
 
-func (r *repositoryFake) ListSnapshots(context.Context, string) ([]core.Snapshot, error) {
-	return nil, nil
+func (r *repositoryFake) ListSnapshots(_ context.Context, gameID string) ([]core.Snapshot, error) {
+	var result []core.Snapshot
+	for _, snapshot := range r.snapshots {
+		if snapshot.GameID == gameID {
+			result = append(result, snapshot)
+		}
+	}
+	return result, nil
 }
 
 func (r *repositoryFake) UpsertGame(_ context.Context, game core.Game) error {
@@ -120,11 +128,12 @@ func (r *repositoryFake) UpdateGamePolicy(context.Context, string, core.BackupPo
 }
 
 type coordinatorFake struct {
-	reconciled int
-	repository *repositoryFake
-	syncResult core.SyncResult
-	syncErr    error
-	syncActive bool
+	reconciled     int
+	repository     *repositoryFake
+	activeSnapshot string
+	syncResult     core.SyncResult
+	syncErr        error
+	syncActive     bool
 }
 
 func (c *coordinatorFake) Backup(context.Context, string) (core.Snapshot, error) {
@@ -133,6 +142,34 @@ func (c *coordinatorFake) Backup(context.Context, string) (core.Snapshot, error)
 
 func (c *coordinatorFake) Restore(context.Context, string, string) (core.Snapshot, error) {
 	return core.Snapshot{}, nil
+}
+func (c *coordinatorFake) ExportSnapshot(_ context.Context, gameID, snapshotID string, destination io.Writer) error {
+	if c.repository != nil {
+		for _, snapshot := range c.repository.snapshots {
+			if snapshot.GameID == gameID && snapshot.ID == snapshotID {
+				_, err := io.WriteString(destination, "snapshot archive")
+				return err
+			}
+		}
+	}
+	return core.ErrGameNotFound
+}
+func (c *coordinatorFake) SetActiveSnapshot(_ context.Context, gameID, snapshotID string) error {
+	if c.repository == nil {
+		return nil
+	}
+	found := false
+	for index := range c.repository.snapshots {
+		if c.repository.snapshots[index].GameID == gameID {
+			c.repository.snapshots[index].Active = c.repository.snapshots[index].ID == snapshotID
+			found = found || c.repository.snapshots[index].ID == snapshotID
+		}
+	}
+	if !found {
+		return core.ErrGameNotFound
+	}
+	c.activeSnapshot = snapshotID
+	return nil
 }
 func (c *coordinatorFake) ReconcileWatches(context.Context) { c.reconciled++ }
 func (c *coordinatorFake) SyncNow(context.Context) (core.SyncResult, error) {
@@ -248,6 +285,46 @@ func TestStatusAndManualGameAPI(t *testing.T) {
 }
 
 //nolint:gocognit // This integration test intentionally verifies the complete HTTP lifecycle in one server instance.
+
+func TestRemoteOnlySnapshotCanBeDownloadedAndSelectedAsActive(t *testing.T) {
+	t.Parallel()
+	directory := t.TempDir()
+	manager, err := settings.New(filepath.Join(directory, "config.json"), config.Config{Listen: "127.0.0.1:32147", DeviceID: "device-b", RetentionKeep: 1}, &vaultFake{values: map[string]string{}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	game := core.Game{ID: "game-a", DisplayName: "Game A", Store: "steam", Enabled: false}
+	repository := &repositoryFake{games: []core.Game{game}, snapshots: []core.Snapshot{
+		{ID: "snapshot-a", GameID: game.ID, DeviceID: "device-a", RemoteState: "synced"},
+		{ID: "snapshot-b", GameID: game.ID, DeviceID: "device-b", RemoteState: "synced"},
+	}}
+	coordinator := &coordinatorFake{repository: repository}
+	server, err := New("127.0.0.1:32147", repository, repository, repository, repository, coordinator, coordinator, coordinator, manager, events.New(), filepath.Join(directory, "artwork"))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	listed := serveRequest(server, http.MethodGet, "/api/games/game-a/snapshots", "")
+	if listed.Code != http.StatusOK || !strings.Contains(listed.Body.String(), "snapshot-a") || !strings.Contains(listed.Body.String(), "snapshot-b") {
+		t.Fatalf("remote-only game versions were not visible: %d %s", listed.Code, listed.Body.String())
+	}
+	downloaded := serveRequest(server, http.MethodGet, "/api/games/game-a/snapshots/snapshot-a/download", "")
+	if downloaded.Code != http.StatusOK || downloaded.Body.String() != "snapshot archive" {
+		t.Fatalf("remote-only snapshot could not be downloaded: %d %q", downloaded.Code, downloaded.Body.String())
+	}
+	selected := serveRequest(server, http.MethodPut, "/api/games/game-a/active-snapshot", `{"snapshotId":"snapshot-b"}`)
+	if selected.Code != http.StatusNoContent || coordinator.activeSnapshot != "snapshot-b" {
+		t.Fatalf("active version was not selected: %d %s active=%q", selected.Code, selected.Body.String(), coordinator.activeSnapshot)
+	}
+	listed = serveRequest(server, http.MethodGet, "/api/games/game-a/snapshots", "")
+	if listed.Code != http.StatusOK || !strings.Contains(listed.Body.String(), `"id":"snapshot-a"`) || !strings.Contains(listed.Body.String(), `"id":"snapshot-b"`) || !strings.Contains(listed.Body.String(), `"active":true`) {
+		t.Fatalf("selecting an active version hid an alternative or omitted active metadata: %d %s", listed.Code, listed.Body.String())
+	}
+	if len(repository.snapshots) != 2 {
+		t.Fatalf("selecting active version removed another version: %#v", repository.snapshots)
+	}
+}
+
 func TestGameLifecycleRecoveryAndSettingsAPI(t *testing.T) {
 	t.Parallel()
 	directory := t.TempDir()

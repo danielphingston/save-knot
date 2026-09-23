@@ -345,3 +345,97 @@ func TestOpenAddsSyncSettingToExistingDatabase(t *testing.T) {
 		t.Fatalf("sync setting was not added to existing database: game=%#v err=%v", loaded, err)
 	}
 }
+
+func TestRetentionLimitAppliesPerDeviceAndPreservesOtherDevicesLatestVersion(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	store, err := Open(ctx, filepath.Join(t.TempDir(), "state.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if err := store.Close(); err != nil {
+			t.Error(err)
+		}
+	})
+	game := core.Game{ID: "shared-game", DisplayName: "Shared Game", Store: "steam"}
+	if err := store.UpsertGame(ctx, game); err != nil {
+		t.Fatal(err)
+	}
+	base := time.Unix(1_700_000_000, 0).UTC()
+	for index, snapshot := range []core.Snapshot{
+		{ID: "a-old", DeviceID: "computer-a", CreatedAt: base},
+		{ID: "b-old", DeviceID: "computer-b", CreatedAt: base.Add(time.Minute)},
+		{ID: "a-new", DeviceID: "computer-a", CreatedAt: base.Add(2 * time.Minute)},
+		{ID: "b-new", DeviceID: "computer-b", CreatedAt: base.Add(3 * time.Minute)},
+	} {
+		snapshot.Version = 1
+		snapshot.GameID = game.ID
+		snapshot.GameName = game.DisplayName
+		snapshot.RemoteState = "synced"
+		if err := store.SaveSnapshot(ctx, snapshot); err != nil {
+			t.Fatalf("save snapshot %d: %v", index, err)
+		}
+	}
+
+	excess, err := store.SnapshotsBeyond(ctx, game.ID, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(excess) != 2 || excess[0].ID != "a-old" || excess[1].ID != "b-old" {
+		t.Fatalf("retention was not applied independently per computer: %#v", excess)
+	}
+	remaining := map[string]bool{}
+	for _, snapshot := range excess {
+		remaining[snapshot.ID] = true
+	}
+	if remaining["a-new"] || remaining["b-new"] {
+		t.Fatalf("a computer's latest divergent version was selected for retention: %#v", excess)
+	}
+}
+
+func TestActiveSelectionPersistsAndKeepsAlternativeVersions(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	path := filepath.Join(t.TempDir(), "state.db")
+	store, err := Open(ctx, path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	game := core.Game{ID: "shared-game", DisplayName: "Shared Game", Store: "steam"}
+	if err := store.UpsertGame(ctx, game); err != nil {
+		t.Fatal(err)
+	}
+	for _, snapshot := range []core.Snapshot{
+		{Version: 1, ID: "snapshot-a", GameID: game.ID, GameName: game.DisplayName, DeviceID: "computer-a", CreatedAt: time.Unix(1_700_000_000, 0), RemoteState: "synced"},
+		{Version: 1, ID: "snapshot-b", GameID: game.ID, GameName: game.DisplayName, DeviceID: "computer-b", CreatedAt: time.Unix(1_700_000_100, 0), RemoteState: "synced"},
+	} {
+		if err := store.ImportSnapshot(ctx, snapshot); err != nil {
+			t.Fatal(err)
+		}
+	}
+	selection := core.ActiveSelection{ID: "selection-b", GameID: game.ID, SnapshotID: "snapshot-b", DeviceID: "computer-c", SelectedAt: time.Unix(1_700_000_200, 0).UTC()}
+	if err := store.SaveActiveSelection(ctx, selection); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	store, err = Open(ctx, path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if err := store.Close(); err != nil {
+			t.Error(err)
+		}
+	})
+	snapshots, err := store.ListSnapshots(ctx, game.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(snapshots) != 2 || snapshots[0].ID != "snapshot-b" || !snapshots[0].Active || snapshots[1].ID != "snapshot-a" || snapshots[1].Active {
+		t.Fatalf("active selection did not persist with other versions available: %#v", snapshots)
+	}
+}

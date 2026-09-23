@@ -74,6 +74,14 @@ func (s *Store) initialize(ctx context.Context) error {
 			remote_state TEXT NOT NULL,
 			manifest BLOB NOT NULL
 		)`,
+		`CREATE TABLE IF NOT EXISTS active_selections (
+			id TEXT PRIMARY KEY,
+			game_id TEXT NOT NULL REFERENCES games(id) ON DELETE CASCADE,
+			snapshot_id TEXT NOT NULL,
+			device_id TEXT NOT NULL,
+			selected_at INTEGER NOT NULL,
+			manifest BLOB NOT NULL
+		)`,
 		`CREATE TABLE IF NOT EXISTS game_registry (
 			id TEXT PRIMARY KEY,
 			game_id TEXT NOT NULL REFERENCES games(id) ON DELETE CASCADE,
@@ -654,11 +662,18 @@ func (s *Store) ListSnapshots(ctx context.Context, gameID string) (snapshots []c
 	if err := rows.Err(); err != nil {
 		return nil, fmt.Errorf("iterate snapshots: %w", err)
 	}
+	selection, err := s.ActiveSelection(ctx, gameID)
+	if err != nil && !errors.Is(err, sql.ErrNoRows) {
+		return nil, err
+	}
+	for i := range snapshots {
+		snapshots[i].Active = err == nil && snapshots[i].ID == selection.SnapshotID
+	}
 	return snapshots, nil
 }
 
 func (s *Store) SnapshotsBeyond(ctx context.Context, gameID string, keep int) (snapshots []core.Snapshot, err error) {
-	rows, err := s.db.QueryContext(ctx, `SELECT manifest FROM snapshots WHERE game_id = ? ORDER BY created_at DESC LIMIT -1 OFFSET ?`, gameID, keep)
+	rows, err := s.db.QueryContext(ctx, `SELECT s.manifest FROM (SELECT id, manifest, ROW_NUMBER() OVER (PARTITION BY device_id ORDER BY created_at DESC, id DESC) AS device_rank FROM snapshots WHERE game_id = ?) s WHERE s.device_rank > ? AND NOT EXISTS (SELECT 1 FROM active_selections a WHERE a.game_id = ? AND a.snapshot_id = s.id) ORDER BY s.device_rank`, gameID, keep, gameID)
 	if err != nil {
 		return nil, fmt.Errorf("list snapshots beyond retention: %w", err)
 	}
@@ -846,4 +861,49 @@ func timePointer(value sql.NullInt64) *time.Time {
 	}
 	timestamp := time.UnixMilli(value.Int64).UTC()
 	return &timestamp
+}
+
+// SaveActiveSelection persists an immutable selection event. Replaying the same event is safe.
+func (s *Store) SaveActiveSelection(ctx context.Context, selection core.ActiveSelection) error {
+	data, err := json.Marshal(selection)
+	if err != nil {
+		return err
+	}
+	_, err = s.db.ExecContext(ctx, `INSERT OR IGNORE INTO active_selections(id, game_id, snapshot_id, device_id, selected_at, manifest) VALUES (?, ?, ?, ?, ?, ?)`, selection.ID, selection.GameID, selection.SnapshotID, selection.DeviceID, selection.SelectedAt.UnixNano(), data)
+	if err != nil {
+		return fmt.Errorf("save active selection %q: %w", selection.ID, err)
+	}
+	return nil
+}
+
+func (s *Store) ActiveSelections(ctx context.Context, gameID string) ([]core.ActiveSelection, error) {
+	rows, err := s.db.QueryContext(ctx, `SELECT manifest FROM active_selections WHERE game_id = ? ORDER BY selected_at, device_id, id`, gameID)
+	if err != nil {
+		return nil, fmt.Errorf("list active selections: %w", err)
+	}
+	defer rows.Close()
+	var selections []core.ActiveSelection
+	for rows.Next() {
+		var data []byte
+		var selection core.ActiveSelection
+		if err := rows.Scan(&data); err != nil {
+			return nil, err
+		}
+		if err := json.Unmarshal(data, &selection); err != nil {
+			return nil, err
+		}
+		selections = append(selections, selection)
+	}
+	return selections, rows.Err()
+}
+
+func (s *Store) ActiveSelection(ctx context.Context, gameID string) (core.ActiveSelection, error) {
+	selections, err := s.ActiveSelections(ctx, gameID)
+	if err != nil {
+		return core.ActiveSelection{}, err
+	}
+	if len(selections) == 0 {
+		return core.ActiveSelection{}, sql.ErrNoRows
+	}
+	return selections[len(selections)-1], nil
 }

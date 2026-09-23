@@ -97,6 +97,16 @@ type Snapshot struct {
 	OriginalSize int64                `json:"originalSize"`
 	StoredSize   int64                `json:"storedSize"`
 	RemoteState  string               `json:"remoteState"`
+	Active       bool                 `json:"active"`
+}
+
+// ActiveSelection is an immutable user choice.
+type ActiveSelection struct {
+	ID         string    `json:"id"`
+	GameID     string    `json:"gameId"`
+	SnapshotID string    `json:"snapshotId"`
+	DeviceID   string    `json:"deviceId"`
+	SelectedAt time.Time `json:"selectedAt"`
 }
 
 type PortableGameMetadata struct {

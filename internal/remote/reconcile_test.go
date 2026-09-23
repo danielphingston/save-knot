@@ -26,9 +26,15 @@ func (f *remoteCatalogFake) Get(_ context.Context, key string) (io.ReadCloser, i
 }
 
 type reconciliationRepoFake struct {
-	games     []core.Game
-	snapshots []core.Snapshot
-	existing  map[string]bool
+	games      []core.Game
+	snapshots  []core.Snapshot
+	selections []core.ActiveSelection
+	existing   map[string]bool
+}
+
+func (r *reconciliationRepoFake) SaveActiveSelection(_ context.Context, selection core.ActiveSelection) error {
+	r.selections = append(r.selections, selection)
+	return nil
 }
 
 func (r *reconciliationRepoFake) EnsureRemoteGame(_ context.Context, game core.Game) error {
@@ -73,6 +79,52 @@ func TestReconcilerImportsOnlySnapshotManifests(t *testing.T) {
 	}
 	if len(repository.games) != 1 || repository.games[0].Enabled || len(repository.snapshots) != 1 || repository.snapshots[0].RemoteState != "synced" {
 		t.Fatalf("unexpected imported state: games=%#v snapshots=%#v", repository.games, repository.snapshots)
+	}
+}
+
+func TestReconcilerImportsActiveSelectionEventsWithoutRemovingVersions(t *testing.T) {
+	t.Parallel()
+	selection := core.ActiveSelection{ID: "event-b", GameID: "game-a", SnapshotID: "snapshot-b", DeviceID: "computer-b", SelectedAt: time.Unix(1_700_000_000, 0).UTC()}
+	selectionData, err := json.Marshal(selection)
+	if err != nil {
+		t.Fatal(err)
+	}
+	snapshot := core.Snapshot{Version: 1, ID: "snapshot-b", GameID: "game-a", GameName: "Game A", DeviceID: "computer-a", CreatedAt: time.Unix(1_699_999_000, 0).UTC(), Files: []core.SnapshotFile{}}
+	snapshotData, err := json.Marshal(snapshot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	selectionKey := "games/game-a/active-selections/event-b.json"
+	snapshotKey := "games/game-a/snapshots/snapshot-b.json"
+	catalog := &remoteCatalogFake{
+		objects: []Object{{Key: selectionKey, Size: int64(len(selectionData))}, {Key: snapshotKey, Size: int64(len(snapshotData))}},
+		data:    map[string][]byte{selectionKey: selectionData, snapshotKey: snapshotData},
+	}
+	repository := &reconciliationRepoFake{}
+	result, err := NewReconciler(repository).Reconcile(context.Background(), catalog)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Snapshots != 1 || len(repository.snapshots) != 1 || len(repository.selections) != 1 || repository.selections[0] != selection {
+		t.Fatalf("remote selection or its backup version was not imported: result=%#v snapshots=%#v selections=%#v", result, repository.snapshots, repository.selections)
+	}
+}
+
+func TestReconcilerIgnoresOrphanedActiveSelectionEvent(t *testing.T) {
+	t.Parallel()
+	selection := core.ActiveSelection{ID: "event-old", GameID: "game-a", SnapshotID: "snapshot-deleted", DeviceID: "computer-b", SelectedAt: time.Unix(1_700_000_000, 0).UTC()}
+	data, err := json.Marshal(selection)
+	if err != nil {
+		t.Fatal(err)
+	}
+	key := "games/game-a/active-selections/event-old.json"
+	catalog := &remoteCatalogFake{objects: []Object{{Key: key, Size: int64(len(data))}}, data: map[string][]byte{key: data}}
+	repository := &reconciliationRepoFake{}
+	if _, err := NewReconciler(repository).Reconcile(context.Background(), catalog); err != nil {
+		t.Fatalf("orphan selection blocked reconciliation: %v", err)
+	}
+	if len(repository.selections) != 0 {
+		t.Fatalf("orphan event was imported: %#v", repository.selections)
 	}
 }
 

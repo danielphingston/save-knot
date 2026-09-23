@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"reflect"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -349,6 +350,129 @@ func TestRemapManualGameLinksCatalogWithoutReplacingCustomPaths(t *testing.T) {
 	}
 	if len(linkedPaths) != 1 || linkedPaths[0] != customPath {
 		t.Fatalf("manual catalog link changed custom paths: %#v", linkedPaths)
+	}
+}
+
+func TestCoordinatorRefusesToDeleteTheActiveSnapshot(t *testing.T) {
+	ctx := context.Background()
+	dataDir := t.TempDir()
+	paths := config.DataPaths(dataDir)
+	if err := config.Save(paths.Config, config.Config{Listen: "127.0.0.1:0", LocalBackupDir: filepath.Join(dataDir, "blobs"), RetentionKeep: 50, DeviceID: "device-a"}); err != nil {
+		t.Fatal(err)
+	}
+	application, err := Build(ctx, dataDir, "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if err := errors.Join(application.coordinator.Close(), application.database.Close()); err != nil {
+			t.Error(err)
+		}
+	})
+	game := core.Game{ID: "game-a", DisplayName: "Game A", Store: "custom", Enabled: false}
+	if err := application.database.UpsertGame(ctx, game); err != nil {
+		t.Fatal(err)
+	}
+	target := core.Snapshot{Version: 1, ID: "snapshot-active", GameID: game.ID, GameName: game.DisplayName, DeviceID: "device-a", CreatedAt: time.Now().UTC(), RemoteState: "local"}
+	if err := application.database.SaveSnapshot(ctx, target); err != nil {
+		t.Fatal(err)
+	}
+	if err := application.coordinator.SetActiveSnapshot(ctx, game.ID, target.ID); err != nil {
+		t.Fatal(err)
+	}
+	if err := application.coordinator.DeleteSnapshot(ctx, game.ID, target.ID, false); err == nil || !strings.Contains(err.Error(), "cannot delete the active snapshot") {
+		t.Fatalf("active snapshot deletion was not refused: %v", err)
+	}
+	if _, err := application.database.Snapshot(ctx, target.ID); err != nil {
+		t.Fatalf("active snapshot was removed: %v", err)
+	}
+}
+
+func TestCoordinatorSerializesActiveSelectionWithSnapshotDeletion(t *testing.T) {
+	ctx := context.Background()
+	dataDir := t.TempDir()
+	paths := config.DataPaths(dataDir)
+	if err := config.Save(paths.Config, config.Config{Listen: "127.0.0.1:0", LocalBackupDir: filepath.Join(dataDir, "blobs"), RetentionKeep: 50, DeviceID: "device-a"}); err != nil {
+		t.Fatal(err)
+	}
+	application, err := Build(ctx, dataDir, "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if err := errors.Join(application.coordinator.Close(), application.database.Close()); err != nil {
+			t.Error(err)
+		}
+	})
+	game := core.Game{ID: "game-race", DisplayName: "Game Race", Store: "custom"}
+	if err := application.database.UpsertGame(ctx, game); err != nil {
+		t.Fatal(err)
+	}
+	target := core.Snapshot{Version: 1, ID: "snapshot-race", GameID: game.ID, GameName: game.DisplayName, DeviceID: "device-a", CreatedAt: time.Now().UTC(), RemoteState: "local"}
+	if err := application.database.SaveSnapshot(ctx, target); err != nil {
+		t.Fatal(err)
+	}
+	start := make(chan struct{})
+	var wait sync.WaitGroup
+	wait.Add(2)
+	var selectErr, deleteErr error
+	go func() {
+		defer wait.Done()
+		<-start
+		selectErr = application.coordinator.SetActiveSnapshot(ctx, game.ID, target.ID)
+	}()
+	go func() {
+		defer wait.Done()
+		<-start
+		deleteErr = application.coordinator.DeleteSnapshot(ctx, game.ID, target.ID, false)
+	}()
+	close(start)
+	wait.Wait()
+	if selectErr == nil && deleteErr == nil {
+		t.Fatal("selection and deletion both succeeded for the same snapshot")
+	}
+	_, snapshotErr := application.database.Snapshot(ctx, target.ID)
+	if selectErr == nil && snapshotErr != nil {
+		t.Fatalf("selected snapshot was deleted concurrently: %v", snapshotErr)
+	}
+	if deleteErr == nil && snapshotErr == nil {
+		t.Fatal("snapshot deletion succeeded while selection was committed")
+	}
+}
+
+func TestRetentionPreservesSyncedSnapshotsUntilExplicitDeletion(t *testing.T) {
+	ctx := context.Background()
+	dataDir := t.TempDir()
+	paths := config.DataPaths(dataDir)
+	if err := config.Save(paths.Config, config.Config{Listen: "127.0.0.1:0", LocalBackupDir: filepath.Join(dataDir, "blobs"), RetentionKeep: 1, DeviceID: "device-a"}); err != nil {
+		t.Fatal(err)
+	}
+	application, err := Build(ctx, dataDir, "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if err := errors.Join(application.coordinator.Close(), application.database.Close()); err != nil {
+			t.Error(err)
+		}
+	})
+	game := core.Game{ID: "game-retention", DisplayName: "Game Retention", Store: "custom"}
+	if err := application.database.UpsertGame(ctx, game); err != nil {
+		t.Fatal(err)
+	}
+	old := core.Snapshot{Version: 1, ID: "snapshot-synced-old", GameID: game.ID, GameName: game.DisplayName, DeviceID: "device-a", CreatedAt: time.Unix(1_700_000_000, 0).UTC(), RemoteState: "synced"}
+	newer := core.Snapshot{Version: 1, ID: "snapshot-local-new", GameID: game.ID, GameName: game.DisplayName, DeviceID: "device-a", CreatedAt: time.Unix(1_700_000_100, 0).UTC(), RemoteState: "local"}
+	if err := application.database.SaveSnapshot(ctx, old); err != nil {
+		t.Fatal(err)
+	}
+	if err := application.database.SaveSnapshot(ctx, newer); err != nil {
+		t.Fatal(err)
+	}
+	if err := application.coordinator.applyRetention(ctx, game.ID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := application.database.Snapshot(ctx, old.ID); err != nil {
+		t.Fatalf("retention deleted synced snapshot: %v", err)
 	}
 }
 
