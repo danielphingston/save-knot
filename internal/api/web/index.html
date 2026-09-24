@@ -20,12 +20,12 @@
         <a href="#/activity" data-route="activity"><span aria-hidden="true">↻</span> Activity</a>
         <a href="#/settings" data-route="settings"><span aria-hidden="true">⚙</span> Settings</a>
       </nav>
-      <p id="live-status" class="live-status" role="status">Connecting to SaveKnot…</p><div class="rail-status">
+      <div class="rail-status">
         <span id="connection-dot" class="dot warn"></span>
         <div><strong id="connection-title">Local only</strong><small id="connection-detail">R2 not connected</small></div>
       </div>
     </aside>
-    <div class="workspace"><section id="updates" class="update-banner" aria-label="Background updates" hidden><span>New activity is available.</span><button class="button small" id="refresh-page">Refresh view</button></section><main id="app" tabindex="-1"></main></div>
+    <div class="workspace"><header class="app-topbar" aria-label="SaveKnot status"><span class="topbar-brand">LOCAL SAVE MONITOR</span><div class="topbar-state"><span class="topbar-chip"><i class="topbar-dot warn"></i><span id="topbar-r2">Checking cloud</span></span><span id="live-status" class="topbar-live" role="status">Connecting to SaveKnot…</span></div></header><section id="updates" class="update-banner" aria-label="Background updates" hidden><span>New activity is available.</span><button class="button small" id="refresh-page">Refresh view</button></section><main id="app" tabindex="-1"></main></div>
   </div>
   <div id="toast-region" class="toasts" aria-live="polite"></div>
   <script type="module" src="/app.js"></script>

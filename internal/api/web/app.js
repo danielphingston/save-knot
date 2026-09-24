@@ -1,4 +1,9 @@
 import { escapeHTML, formatBytes, formatTime, snapshotChanges, parseRoute, syncProgressValues, pageItems, api, filterGames, activityText } from './helpers.mjs';
+import { activityEvents, createAccentPreference, runNavigationUpdate } from './ui-behavior.mjs';
+
+const accents = ['lime', 'violet', 'coral'];
+const accentStorage = (() => { try { return window.localStorage; } catch { return null; } })();
+const accentPreference = createAccentPreference({ root: document.documentElement, storage: accentStorage, accents, fallback: 'lime' });
 
 const state = {
   games: [], ignoredGames: [], status: null, activity: [],
@@ -12,8 +17,19 @@ let pageVersion = 0;
 let sharedRequest;
 let detailVersion = 0;
 let activeDialog;
+let previousRoute;
+let pendingCardId = '';
+let libraryOrigin;
 const currentRoute = () => parseRoute(location.hash);
 const onLibrary = () => currentRoute().name === 'games';
+previousRoute = currentRoute();
+document.addEventListener('click', event => {
+  const card = event.target.closest('.game-card[data-game-id]');
+  if (!card || event.button !== 0 || event.metaKey || event.ctrlKey || event.shiftKey || event.altKey) return;
+  pendingCardId = card.dataset.gameId;
+  libraryOrigin = { gameId: pendingCardId, scrollY: window.scrollY };
+});
+
 
 function pagination(page, pages, total, label = 'items') {
   if (pages <= 1) return '';
@@ -65,6 +81,8 @@ function loadShared() {
     document.querySelector('#connection-dot').classList.toggle('warn', r2State !== 'verified');
     document.querySelector('#connection-title').textContent = { verified: 'R2 verified', unavailable: 'R2 unavailable', configured: 'R2 configured', disconnected: 'Local only' }[r2State];
     document.querySelector('#connection-detail').textContent = status.r2Configured ? status.r2.bucket : 'Backups stay on this device';
+    document.querySelector('#topbar-r2').textContent = { verified: 'R2 verified', unavailable: 'R2 unavailable', configured: 'R2 configured', disconnected: 'Local only' }[r2State];
+    document.querySelector('.topbar-dot').classList.toggle('warn', r2State !== 'verified');
   }).finally(() => { sharedRequest = null; });
   return sharedRequest;
 }
@@ -141,7 +159,7 @@ function gamesPage() {
     const page = pageItems(items, state.libraryPage, 36); state.libraryPage = page.page;
     const results = document.querySelector('#library-results');
     if (!results) return;
-    results.innerHTML = page.items.length ? `${pagination(page.page, page.pages, page.total, 'games')}${ignored ? `<div class="panel">${page.items.map(game => `<div class="row"><div><strong>${escapeHTML(game.displayName)}</strong><small>${game.store === 'custom' ? 'Removed custom game' : 'Ignored discovered game'} · ${countLabel(game.snapshotCount, 'snapshot')} preserved</small></div><button class="button small restore-game" data-game="${escapeHTML(game.id)}">Restore to library</button></div>`).join('')}</div>` : `<section class="games">${page.items.map(game => `<a class="game-card ${game.availableSources === 0 ? 'no-backup-source' : ''}" href="#/games/${encodeURIComponent(game.id)}"><div class="cover">${cover(game)}<span class="badge"><span class="dot ${game.enabled ? '' : 'warn'}"></span>${game.enabled ? 'Watching' : 'Manual backups'}</span></div><div class="card-body"><h2 title="${escapeHTML(game.displayName)}">${escapeHTML(game.displayName)}</h2>${game.availableSources === 0 ? `<p class="source-warning">${game.sourceCount === 0 ? 'No save locations found' : 'No save files found'} · open to fix</p>` : ''}<div class="card-meta"><span>${countLabel(game.snapshotCount, 'snapshot')} · ${formatBytes(game.storedSize)}</span><span>${escapeHTML(gameSyncLabel(game))}</span></div></div></a>`).join('')}</section>`}` : `<section class="empty filtered-empty"><div><div class="empty-mark">◇</div><h2>${ignored ? 'No ignored games match' : state.games.length ? 'No games match these filters' : 'Add your first game'}</h2><p class="subtle">${ignored ? 'Removed games stay here with their snapshots and customizations.' : state.games.length ? 'Try another search or clear the filters.' : 'Scan for installed games, or choose a save folder to start backing it up.'}</p>${ignored || state.games.length ? '<button class="button" id="clear-game-filters">Clear filters</button>' : '<button class="button primary" id="empty-add">Add a custom game</button>'}</div></section>`;
+    results.innerHTML = page.items.length ? `${pagination(page.page, page.pages, page.total, 'games')}${ignored ? `<div class="panel">${page.items.map(game => `<div class="row"><div><strong>${escapeHTML(game.displayName)}</strong><small>${game.store === 'custom' ? 'Removed custom game' : 'Ignored discovered game'} · ${countLabel(game.snapshotCount, 'snapshot')} preserved</small></div><button class="button small restore-game" data-game="${escapeHTML(game.id)}">Restore to library</button></div>`).join('')}</div>` : `<section class="games">${page.items.map(game => `<a class="game-card ${game.availableSources === 0 ? 'no-backup-source' : ''}" data-game-id="${escapeHTML(game.id)}" href="#/games/${encodeURIComponent(game.id)}"><div class="cover">${cover(game)}<span class="badge"><span class="dot ${game.enabled ? '' : 'warn'}"></span>${game.enabled ? 'Watching' : 'Manual backups'}</span></div><div class="card-body"><h2 title="${escapeHTML(game.displayName)}">${escapeHTML(game.displayName)}</h2>${game.availableSources === 0 ? `<p class="source-warning">${game.sourceCount === 0 ? 'No save locations found' : 'No save files found'} · open to fix</p>` : ''}<div class="card-meta"><span>${countLabel(game.snapshotCount, 'snapshot')} · ${formatBytes(game.storedSize)}</span><span>${escapeHTML(gameSyncLabel(game))}</span></div></div></a>`).join('')}</section>`}` : `<section class="empty filtered-empty"><div><div class="empty-mark">◇</div><h2>${ignored ? 'No ignored games match' : state.games.length ? 'No games match these filters' : 'Add your first game'}</h2><p class="subtle">${ignored ? 'Removed games stay here with their snapshots and customizations.' : state.games.length ? 'Try another search or clear the filters.' : 'Scan for installed games, or choose a save folder to start backing it up.'}</p>${ignored || state.games.length ? '<button class="button" id="clear-game-filters">Clear filters</button>' : '<button class="button primary" id="empty-add">Add a custom game</button>'}</div></section>`;
     results.querySelectorAll('[data-page]').forEach(button => button.addEventListener('click', () => { state.libraryPage = Number(button.dataset.page); renderResults(); document.querySelector('#game-search').focus(); }));
     results.querySelector('#empty-add')?.addEventListener('click', showAddGame);
     results.querySelector('#clear-game-filters')?.addEventListener('click', () => { state.gameFilters = { query: '', watcher: 'all', sync: 'all', snapshots: 'all' }; state.libraryPage = 0; gamesPage(); document.querySelector('#game-search').focus(); });
@@ -198,7 +216,7 @@ async function gamePage(id, snapshotPage = 0) {
   root.innerHTML = `
     <a class="subtle" href="#/games">← All games</a>
     <section class="detail-head section">
-      <div class="detail-cover">${cover(game)}</div>
+      <div class="detail-cover ${document.documentElement.dataset.navigationTransition === 'card' ? 'shared-game-art' : ''}">${cover(game)}</div>
       <div class="detail-copy">
         <p class="eyebrow">${escapeHTML(game.store)} ${game.storeId ? `· ${escapeHTML(game.storeId)}` : ''}</p>
         <h1>${escapeHTML(game.displayName)}</h1>
@@ -238,7 +256,7 @@ async function gamePage(id, snapshotPage = 0) {
     catch (error) { toast(error.message, true); button.disabled = false; }
   }));
   document.querySelectorAll('.remove-path').forEach(button => button.addEventListener('click', async () => {
-    if (!confirm('Remove this custom save location? Existing snapshots are not deleted.')) return;
+    if (!await confirmAction({ title: 'Remove save location?', description: 'Existing snapshots are not deleted.', action: 'Remove location', eyebrow: 'Save locations' })) return;
     button.disabled = true;
     try { await api(`/api/games/${encodeURIComponent(id)}/paths/${encodeURIComponent(button.dataset.path)}`, { method: 'DELETE' }); await gamePage(id); }
     catch (error) { toast(error.message, true); button.disabled = false; }
@@ -249,14 +267,14 @@ async function gamePage(id, snapshotPage = 0) {
     catch (error) { toast(error.message, true); button.disabled = false; }
   }));
   document.querySelectorAll('.restore').forEach(button => button.addEventListener('click', async () => {
-    if (!confirm('Restore this version? SaveKnot will snapshot your current files first.')) return;
+    if (!await confirmAction({ title: 'Restore this version?', description: 'SaveKnot will create a snapshot of your current files first.', action: 'Restore version', eyebrow: 'Restore backup' })) return;
     button.disabled = true;
     try { await api(`/api/games/${encodeURIComponent(id)}/restore/${encodeURIComponent(button.dataset.snapshot)}`, { method: 'POST', body: '{}' }); toast('Save restored; previous files were preserved as a snapshot'); await loadShared(); gamePage(id); }
     catch (error) { toast(error.message, true); button.disabled = false; }
   }));
   document.querySelectorAll('.delete-snapshot').forEach(button => button.addEventListener('click', async () => {
     const scope = button.dataset.remote === 'true' ? 'locally and from R2' : 'locally';
-    if (!confirm(`Permanently delete this snapshot ${scope}? Shared content blobs are retained safely.`)) return;
+    if (!await confirmAction({ title: 'Delete this snapshot?', description: `This permanently removes the snapshot ${scope}. Shared content blobs are retained safely.`, action: 'Delete snapshot', eyebrow: 'Delete backup' })) return;
     button.disabled = true;
     try { await api(`/api/games/${encodeURIComponent(id)}/snapshots/${encodeURIComponent(button.dataset.snapshot)}?remote=${button.dataset.remote}`, { method: 'DELETE' }); toast('Snapshot deleted'); await loadShared(); gamePage(id); }
     catch (error) { toast(error.message, true); button.disabled = false; }
@@ -298,6 +316,7 @@ function settingsPage(preserveDrafts = false) {
       : state.status.r2Configured ? 'Configured, but not yet verified by this version' : 'Not configured';
   root.innerHTML = `
     <header class="page-head"><div><p class="eyebrow">Make SaveKnot yours</p><h1>Settings</h1><p class="subtle">Control when backups move, how games are found, and where your data lives.</p></div></header>
+    <section class="appearance-panel" aria-labelledby="appearance-heading"><div><h2 id="appearance-heading">Accent color</h2><p class="subtle">Choose a highlight for your workspace. Saved on this device.</p></div><div class="accent-options" role="group" aria-label="Accent color">${accents.map(accent => `<button class="accent-choice accent-${accent}" type="button" data-accent-option="${accent}" aria-pressed="${accentPreference.current === accent}"><span class="accent-sample" aria-hidden="true"></span>${accent[0].toUpperCase()}${accent.slice(1)}</button>`).join('')}</div></section>
     <section class="settings-grid">
       <form class="settings-card settings-card-wide" id="automation-form"><div class="settings-card-head"><div><p class="eyebrow">Background tasks</p><h2>Automatic sync & discovery</h2><p class="subtle">These schedules are independent. Turn on only the help you want.</p></div><span class="status-pill">Runs on this device</span></div>
         <div class="automation-grid">
@@ -326,7 +345,15 @@ function settingsPage(preserveDrafts = false) {
         <details class="advanced-settings diagnostics-details"><summary>Troubleshooting details</summary><div class="callout">Catalog: ${catalog.loaded ? `${catalog.gameCount || 0} games ready` : `not ready${catalog.lastError ? ` · ${escapeHTML(catalog.lastError)}` : ''}`}<br>Installed games found: ${(discovery.steamInstalled || 0) + (discovery.epicInstalled || 0) + (discovery.gogInstalled || 0)}<br>Matched save definitions: ${discovery.catalogMatched || 0}<br>Found from local save data: ${discovery.localSaveGames || 0}<br>Added to library: ${discovery.gamesRegistered || 0}${(discovery.unmatched || []).length ? `<br>Not matched: ${discovery.unmatched.slice(0, 10).map(escapeHTML).join(', ')}` : ''}${discovery.lastError ? `<br>Error: ${escapeHTML(discovery.lastError)}` : ''}</div><p class="help">Last scan: ${escapeHTML(formatTime(discovery.lastRun))}</p></details>
         <div class="form-actions"><button class="button primary" type="button" id="settings-scan">Scan now</button></div>
       </div>
+
     </section>`;
+  const updateAccentChoices = () => root.querySelectorAll('[data-accent-option]').forEach(choice => choice.setAttribute('aria-pressed', String(choice.dataset.accentOption === accentPreference.current)));
+  root.querySelectorAll('[data-accent-option]').forEach(choice => choice.addEventListener('click', () => {
+    accentPreference.select(choice.dataset.accentOption);
+    updateAccentChoices();
+  }));
+  updateAccentChoices();
+
   document.querySelector('#automation-form').addEventListener('submit', async event => {
     event.preventDefault(); const form = new FormData(event.currentTarget); const button = event.submitter || event.currentTarget.querySelector('[type="submit"]'); button.disabled = true;
     try {
@@ -368,7 +395,7 @@ function settingsPage(preserveDrafts = false) {
     catch (error) { toast(error.message, true); button.disabled = false; }
   });
   document.querySelector('#disconnect-r2')?.addEventListener('click', async event => {
-    if (!confirm('Disconnect R2 from this device? Local snapshots and objects already stored in R2 will not be deleted.')) return;
+    if (!await confirmAction({ title: 'Disconnect R2?', description: 'Local snapshots and objects already stored in R2 will not be deleted.', action: 'Disconnect R2', eyebrow: 'Cloudflare R2' })) return;
     const button = event.currentTarget; button.disabled = true;
     try { await api('/api/r2', { method: 'DELETE' }); await loadShared(); if (button.isConnected) settingsPage(true); toast('R2 disconnected; local backups are unchanged'); }
     catch (error) { toast(error.message, true); button.disabled = false; }
@@ -395,7 +422,7 @@ async function activityPage() {
   try {
     const result = await api(`/api/activity?offset=${state.activityOffset}${state.activityUntil ? `&until=${encodeURIComponent(state.activityUntil)}` : ''}`);
     if (version !== pageVersion || request !== activityRequest) return;
-    state.activity = result.events; state.activityUntil = result.until;
+    state.activity = activityEvents(result.events); state.activityUntil = result.until;
     acknowledgeUpdates();
     root.innerHTML = `<header class="page-head"><div><p class="eyebrow">History on this device</p><h1>Activity</h1><p class="subtle">Events from the last 30 days, including previous sessions.</p></div><button class="button" id="refresh-activity">${activityDirty ? 'Show new activity' : 'Refresh activity'}</button></header>${pagination(Math.floor(state.activityOffset / 50), Math.max(1, Math.ceil(result.total / 50)), result.total, 'events')}<div class="panel" id="activity-list">${state.activity.length ? state.activity.map(activityRow).join('') : '<div class="row"><div><strong>Quiet for now</strong><small>Backup, restore, discovery and sync events will appear here.</small></div></div>'}</div>`;
     document.querySelector('#refresh-activity').addEventListener('click', () => { state.activityOffset = 0; state.activityUntil = ''; activityDirty = false; activityPage(); });
@@ -434,6 +461,22 @@ function modal(content) {
   document.body.append(element); activeDialog = element;
   queueMicrotask(() => { if (element.isConnected) { element.showModal(); (element.querySelector('[autofocus], form input, button'))?.focus(); } });
   return element;
+}
+function confirmAction({ title, description, action, eyebrow = 'Confirm action', danger = true }) {
+  const element = modal(`<div><p class="eyebrow">${escapeHTML(eyebrow)}</p><h2>${escapeHTML(title)}</h2><p class="subtle">${escapeHTML(description)}</p></div>`);
+  element.insertAdjacentHTML('beforeend', `<div class="form-actions"><button class="button" type="button" data-confirm-cancel autofocus>Cancel</button><button class="button ${danger ? 'danger' : 'primary'}" type="button" data-confirm-action>${escapeHTML(action)}</button></div>`);
+  return new Promise(resolve => {
+    let settled = false;
+    const finish = confirmed => {
+      if (settled) return;
+      settled = true;
+      element.closeModal();
+      resolve(confirmed);
+    };
+    element.querySelector('[data-confirm-cancel]').addEventListener('click', () => finish(false));
+    element.querySelector('[data-confirm-action]').addEventListener('click', () => finish(true));
+    element.addEventListener('close', () => { if (!settled) { settled = true; resolve(false); } }, { once: true });
+  });
 }
 
 function showAddGame() {
@@ -494,25 +537,57 @@ function showRemoveGame(game) {
   });
 }
 
+function withNavigationTransition(from, to, cardId, update, restorePosition) {
+  return runNavigationUpdate({
+    document, root: document, from, to, cardId,
+    reducedMotion: window.matchMedia('(prefers-reduced-motion: reduce)').matches,
+    update, restorePosition,
+  });
+}
+
 async function route() {
   const version = ++pageVersion;
   ++detailVersion;
   activeDialog?.closeModal();
   const target = currentRoute();
+  const cardId = pendingCardId;
+  const returnOrigin = target.name === 'games' && previousRoute?.name === 'game' && libraryOrigin?.gameId === previousRoute.id ? libraryOrigin : null;
+  const transitionCardId = returnOrigin?.gameId || cardId;
+  const restorePosition = returnOrigin ? () => window.scrollTo(0, returnOrigin.scrollY) : undefined;
   state.activity = [];
-  root.innerHTML = '<p class="loading" role="status">Loading SaveKnot…</p>';
-  try {
-    await loadShared();
+  try { await withNavigationTransition(previousRoute, target, transitionCardId, async () => {
     if (version !== pageVersion) return;
-    if (target.name === 'settings') settingsPage();
-    else if (target.name === 'activity') { state.activityOffset = 0; state.activityUntil = ''; await activityPage(); }
-    else if (target.name === 'game') await gamePage(target.id);
-    else gamesPage();
-    if (version !== pageVersion) return;
-    const focusTarget = target.focusR2 ? document.querySelector('#r2-form') : root;
-    focusTarget?.focus({ preventScroll: true });
-    if (target.focusR2) focusTarget?.scrollIntoView({ block: 'center' });
-  } catch (error) { if (version === pageVersion) showError(error); }
+    root.setAttribute('aria-busy', 'true');
+    root.innerHTML = '<p class="loading" role="status">Loading SaveKnot…</p>';
+    try {
+      await loadShared();
+      if (version !== pageVersion) return;
+      if (target.name === 'settings') settingsPage();
+      else if (target.name === 'activity') { state.activityOffset = 0; state.activityUntil = ''; await activityPage(); }
+      else if (target.name === 'game') {
+        await gamePage(target.id);
+        if (version === pageVersion) window.scrollTo(0, 0);
+      }
+      else gamesPage();
+      if (version !== pageVersion) return;
+      const focusTarget = target.focusR2 ? document.querySelector('#r2-form') : root;
+      focusTarget?.focus({ preventScroll: true });
+      if (target.focusR2) focusTarget?.scrollIntoView({ block: 'center' });
+    } finally {
+      if (version === pageVersion) root.removeAttribute('aria-busy');
+    }
+  }, restorePosition);
+  if (version === pageVersion) {
+    previousRoute = target;
+    pendingCardId = '';
+    if (returnOrigin) libraryOrigin = null;
+  }
+  } catch (error) {
+    if (version === pageVersion) {
+      root.removeAttribute('aria-busy');
+      showError(error);
+    }
+  }
 }
 
 // One live connection. History lives on the server and is read one page at a time.
