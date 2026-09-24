@@ -35,7 +35,7 @@ const (
 	maxImage    = 5 << 20
 )
 
-//go:embed web/index.html web/styles.css web/app.js web/helpers.mjs
+//go:embed web/index.html web/styles.css web/app.js web/helpers.mjs web/ui-behavior.mjs
 var webFiles embed.FS
 
 type gameReader interface {
