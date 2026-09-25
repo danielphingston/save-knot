@@ -740,6 +740,9 @@ func (c *Coordinator) Restore(ctx context.Context, gameID, snapshotID string) (c
 	if err != nil {
 		return core.Snapshot{}, err
 	}
+	if _, err := c.snapshots.ValidateRestoreScope(ctx, game, target); err != nil {
+		return core.Snapshot{}, err
+	}
 	needsDownload, err := c.syncer.NeedsDownload(ctx, target)
 	if err != nil {
 		return core.Snapshot{}, err

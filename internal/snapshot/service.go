@@ -448,9 +448,16 @@ func (s *Service) Restore(ctx context.Context, game core.Game, snapshotID string
 	if target.GameID != game.ID {
 		return core.Snapshot{}, errors.New("snapshot does not belong to this game")
 	}
+	registryRoots, err := s.ValidateRestoreScope(ctx, game, target)
+	if err != nil {
+		return core.Snapshot{}, err
+	}
 	preRestore, rollbackSnapshot, err := s.createRollbackSnapshot(ctx, game)
 	if err != nil {
 		return core.Snapshot{}, err
+	}
+	if _, err := s.ValidateRestoreScope(ctx, game, rollbackSnapshot); err != nil {
+		return core.Snapshot{}, fmt.Errorf("validate pre-restore registry scope: %w", err)
 	}
 	staged, err := s.stageRestoreFiles(ctx, game.ID, target)
 	if err != nil {
@@ -464,10 +471,6 @@ func (s *Service) Restore(ctx context.Context, game core.Game, snapshotID string
 	registryData, err := s.loadRestoreRegistry(ctx, target.Registry)
 	if err != nil {
 		return core.Snapshot{}, err
-	}
-	var registryRoots []string
-	if target.Registry != nil {
-		registryRoots = target.Registry.Keys
 	}
 	backups, err := s.activateAndRestore(ctx, target.Registry != nil, registryData, registryRoots, rollbackSnapshot, staged)
 	if err != nil {
@@ -639,6 +642,10 @@ func (s *Service) restorePreviousRegistry(ctx context.Context, snapshot core.Sna
 	if snapshot.Registry == nil {
 		return nil
 	}
+	registryRoots, err := s.ValidateRestoreScope(ctx, core.Game{ID: snapshot.GameID}, snapshot)
+	if err != nil {
+		return fmt.Errorf("validate rollback registry scope: %w", err)
+	}
 	blobPath, err := s.repository.BlobPath(ctx, snapshot.Registry.Hash)
 	if err != nil {
 		return fmt.Errorf("load pre-restore registry blob: %w", err)
@@ -647,7 +654,7 @@ func (s *Service) restorePreviousRegistry(ctx context.Context, snapshot core.Sna
 	if err != nil {
 		return fmt.Errorf("verify pre-restore registry blob: %w", err)
 	}
-	if err := (registrybackup.Service{}).Restore(ctx, data, snapshot.Registry.Keys); err != nil {
+	if err := (registrybackup.Service{}).Restore(ctx, data, registryRoots); err != nil {
 		return fmt.Errorf("roll back Windows registry: %w", err)
 	}
 	return nil
@@ -746,4 +753,50 @@ func removeTemporary(path string) error {
 		return nil
 	}
 	return err
+}
+
+const registryScopeMismatch = "snapshot registry scope does not match this game's configured registry paths"
+
+// ValidateRestoreScope checks registry paths from a snapshot against the
+// enabled registry paths configured on this device. Snapshot metadata may be
+// remote and must never grant broader registry access than local config.
+func (s *Service) ValidateRestoreScope(ctx context.Context, game core.Game, target core.Snapshot) ([]string, error) {
+	if target.GameID != game.ID {
+		return nil, errors.New("snapshot does not belong to this game")
+	}
+	if target.Registry == nil || len(target.Registry.Keys) == 0 {
+		return nil, nil
+	}
+	configured, err := s.sources.GameRegistry(ctx, game.ID)
+	if err != nil {
+		return nil, err
+	}
+	localRoots := make([]string, 0, len(configured))
+	for _, root := range configured {
+		if root.Enabled {
+			localRoots = append(localRoots, root.Path)
+		}
+	}
+	normalizedLocal, err := registrybackup.NormalizeRootPaths(localRoots)
+	if err != nil {
+		return nil, errors.New(registryScopeMismatch)
+	}
+	normalizedTarget, err := registrybackup.NormalizeRootPaths(target.Registry.Keys)
+	if err != nil {
+		return nil, errors.New(registryScopeMismatch)
+	}
+	allowed := uniqueRegistryRoots(normalizedLocal)
+	for _, root := range uniqueRegistryRoots(normalizedTarget) {
+		found := false
+		for _, candidate := range allowed {
+			if strings.EqualFold(root, candidate) {
+				found = true
+				break
+			}
+		}
+		if !found {
+			return nil, errors.New(registryScopeMismatch)
+		}
+	}
+	return uniqueRegistryRoots(normalizedTarget), nil
 }

@@ -1086,10 +1086,20 @@ func (s *Store) InvalidateBlobUploads(ctx context.Context, target string) error 
 
 // BlobRelocation records verified source and destination paths for a relocation.
 type BlobRelocation struct {
-	store *Store
-	items []blobRelocationItem
-	root  string
+	store            *Store
+	items            []blobRelocationItem
+	root             string
+	pendingUndo      []pendingBlobSourceRow
+	pendingUndoKeys  []pendingBlobSourceKey
+	pendingUndoReady bool
 }
+
+type pendingBlobSourceRow struct {
+	sourcePath, targetRoot, hash, replacementPath string
+	originalSize                                  int64
+}
+
+type pendingBlobSourceKey struct{ sourcePath, targetRoot, hash string }
 
 type blobRelocationItem struct {
 	hash, oldPath, newPath  string
@@ -1167,6 +1177,8 @@ func (s *Store) prepareRelocationItem(ctx context.Context, root string, item *bl
 }
 
 // Switch atomically sets all paths to either the destination or the source paths.
+//
+//nolint:gocognit // Keep the index and its cleanup journal in one transaction.
 func (r *BlobRelocation) Switch(ctx context.Context, toDestination bool) (err error) {
 	if r == nil || r.store == nil {
 		return errors.New("invalid blob relocation receipt")
@@ -1176,13 +1188,30 @@ func (r *BlobRelocation) Switch(ctx context.Context, toDestination bool) (err er
 		return fmt.Errorf("begin blob relocation switch: %w", err)
 	}
 	committed := false
+	var undoRows []pendingBlobSourceRow
+	var undoKeys []pendingBlobSourceKey
 	defer func() {
 		if !committed {
 			err = errors.Join(err, tx.Rollback())
 		}
 	}()
 	for _, item := range r.items {
+		var rows []pendingBlobSourceRow
+		var keys []pendingBlobSourceKey
+		if toDestination && !r.pendingUndoReady {
+			rows, keys, err = r.capturePendingSourceUndo(ctx, tx, item)
+			if err != nil {
+				return err
+			}
+		}
 		if err := r.switchRelocationItem(ctx, tx, item, toDestination); err != nil {
+			return err
+		}
+		undoRows = append(undoRows, rows...)
+		undoKeys = append(undoKeys, keys...)
+	}
+	if !toDestination && r.pendingUndoReady {
+		if err := r.restorePendingSources(ctx, tx); err != nil {
 			return err
 		}
 	}
@@ -1190,6 +1219,12 @@ func (r *BlobRelocation) Switch(ctx context.Context, toDestination bool) (err er
 		return fmt.Errorf("commit blob relocation switch: %w", err)
 	}
 	committed = true
+	if toDestination && !r.pendingUndoReady {
+		r.pendingUndo, r.pendingUndoKeys, r.pendingUndoReady = undoRows, undoKeys, true
+	}
+	if !toDestination && r.pendingUndoReady {
+		r.pendingUndo, r.pendingUndoKeys, r.pendingUndoReady = nil, nil, false
+	}
 	return nil
 }
 
@@ -1204,8 +1239,10 @@ func (r *BlobRelocation) switchRelocationItem(ctx context.Context, tx *sql.Tx, i
 	if item.oldPath == item.newPath {
 		return nil
 	}
-	if err := r.updatePendingSource(ctx, tx, item, toDestination); err != nil {
-		return err
+	if toDestination {
+		if err := r.updatePendingSource(ctx, tx, item, true); err != nil {
+			return err
+		}
 	}
 	if item.artifactID != "" {
 		state := "preparing"
@@ -1219,9 +1256,126 @@ func (r *BlobRelocation) switchRelocationItem(ctx context.Context, tx *sql.Tx, i
 	return nil
 }
 
+//nolint:gocognit // Snapshot collisions and source rows together for exact compensation.
+func (r *BlobRelocation) capturePendingSourceUndo(ctx context.Context, tx *sql.Tx, item blobRelocationItem) ([]pendingBlobSourceRow, []pendingBlobSourceKey, error) {
+	rows, err := tx.QueryContext(ctx, `SELECT source_path, target_root, hash, replacement_path, original_size FROM pending_blob_sources WHERE hash = ?`, item.hash)
+	if err != nil {
+		return nil, nil, fmt.Errorf("read pending source chain for blob %q: %w", item.hash, err)
+	}
+	var all []pendingBlobSourceRow
+	for rows.Next() {
+		var row pendingBlobSourceRow
+		if err := rows.Scan(&row.sourcePath, &row.targetRoot, &row.hash, &row.replacementPath, &row.originalSize); err != nil {
+			return nil, nil, errors.Join(err, rows.Close())
+		}
+		all = append(all, row)
+	}
+	if err := errors.Join(rows.Err(), rows.Close()); err != nil {
+		return nil, nil, err
+	}
+	var moved, before []pendingBlobSourceRow
+	for _, row := range all {
+		if !sameBlobPath(row.sourcePath, item.oldPath) && sameBlobPath(row.replacementPath, item.oldPath) {
+			moved = append(moved, row)
+		}
+	}
+	for _, row := range all {
+		for _, prior := range moved {
+			if row.sourcePath == prior.sourcePath && sameBlobPath(row.targetRoot, r.root) {
+				before = append(before, row)
+				break
+			}
+		}
+		if row.sourcePath == item.oldPath && sameBlobPath(row.targetRoot, r.root) {
+			before = append(before, row)
+		}
+	}
+	var keys []pendingBlobSourceKey
+	for _, row := range moved {
+		found := false
+		for _, prior := range before {
+			if prior.sourcePath == row.sourcePath && prior.targetRoot == row.targetRoot && prior.hash == row.hash {
+				found = true
+				break
+			}
+		}
+		if !found {
+			before = append(before, row)
+		}
+		keys = appendUniquePendingKey(keys, pendingBlobSourceKey{row.sourcePath, r.root, row.hash})
+	}
+	keys = appendUniquePendingKey(keys, pendingBlobSourceKey{item.oldPath, r.root, item.hash})
+	return before, keys, nil
+}
+
+func appendUniquePendingKey(keys []pendingBlobSourceKey, key pendingBlobSourceKey) []pendingBlobSourceKey {
+	for _, existing := range keys {
+		if existing == key {
+			return keys
+		}
+	}
+	return append(keys, key)
+}
+
+func (r *BlobRelocation) restorePendingSources(ctx context.Context, tx *sql.Tx) error {
+	for _, key := range r.pendingUndoKeys {
+		if _, err := tx.ExecContext(ctx, `DELETE FROM pending_blob_sources WHERE source_path = ? AND target_root = ? AND hash = ?`, key.sourcePath, key.targetRoot, key.hash); err != nil {
+			return fmt.Errorf("remove pending source created by relocation for %q: %w", key.sourcePath, err)
+		}
+	}
+	for _, row := range r.pendingUndo {
+		if _, err := tx.ExecContext(ctx, `INSERT INTO pending_blob_sources (source_path, target_root, hash, replacement_path, original_size) VALUES (?, ?, ?, ?, ?)`, row.sourcePath, row.targetRoot, row.hash, row.replacementPath, row.originalSize); err != nil {
+			return fmt.Errorf("restore pending source for %q: %w", row.sourcePath, err)
+		}
+	}
+	return nil
+}
+
+//nolint:gocognit,nestif // Retarget old rows and insert the immediate row in the switch transaction.
 func (r *BlobRelocation) updatePendingSource(ctx context.Context, tx *sql.Tx, item blobRelocationItem, toDestination bool) error {
 	if toDestination {
-		_, err := tx.ExecContext(ctx, `INSERT INTO pending_blob_sources (source_path, target_root, hash, replacement_path, original_size)
+		rows, err := tx.QueryContext(ctx, `SELECT source_path, target_root, hash, replacement_path, original_size FROM pending_blob_sources WHERE hash = ?`, item.hash)
+		if err != nil {
+			return fmt.Errorf("list pending sources for blob %q: %w", item.hash, err)
+		}
+		var all []pendingBlobSourceRow
+		for rows.Next() {
+			var row pendingBlobSourceRow
+			if err := rows.Scan(&row.sourcePath, &row.targetRoot, &row.hash, &row.replacementPath, &row.originalSize); err != nil {
+				return errors.Join(err, rows.Close())
+			}
+			all = append(all, row)
+		}
+		if err := errors.Join(rows.Err(), rows.Close()); err != nil {
+			return err
+		}
+		movedSources := make(map[string]bool)
+		for _, row := range all {
+			if !sameBlobPath(row.sourcePath, item.oldPath) && sameBlobPath(row.replacementPath, item.oldPath) {
+				movedSources[row.sourcePath] = true
+			}
+		}
+		for source := range movedSources {
+			for _, row := range all {
+				if row.sourcePath == source && (sameBlobPath(row.replacementPath, item.oldPath) || sameBlobPath(row.targetRoot, r.root)) {
+					if _, err := tx.ExecContext(ctx, `DELETE FROM pending_blob_sources WHERE source_path = ? AND target_root = ? AND hash = ?`, row.sourcePath, row.targetRoot, row.hash); err != nil {
+						return fmt.Errorf("retarget older pending source for blob %q: %w", item.hash, err)
+					}
+				}
+			}
+			var originalSize int64
+			for _, row := range all {
+				if row.sourcePath == source && sameBlobPath(row.replacementPath, item.oldPath) {
+					originalSize = row.originalSize
+					break
+				}
+			}
+			if _, err := tx.ExecContext(ctx, `INSERT INTO pending_blob_sources (source_path, target_root, hash, replacement_path, original_size) VALUES (?, ?, ?, ?, ?)
+				ON CONFLICT(source_path, target_root, hash) DO UPDATE SET replacement_path = excluded.replacement_path, original_size = excluded.original_size`, source, r.root, item.hash, item.newPath, originalSize); err != nil {
+				return fmt.Errorf("record retargeted pending source for blob %q: %w", item.hash, err)
+			}
+		}
+		_, err = tx.ExecContext(ctx, `INSERT INTO pending_blob_sources (source_path, target_root, hash, replacement_path, original_size)
 			VALUES (?, ?, ?, ?, ?) ON CONFLICT(source_path, target_root, hash) DO UPDATE SET
 			replacement_path = excluded.replacement_path, original_size = excluded.original_size`,
 			item.oldPath, r.root, item.hash, item.newPath, item.originalSize)

@@ -54,6 +54,94 @@ func TestRelocationCleanupRetriesAfterRestart(t *testing.T) {
 	assertPathExists(t, oldPath, "completed cleanup retained a stale pending deletion")
 }
 
+func TestRelocationCleanupFollowsTwoCommittedMovesAfterRestart(t *testing.T) {
+	ctx := context.Background()
+	root := t.TempDir()
+	dbPath := filepath.Join(root, "state.db")
+	store, err := Open(ctx, dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if err := store.Close(); err != nil {
+			t.Error(err)
+		}
+	})
+	hash, aPath, bPath, first := prepareRetryableRelocation(t, ctx, store, root)
+	savedSource, blocker := makeSourceUndeletable(t, root, aPath)
+	requireCleanupFailure(t, ctx, first)
+	assertPendingBlobSourceCount(t, ctx, store, 1)
+	restoreSource(t, aPath, savedSource, blocker)
+
+	cRoot := filepath.Join(root, "third")
+	cPath := filepath.Join(cRoot, hash[:2], hash+".zst")
+	second, err := store.PrepareBlobRelocation(ctx, cRoot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := second.Switch(ctx, true); err != nil {
+		t.Fatal(err)
+	}
+	if err := second.CleanupSources(ctx); err != nil {
+		t.Fatalf("clean up second committed move: %v", err)
+	}
+	assertBlobPath(t, ctx, store, hash, cPath, "second move changed the active index")
+	assertPathExists(t, cPath, "second move lost the active blob")
+
+	store, err = reopenRelocationRetryStore(t, ctx, store, dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.CleanupPendingBlobSources(ctx, cRoot); err != nil {
+		t.Fatalf("retry all obsolete sources for active root after restart: %v", err)
+	}
+	assertPathMissing(t, aPath, "first obsolete source remains after chained relocation")
+	assertPathMissing(t, bPath, "second obsolete source remains after chained relocation")
+	assertPathExists(t, cPath, "cleanup removed the current blob")
+	assertBlobPath(t, ctx, store, hash, cPath, "cleanup changed the active index")
+	assertPendingBlobSourceCount(t, ctx, store, 0)
+}
+
+func TestChainedRelocationRollbackRestoresOlderPendingSource(t *testing.T) {
+	ctx := context.Background()
+	root := t.TempDir()
+	store, err := Open(ctx, filepath.Join(root, "state.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if err := store.Close(); err != nil {
+			t.Error(err)
+		}
+	})
+	hash, aPath, bPath, first := prepareRetryableRelocation(t, ctx, store, root)
+	savedSource, blocker := makeSourceUndeletable(t, root, aPath)
+	requireCleanupFailure(t, ctx, first)
+	restoreSource(t, aPath, savedSource, blocker)
+
+	cRoot := filepath.Join(root, "third")
+	second, err := store.PrepareBlobRelocation(ctx, cRoot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := second.Switch(ctx, true); err != nil {
+		t.Fatal(err)
+	}
+	if err := second.Rollback(ctx); err != nil {
+		t.Fatalf("rollback second move: %v", err)
+	}
+	assertBlobPath(t, ctx, store, hash, bPath, "rollback did not restore the active path")
+	assertPathExists(t, bPath, "rollback removed the active source")
+	assertPendingBlobSourceCount(t, ctx, store, 1)
+	var source, target, replacement string
+	if err := store.db.QueryRowContext(ctx, `SELECT source_path, target_root, replacement_path FROM pending_blob_sources WHERE hash = ?`, hash).Scan(&source, &target, &replacement); err != nil {
+		t.Fatal(err)
+	}
+	if source != aPath || target != filepath.Join(root, "new") || replacement != bPath {
+		t.Fatalf("pending source after rollback = (%q, %q, %q), want (%q, %q, %q)", source, target, replacement, aPath, filepath.Join(root, "new"), bPath)
+	}
+}
+
 func TestRelocationCleanupRetriesReusedIndexedPathAfterReferenceMoves(t *testing.T) {
 	ctx := context.Background()
 	root := t.TempDir()
