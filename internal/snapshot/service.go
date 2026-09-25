@@ -456,8 +456,10 @@ func (s *Service) Restore(ctx context.Context, game core.Game, snapshotID string
 	if err != nil {
 		return core.Snapshot{}, err
 	}
-	if _, err := s.ValidateRestoreScope(ctx, game, rollbackSnapshot); err != nil {
-		return core.Snapshot{}, fmt.Errorf("validate pre-restore registry scope: %w", err)
+	if rollbackSnapshot.Registry != nil {
+		if _, err := s.ValidateRestoreScope(ctx, game, rollbackSnapshot); err != nil {
+			return core.Snapshot{}, fmt.Errorf("validate pre-restore registry scope: %w", err)
+		}
 	}
 	staged, err := s.stageRestoreFiles(ctx, game.ID, target)
 	if err != nil {
