@@ -68,6 +68,21 @@ func normalizeRoots(roots []string) ([]string, error) {
 	return normalized, nil
 }
 
+// NormalizeRootPaths parses registry roots with the same rules as backup and
+// restore validation, while accepting trailing separators for identity checks.
+func NormalizeRootPaths(roots []string) ([]string, error) {
+	normalized := make([]string, 0, len(roots))
+	for _, root := range roots {
+		root = strings.TrimRight(root, `/\`)
+		path, err := normalizePath(root)
+		if err != nil {
+			return nil, fmt.Errorf("invalid configured registry root %q: %w", root, err)
+		}
+		normalized = append(normalized, path)
+	}
+	return normalized, nil
+}
+
 func validateKeyData(key KeyData, roots []string, seenKeys map[string]struct{}) error {
 	normalized, err := normalizePath(key.Path)
 	if err != nil {

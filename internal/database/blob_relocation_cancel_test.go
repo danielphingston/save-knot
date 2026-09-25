@@ -53,18 +53,10 @@ func TestPrepareBlobRelocationCancellationRemovesCreatedDestination(t *testing.T
 	cancelObserved := make(chan struct{})
 	go func() {
 		defer close(cancelObserved)
-		for {
-			select {
-			case <-ctx.Done():
-				return
-			default:
-			}
-			if _, err := os.Stat(destination); err == nil {
-				cancel()
-				return
-			}
-			time.Sleep(time.Millisecond)
+		if err := waitForRelocationStaging(ctx, destination); err != nil && !errors.Is(err, context.Canceled) {
+			t.Errorf("wait for relocation staging file: %v", err)
 		}
+		cancel()
 	}()
 
 	_, err = store.PrepareBlobRelocation(ctx, newRoot)
@@ -81,5 +73,24 @@ func TestPrepareBlobRelocationCancellationRemovesCreatedDestination(t *testing.T
 	}
 	if _, err := os.Stat(destination); !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("created destination remains after canceled prepare: %v", err)
+	}
+}
+
+func waitForRelocationStaging(ctx context.Context, destination string) error {
+	ticker := time.NewTicker(time.Millisecond)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-ticker.C:
+			stagingFiles, err := filepath.Glob(destination + ".prepare-*")
+			if err != nil {
+				return err
+			}
+			if len(stagingFiles) != 0 {
+				return nil
+			}
+		}
 	}
 }

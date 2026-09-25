@@ -8,7 +8,66 @@ import (
 	"testing"
 
 	"github.com/saveknot/saveknot/internal/config"
+	"github.com/saveknot/saveknot/internal/database"
 )
+
+type cleanupFailureRepository struct {
+	repository
+	store *database.Store
+}
+
+func (r cleanupFailureRepository) PrepareLocalBlobRelocation(ctx context.Context, root string) (localBlobRelocation, error) {
+	receipt, err := r.store.PrepareBlobRelocation(ctx, root)
+	if err != nil {
+		return nil, err
+	}
+	return cleanupFailureReceipt{localBlobRelocation: receipt}, nil
+}
+
+type cleanupFailureReceipt struct{ localBlobRelocation }
+
+func (cleanupFailureReceipt) CleanupSources(context.Context) error {
+	return errors.New("source is temporarily in use")
+}
+
+func TestConfigureLocalCommitsSuccessfulSwitchDespiteSourceCleanupFailure(t *testing.T) {
+	application, paths := buildBackupTestApplication(t)
+	ctx := context.Background()
+	game, _ := contractGame(t, application, paths.Root, "locked-old-source")
+	snapshot, err := application.coordinator.Backup(ctx, game.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	hash := snapshot.Files[0].Hash
+	oldPath, err := application.database.BlobPath(ctx, hash)
+	if err != nil {
+		t.Fatal(err)
+	}
+	application.coordinator.repository = cleanupFailureRepository{
+		repository: application.coordinator.repository,
+		store:      application.database,
+	}
+	newRoot := filepath.Join(paths.Root, "new-backup-location")
+	if err := application.coordinator.ConfigureLocal(ctx, config.Local{LocalBackupDir: newRoot}); err != nil {
+		t.Fatalf("committed location switch reported a failure after cleanup error: %v", err)
+	}
+	newPath := filepath.Join(newRoot, hash[:2], hash+".zst")
+	if got, err := application.database.BlobPath(ctx, hash); err != nil || got != newPath {
+		t.Fatalf("indexed path = %q, err=%v; want %q", got, err, newPath)
+	}
+	if got := application.coordinator.settings.Config().LocalBackupDir; got != newRoot {
+		t.Fatalf("saved location = %q; want %q", got, newRoot)
+	}
+	if got := application.coordinator.snapshots.BlobRoot(); got != newRoot {
+		t.Fatalf("writer location = %q; want %q", got, newRoot)
+	}
+	if _, err := os.Stat(newPath); err != nil {
+		t.Fatalf("new indexed blob missing: %v", err)
+	}
+	if _, err := os.Stat(oldPath); err != nil {
+		t.Fatalf("failed cleanup unexpectedly removed old source: %v", err)
+	}
+}
 
 func TestConfigureLocalRemovesOldBlobOnlyAfterSuccessfulSwitch(t *testing.T) {
 	application, paths := buildBackupTestApplication(t)

@@ -144,7 +144,59 @@ func sameContents(left, right core.Snapshot) bool {
 			return false
 		}
 	}
-	return left.Registry == nil || left.Registry.Hash == right.Registry.Hash
+	if left.Registry == nil {
+		return true
+	}
+	if left.Registry.Hash != right.Registry.Hash {
+		return false
+	}
+	return sameRegistryRoots(left.Registry.Keys, right.Registry.Keys)
+}
+
+func sameRegistryRoots(left, right []string) bool {
+	normalizedLeft, err := registrybackup.NormalizeRootPaths(left)
+	if err != nil {
+		return false
+	}
+	normalizedRight, err := registrybackup.NormalizeRootPaths(right)
+	if err != nil {
+		return false
+	}
+	uniqueLeft := uniqueRegistryRoots(normalizedLeft)
+	uniqueRight := uniqueRegistryRoots(normalizedRight)
+	if len(uniqueLeft) != len(uniqueRight) {
+		return false
+	}
+	for _, root := range uniqueLeft {
+		found := false
+		for _, candidate := range uniqueRight {
+			if strings.EqualFold(root, candidate) {
+				found = true
+				break
+			}
+		}
+		if !found {
+			return false
+		}
+	}
+	return true
+}
+
+func uniqueRegistryRoots(roots []string) []string {
+	unique := make([]string, 0, len(roots))
+	for _, root := range roots {
+		seen := false
+		for _, existing := range unique {
+			if strings.EqualFold(root, existing) {
+				seen = true
+				break
+			}
+		}
+		if !seen {
+			unique = append(unique, root)
+		}
+	}
+	return unique
 }
 
 func (s *Service) addRegistry(ctx context.Context, gameID string, snapshot *core.Snapshot, storedBlobs map[string]int64) error {

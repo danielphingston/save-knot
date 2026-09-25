@@ -582,7 +582,7 @@ func (c *Coordinator) ConfigureLocal(ctx context.Context, local config.Local) er
 	c.snapshots.SetBlobRoot(newRoot)
 	if receipt != nil {
 		if err := receipt.CleanupSources(ctx); err != nil {
-			return fmt.Errorf("remove obsolete local backup blobs: %w", err)
+			slog.Warn("remove obsolete local backup blobs", "error", err)
 		}
 	}
 	c.ReconcileWatches(ctx)

@@ -12,6 +12,7 @@ import (
 	"math"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"time"
 
@@ -109,6 +110,26 @@ func (s *Store) initialize(ctx context.Context) error {
 			original_size INTEGER NOT NULL,
 			stored_size INTEGER NOT NULL,
 			uploaded_to TEXT NOT NULL DEFAULT ''
+		)`,
+		`CREATE TABLE IF NOT EXISTS pending_blob_sources (
+			source_path TEXT NOT NULL,
+			target_root TEXT NOT NULL,
+			hash TEXT NOT NULL,
+			replacement_path TEXT NOT NULL,
+			original_size INTEGER NOT NULL,
+			PRIMARY KEY(source_path, target_root, hash)
+		)`,
+		`CREATE TABLE IF NOT EXISTS relocation_artifacts (
+			artifact_id TEXT PRIMARY KEY,
+			hash TEXT NOT NULL,
+			source_path TEXT NOT NULL,
+			target_root TEXT NOT NULL,
+			destination_path TEXT NOT NULL,
+			staging_path TEXT NOT NULL,
+			original_size INTEGER NOT NULL,
+			staging_owned INTEGER NOT NULL DEFAULT 0,
+			finalized_by_rename INTEGER NOT NULL DEFAULT 0,
+			state TEXT NOT NULL
 		)`,
 		`CREATE TABLE IF NOT EXISTS diagnostic_cache (
 			id INTEGER PRIMARY KEY CHECK (id = 1),
@@ -1067,21 +1088,36 @@ func (s *Store) InvalidateBlobUploads(ctx context.Context, target string) error 
 type BlobRelocation struct {
 	store *Store
 	items []blobRelocationItem
+	root  string
 }
 
 type blobRelocationItem struct {
-	hash, oldPath, newPath string
-	originalSize           int64
-	created                bool
+	hash, oldPath, newPath  string
+	originalSize            int64
+	artifactID, stagingPath string
 }
 
 // PrepareBlobRelocation copies and verifies indexed blobs without changing the database.
 func (s *Store) PrepareBlobRelocation(ctx context.Context, root string) (*BlobRelocation, error) {
+	items, err := s.listBlobsForRelocation(ctx)
+	if err != nil {
+		return nil, err
+	}
+	receipt := &BlobRelocation{store: s, items: items, root: filepath.Clean(root)}
+	for i := range receipt.items {
+		if err := s.prepareRelocationItem(ctx, receipt.root, &receipt.items[i]); err != nil {
+			return nil, errors.Join(err, receipt.cleanupDestinationsAfterFailure(ctx))
+		}
+	}
+	return receipt, nil
+}
+
+func (s *Store) listBlobsForRelocation(ctx context.Context) ([]blobRelocationItem, error) {
 	rows, err := s.db.QueryContext(ctx, `SELECT hash, local_path, original_size FROM blobs`)
 	if err != nil {
 		return nil, fmt.Errorf("list blobs for relocation: %w", err)
 	}
-	receipt := &BlobRelocation{store: s}
+	var items []blobRelocationItem
 	for rows.Next() {
 		var item blobRelocationItem
 		if err := rows.Scan(&item.hash, &item.oldPath, &item.originalSize); err != nil {
@@ -1091,24 +1127,43 @@ func (s *Store) PrepareBlobRelocation(ctx context.Context, root string) (*BlobRe
 			return nil, errors.Join(fmt.Errorf("invalid blob hash %q", item.hash), rows.Close())
 		}
 		item.oldPath = filepath.Clean(item.oldPath)
-		item.newPath = filepath.Join(root, item.hash[:2], item.hash+".zst")
-		receipt.items = append(receipt.items, item)
+		items = append(items, item)
 	}
 	if err := errors.Join(rows.Err(), rows.Close()); err != nil {
 		return nil, err
 	}
-	for i := range receipt.items {
-		item := &receipt.items[i]
-		created, err := relocateBlobTracked(ctx, item.hash, item.oldPath, item.newPath, item.originalSize)
-		if err != nil {
-			return nil, errors.Join(err, receipt.cleanupDestinationsAfterFailure(ctx))
+	return items, nil
+}
+
+func (s *Store) prepareRelocationItem(ctx context.Context, root string, item *blobRelocationItem) error {
+	item.newPath = filepath.Join(root, item.hash[:2], item.hash+".zst")
+	if sameBlobPath(item.oldPath, item.newPath) {
+		if err := verifyBlobFile(item.newPath, item.hash, item.originalSize); err != nil {
+			return fmt.Errorf("indexed blob %q is invalid: %w", item.hash, err)
 		}
-		item.created = created
-		if err := ctx.Err(); err != nil {
-			return nil, errors.Join(err, receipt.cleanupDestinationsAfterFailure(ctx))
-		}
+		return nil
 	}
-	return receipt, nil
+	artifactID, err := core.NewID(time.Now().UTC())
+	if err != nil {
+		return fmt.Errorf("record relocation artifact for blob %q: %w", item.hash, err)
+	}
+	item.artifactID = artifactID
+	item.stagingPath = item.newPath + ".prepare-" + artifactID
+	// The durable journal reserves this unique staging name before O_EXCL creates it.
+	// Recovery deletes the final path only when it shares an inode with this stage.
+	if _, err := s.db.ExecContext(ctx, `INSERT INTO relocation_artifacts
+		(artifact_id, hash, source_path, target_root, destination_path, staging_path, original_size, staging_owned, state)
+		VALUES (?, ?, ?, ?, ?, ?, ?, 0, 'preparing')`, item.artifactID, item.hash, item.oldPath, root,
+		item.newPath, item.stagingPath, item.originalSize); err != nil {
+		return fmt.Errorf("journal relocation artifact for blob %q: %w", item.hash, err)
+	}
+	if err := s.relocateBlobStaged(ctx, item.hash, item.oldPath, item.newPath, item.stagingPath, item.artifactID, item.originalSize); err != nil {
+		return fmt.Errorf("prepare replacement for blob %q: %w", item.hash, err)
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	return nil
 }
 
 // Switch atomically sets all paths to either the destination or the source paths.
@@ -1127,12 +1182,8 @@ func (r *BlobRelocation) Switch(ctx context.Context, toDestination bool) (err er
 		}
 	}()
 	for _, item := range r.items {
-		target := item.oldPath
-		if toDestination {
-			target = item.newPath
-		}
-		if _, err := tx.ExecContext(ctx, `UPDATE blobs SET local_path = ? WHERE hash = ?`, target, item.hash); err != nil {
-			return fmt.Errorf("switch blob %q path: %w", item.hash, err)
+		if err := r.switchRelocationItem(ctx, tx, item, toDestination); err != nil {
+			return err
 		}
 	}
 	if err := tx.Commit(); err != nil {
@@ -1142,30 +1193,219 @@ func (r *BlobRelocation) Switch(ctx context.Context, toDestination bool) (err er
 	return nil
 }
 
+func (r *BlobRelocation) switchRelocationItem(ctx context.Context, tx *sql.Tx, item blobRelocationItem, toDestination bool) error {
+	target := item.oldPath
+	if toDestination {
+		target = item.newPath
+	}
+	if _, err := tx.ExecContext(ctx, `UPDATE blobs SET local_path = ? WHERE hash = ?`, target, item.hash); err != nil {
+		return fmt.Errorf("switch blob %q path: %w", item.hash, err)
+	}
+	if item.oldPath == item.newPath {
+		return nil
+	}
+	if err := r.updatePendingSource(ctx, tx, item, toDestination); err != nil {
+		return err
+	}
+	if item.artifactID != "" {
+		state := "preparing"
+		if toDestination {
+			state = "committed"
+		}
+		if _, err := tx.ExecContext(ctx, `UPDATE relocation_artifacts SET state = ? WHERE artifact_id = ?`, state, item.artifactID); err != nil {
+			return fmt.Errorf("update relocation artifact for blob %q: %w", item.hash, err)
+		}
+	}
+	return nil
+}
+
+func (r *BlobRelocation) updatePendingSource(ctx context.Context, tx *sql.Tx, item blobRelocationItem, toDestination bool) error {
+	if toDestination {
+		_, err := tx.ExecContext(ctx, `INSERT INTO pending_blob_sources (source_path, target_root, hash, replacement_path, original_size)
+			VALUES (?, ?, ?, ?, ?) ON CONFLICT(source_path, target_root, hash) DO UPDATE SET
+			replacement_path = excluded.replacement_path, original_size = excluded.original_size`,
+			item.oldPath, r.root, item.hash, item.newPath, item.originalSize)
+		if err != nil {
+			return fmt.Errorf("record obsolete source for blob %q: %w", item.hash, err)
+		}
+		return nil
+	}
+	if _, err := tx.ExecContext(ctx, `DELETE FROM pending_blob_sources WHERE source_path = ? AND target_root = ? AND hash = ?`, item.oldPath, r.root, item.hash); err != nil {
+		return fmt.Errorf("cancel obsolete source cleanup for blob %q: %w", item.hash, err)
+	}
+	return nil
+}
+
 // CleanupSources removes obsolete source files after replacements are indexed and verified.
 func (r *BlobRelocation) CleanupSources(ctx context.Context) error {
+	return r.store.CleanupPendingBlobSources(ctx, r.root)
+}
+
+// CleanupPendingBlobSources retries source removals recorded by a committed relocation.
+// When activeRoots is supplied, entries for a different configured root are left untouched.
+func (s *Store) CleanupPendingBlobSources(ctx context.Context, activeRoots ...string) error {
+	if len(activeRoots) > 1 {
+		return errors.New("cleanup accepts at most one active blob root")
+	}
 	var result error
-	for _, item := range r.items {
-		if item.oldPath == item.newPath {
+	result = errors.Join(result, s.cleanupRelocationArtifacts(ctx))
+	activeRoot := ""
+	if len(activeRoots) == 1 {
+		activeRoot = filepath.Clean(activeRoots[0])
+	}
+	rows, err := s.db.QueryContext(ctx, `SELECT source_path, target_root, hash, replacement_path, original_size FROM pending_blob_sources`)
+	if err != nil {
+		return fmt.Errorf("list pending blob source cleanup: %w", err)
+	}
+	type pendingSource struct {
+		sourcePath, targetRoot, hash, replacementPath string
+		originalSize                                  int64
+	}
+	var pending []pendingSource
+	for rows.Next() {
+		var item pendingSource
+		if err := rows.Scan(&item.sourcePath, &item.targetRoot, &item.hash, &item.replacementPath, &item.originalSize); err != nil {
+			return errors.Join(fmt.Errorf("scan pending blob source cleanup: %w", err), rows.Close())
+		}
+		pending = append(pending, item)
+	}
+	if err := errors.Join(rows.Err(), rows.Close()); err != nil {
+		return fmt.Errorf("read pending blob source cleanup: %w", err)
+	}
+	for _, item := range pending {
+		if activeRoot != "" && !sameBlobPath(activeRoot, item.targetRoot) {
 			continue
 		}
-		indexed, err := r.store.BlobPath(ctx, item.hash)
-		if err != nil {
-			result = errors.Join(result, fmt.Errorf("confirm relocated blob %q: %w", item.hash, err))
-			continue
-		}
-		if filepath.Clean(indexed) != filepath.Clean(item.newPath) {
-			continue
-		}
-		if err := verifyBlobFile(item.newPath, item.hash, item.originalSize); err != nil {
-			result = errors.Join(result, fmt.Errorf("verify indexed replacement for blob %q: %w", item.hash, err))
-			continue
-		}
-		if err := r.store.removeIfUnindexed(ctx, item.oldPath); err != nil {
+		if err := s.cleanupPendingBlobSource(ctx, item.sourcePath, item.targetRoot, item.hash, item.replacementPath, item.originalSize); err != nil {
 			result = errors.Join(result, err)
 		}
 	}
 	return result
+}
+
+func (s *Store) cleanupPendingBlobSource(ctx context.Context, sourcePath, targetRoot, hash, replacementPath string, originalSize int64) (err error) {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("begin cleanup for obsolete blob %q: %w", sourcePath, err)
+	}
+	committed := false
+	defer func() {
+		if !committed {
+			err = errors.Join(err, tx.Rollback())
+		}
+	}()
+	// Acquire SQLite's write lock before checking references so a concurrent path switch
+	// cannot make the source live between the check and os.Remove.
+	if _, err := tx.ExecContext(ctx, `UPDATE pending_blob_sources SET source_path = source_path
+		WHERE source_path = ? AND target_root = ? AND hash = ?`, sourcePath, targetRoot, hash); err != nil {
+		return fmt.Errorf("lock pending source %q for cleanup: %w", sourcePath, err)
+	}
+	var indexed string
+	if err := tx.QueryRowContext(ctx, `SELECT local_path FROM blobs WHERE hash = ?`, hash).Scan(&indexed); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil
+		}
+		return fmt.Errorf("confirm replacement for obsolete blob %q: %w", sourcePath, err)
+	}
+	if !sameBlobPath(indexed, replacementPath) || !pathWithinRoot(indexed, targetRoot) {
+		return nil
+	}
+	if err := verifyBlobFile(indexed, hash, originalSize); err != nil {
+		return fmt.Errorf("verify indexed replacement for blob %q: %w", hash, err)
+	}
+	sharesReplacement, err := samePhysicalFile(sourcePath, indexed)
+	if err != nil {
+		return fmt.Errorf("compare obsolete source %q with replacement %q: %w", sourcePath, indexed, err)
+	}
+	if sharesReplacement {
+		return s.finishPendingBlobSource(ctx, tx, sourcePath, targetRoot, hash, &committed)
+	}
+	referenced, err := s.hasIndexedBlobPathReference(ctx, tx, sourcePath)
+	if err != nil {
+		return err
+	}
+	if referenced {
+		return nil
+	}
+	if err := os.Remove(sourcePath); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return fmt.Errorf("remove obsolete blob %q: %w", sourcePath, err)
+	}
+	return s.finishPendingBlobSource(ctx, tx, sourcePath, targetRoot, hash, &committed)
+}
+
+func (s *Store) hasIndexedBlobPathReference(ctx context.Context, tx *sql.Tx, sourcePath string) (bool, error) {
+	rows, err := tx.QueryContext(ctx, `SELECT local_path FROM blobs`)
+	if err != nil {
+		return false, fmt.Errorf("list indexed blob paths while cleaning %q: %w", sourcePath, err)
+	}
+	var indexedPaths []string
+	for rows.Next() {
+		var indexedPath string
+		if err := rows.Scan(&indexedPath); err != nil {
+			return false, errors.Join(fmt.Errorf("scan indexed blob path for %q: %w", sourcePath, err), rows.Close())
+		}
+		indexedPaths = append(indexedPaths, indexedPath)
+	}
+	if err := errors.Join(rows.Err(), rows.Close()); err != nil {
+		return false, fmt.Errorf("read indexed blob paths while cleaning %q: %w", sourcePath, err)
+	}
+	for _, indexedPath := range indexedPaths {
+		if sameBlobPath(sourcePath, indexedPath) {
+			return true, nil
+		}
+		sameFile, err := samePhysicalFile(sourcePath, indexedPath)
+		if err != nil {
+			return false, fmt.Errorf("compare obsolete source %q with indexed path %q: %w", sourcePath, indexedPath, err)
+		}
+		if sameFile {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
+func (s *Store) finishPendingBlobSource(ctx context.Context, tx *sql.Tx, sourcePath, targetRoot, hash string, committed *bool) error {
+	if _, err := tx.ExecContext(ctx, `DELETE FROM pending_blob_sources WHERE source_path = ? AND target_root = ? AND hash = ?`, sourcePath, targetRoot, hash); err != nil {
+		return fmt.Errorf("complete source cleanup for %q: %w", sourcePath, err)
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("commit source cleanup for %q: %w", sourcePath, err)
+	}
+	*committed = true
+	return nil
+}
+
+// Stat follows symlinks and directory junctions; SameFile compares their resolved file identities.
+func samePhysicalFile(left, right string) (bool, error) {
+	leftInfo, err := os.Stat(left)
+	if errors.Is(err, os.ErrNotExist) {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	rightInfo, err := os.Stat(right)
+	if errors.Is(err, os.ErrNotExist) {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	return os.SameFile(leftInfo, rightInfo), nil
+}
+
+func sameBlobPath(left, right string) bool {
+	left = filepath.Clean(left)
+	right = filepath.Clean(right)
+	if runtime.GOOS == "windows" {
+		return strings.EqualFold(left, right)
+	}
+	return left == right
+}
+
+func pathWithinRoot(path, root string) bool {
+	rel, err := filepath.Rel(filepath.Clean(root), filepath.Clean(path))
+	return err == nil && rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator)) && !filepath.IsAbs(rel)
 }
 
 // Rollback restores source paths before removing only destinations created by this attempt.
@@ -1181,38 +1421,149 @@ func (r *BlobRelocation) Rollback(ctx context.Context) error {
 func (r *BlobRelocation) cleanupDestinations(ctx context.Context) error {
 	var result error
 	for _, item := range r.items {
-		if !item.created || item.oldPath == item.newPath {
+		if item.artifactID == "" {
 			continue
 		}
-		if err := r.store.removeIfUnindexed(ctx, item.newPath); err != nil {
+		if err := r.store.cleanupRelocationArtifact(ctx, item.artifactID); err != nil {
 			result = errors.Join(result, err)
 		}
 	}
 	return result
 }
 
-func (s *Store) removeIfUnindexed(ctx context.Context, path string) error {
-	rows, err := s.db.QueryContext(ctx, `SELECT local_path FROM blobs`)
+func (s *Store) cleanupRelocationArtifacts(ctx context.Context) error {
+	rows, err := s.db.QueryContext(ctx, `SELECT artifact_id FROM relocation_artifacts`)
 	if err != nil {
-		return fmt.Errorf("check blob path references for %q: %w", path, err)
+		return fmt.Errorf("list relocation artifacts: %w", err)
 	}
-	cleanPath := filepath.Clean(path)
+	var artifactIDs []string
 	for rows.Next() {
-		var indexedPath string
-		if err := rows.Scan(&indexedPath); err != nil {
-			return errors.Join(fmt.Errorf("check blob path references for %q: %w", path, err), rows.Close())
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			return errors.Join(fmt.Errorf("scan relocation artifact: %w", err), rows.Close())
 		}
-		if strings.EqualFold(filepath.Clean(indexedPath), cleanPath) {
-			return rows.Close()
-		}
+		artifactIDs = append(artifactIDs, id)
 	}
 	if err := errors.Join(rows.Err(), rows.Close()); err != nil {
-		return fmt.Errorf("check blob path references for %q: %w", path, err)
+		return fmt.Errorf("read relocation artifacts: %w", err)
 	}
-	if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
-		return fmt.Errorf("remove obsolete blob %q: %w", path, err)
+	var result error
+	for _, id := range artifactIDs {
+		if err := s.cleanupRelocationArtifact(ctx, id); err != nil {
+			result = errors.Join(result, err)
+		}
+	}
+	return result
+}
+
+type relocationArtifact struct {
+	id, hash, sourcePath, destinationPath, stagingPath, state string
+	originalSize                                              int64
+	stagingOwned, finalizedByRename                           bool
+}
+
+func (s *Store) cleanupRelocationArtifact(ctx context.Context, artifactID string) (err error) {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("begin cleanup for relocation artifact %q: %w", artifactID, err)
+	}
+	committed := false
+	defer func() {
+		if !committed {
+			err = errors.Join(err, tx.Rollback())
+		}
+	}()
+	if _, err := tx.ExecContext(ctx, `UPDATE relocation_artifacts SET artifact_id = artifact_id WHERE artifact_id = ?`, artifactID); err != nil {
+		return fmt.Errorf("lock relocation artifact %q: %w", artifactID, err)
+	}
+	artifact, err := readRelocationArtifact(ctx, tx, artifactID)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil
+		}
+		return fmt.Errorf("read relocation artifact %q: %w", artifactID, err)
+	}
+	if artifact.stagingOwned {
+		if err := s.removeRelocationArtifactFiles(ctx, tx, artifact); err != nil {
+			return err
+		}
+	}
+	if _, err := tx.ExecContext(ctx, `DELETE FROM relocation_artifacts WHERE artifact_id = ?`, artifactID); err != nil {
+		return fmt.Errorf("complete cleanup for relocation artifact %q: %w", artifactID, err)
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("commit cleanup for relocation artifact %q: %w", artifactID, err)
+	}
+	committed = true
+	return nil
+}
+
+func readRelocationArtifact(ctx context.Context, tx *sql.Tx, artifactID string) (relocationArtifact, error) {
+	var artifact relocationArtifact
+	var stagingOwned, finalizedByRename int
+	if err := tx.QueryRowContext(ctx, `SELECT artifact_id, hash, source_path, destination_path, staging_path, original_size, staging_owned, finalized_by_rename, state
+		FROM relocation_artifacts WHERE artifact_id = ?`, artifactID).Scan(
+		&artifact.id, &artifact.hash, &artifact.sourcePath, &artifact.destinationPath, &artifact.stagingPath,
+		&artifact.originalSize, &stagingOwned, &finalizedByRename, &artifact.state); err != nil {
+		return relocationArtifact{}, err
+	}
+	artifact.stagingOwned = stagingOwned != 0
+	artifact.finalizedByRename = finalizedByRename != 0
+	return artifact, nil
+}
+
+func (s *Store) removeRelocationArtifactFiles(ctx context.Context, tx *sql.Tx, artifact relocationArtifact) error {
+	var indexedPath string
+	indexErr := tx.QueryRowContext(ctx, `SELECT local_path FROM blobs WHERE hash = ?`, artifact.hash).Scan(&indexedPath)
+	if indexErr != nil && !errors.Is(indexErr, sql.ErrNoRows) {
+		return fmt.Errorf("confirm relocation artifact %q ownership: %w", artifact.id, indexErr)
+	}
+	abandoned := artifact.state == "preparing" && indexErr == nil && sameBlobPath(indexedPath, artifact.sourcePath)
+	if abandoned {
+		sourceSharesDestination, err := samePhysicalFile(artifact.sourcePath, artifact.destinationPath)
+		if err != nil {
+			return fmt.Errorf("compare indexed source %q with abandoned destination %q: %w", artifact.sourcePath, artifact.destinationPath, err)
+		}
+		ownedDestination := sameFile(artifact.stagingPath, artifact.destinationPath) || artifact.finalizedByRename && fileMissing(artifact.stagingPath) && verifyBlobFile(artifact.destinationPath, artifact.hash, artifact.originalSize) == nil
+		if ownedDestination && !sourceSharesDestination {
+			if err := os.Remove(artifact.destinationPath); err != nil && !errors.Is(err, os.ErrNotExist) {
+				return fmt.Errorf("remove abandoned relocation destination %q: %w", artifact.destinationPath, err)
+			}
+		}
+	}
+	if err := os.Remove(artifact.stagingPath); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return fmt.Errorf("remove relocation staging artifact %q: %w", artifact.stagingPath, err)
 	}
 	return nil
+}
+
+func sameFile(left, right string) bool {
+	leftInfo, err := os.Stat(left)
+	if err != nil {
+		return false
+	}
+	rightInfo, err := os.Stat(right)
+	return err == nil && os.SameFile(leftInfo, rightInfo)
+}
+
+func fileMissing(path string) bool {
+	_, err := os.Lstat(path)
+	return errors.Is(err, os.ErrNotExist)
+}
+
+func finalizeStagedBlob(stagingPath, destinationPath string, link func(string, string) error, rename func(string, string) error, beforeRename func() error) (bool, error) {
+	if err := link(stagingPath, destinationPath); err == nil {
+		return false, nil
+	} else if errors.Is(err, os.ErrExist) {
+		return false, err
+	}
+	if err := beforeRename(); err != nil {
+		return false, fmt.Errorf("journal staged rename: %w", err)
+	}
+	if err := rename(stagingPath, destinationPath); err != nil {
+		return true, err
+	}
+	return true, nil
 }
 
 // RelocateBlobs copies indexed data and updates paths only after all copies succeed.
@@ -1312,51 +1663,64 @@ func relocateBlob(ctx context.Context, hash, oldPath, newPath string, originalSi
 	return nil
 }
 
-func relocateBlobTracked(ctx context.Context, hash, oldPath, newPath string, originalSize int64) (bool, error) {
-	if oldPath == newPath {
-		if err := verifyBlobFile(newPath, hash, originalSize); err != nil {
-			return false, fmt.Errorf("indexed blob %q is invalid: %w", hash, err)
-		}
-		return false, nil
-	}
+func (s *Store) relocateBlobStaged(ctx context.Context, hash, oldPath, newPath, stagingPath, artifactID string, originalSize int64) error {
 	if err := ctx.Err(); err != nil {
-		return false, err
+		return err
 	}
 	if err := os.MkdirAll(filepath.Dir(newPath), 0o700); err != nil {
-		return false, err
+		return err
 	}
 	if err := verifyBlobFile(newPath, hash, originalSize); err == nil {
-		return false, nil
+		return nil
 	} else if !errors.Is(err, os.ErrNotExist) {
-		return false, fmt.Errorf("destination blob %q is invalid: %w", hash, err)
+		return fmt.Errorf("destination blob %q is invalid: %w", hash, err)
+	}
+	if _, err := os.Lstat(stagingPath); err == nil {
+		return fmt.Errorf("relocation staging path already exists: %q", stagingPath)
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return fmt.Errorf("inspect relocation staging path %q: %w", stagingPath, err)
+	}
+	if _, err := s.db.ExecContext(ctx, `UPDATE relocation_artifacts SET staging_owned = 1 WHERE artifact_id = ?`, artifactID); err != nil {
+		return fmt.Errorf("reserve relocation staging path for blob %q: %w", hash, err)
 	}
 	if err := verifyBlobFile(oldPath, hash, originalSize); err != nil {
-		return false, fmt.Errorf("source blob %q is invalid: %w", hash, err)
+		return fmt.Errorf("source blob %q is invalid: %w", hash, err)
 	}
 	source, err := openBlobFile(oldPath)
 	if err != nil {
-		return false, fmt.Errorf("open source blob %q: %w", hash, err)
+		return fmt.Errorf("open source blob %q: %w", hash, err)
 	}
-	destination, err := createBlobFile(newPath)
+	destination, err := createBlobFile(stagingPath)
 	if err != nil {
-		closeErr := source.Close()
-		if errors.Is(err, os.ErrExist) && closeErr == nil {
-			if verifyErr := verifyBlobFile(newPath, hash, originalSize); verifyErr != nil {
-				return false, fmt.Errorf("concurrent destination blob %q is invalid: %w", hash, verifyErr)
-			}
-			return false, nil
-		}
-		return false, errors.Join(err, closeErr)
+		_, ownershipErr := s.db.ExecContext(ctx, `UPDATE relocation_artifacts SET staging_owned = 0 WHERE artifact_id = ?`, artifactID)
+		return errors.Join(err, source.Close(), ownershipErr)
 	}
 	_, copyErr := io.Copy(destination, source)
 	closeErr := errors.Join(source.Close(), destination.Close())
 	if err := errors.Join(copyErr, closeErr); err != nil {
-		return false, errors.Join(err, removePartialBlob(newPath))
+		return errors.Join(err, removePartialBlob(stagingPath))
 	}
-	if err := verifyBlobFile(newPath, hash, originalSize); err != nil {
-		return false, errors.Join(fmt.Errorf("copied blob %q failed verification: %w", hash, err), removePartialBlob(newPath))
+	if err := verifyBlobFile(stagingPath, hash, originalSize); err != nil {
+		return errors.Join(fmt.Errorf("staged blob %q failed verification: %w", hash, err), removePartialBlob(stagingPath))
 	}
-	return true, nil
+	if err := ctx.Err(); err != nil {
+		return errors.Join(err, removePartialBlob(stagingPath))
+	}
+	_, err = finalizeStagedBlob(stagingPath, newPath, os.Link, renameNoReplace, func() error {
+		_, err := s.db.ExecContext(ctx, `UPDATE relocation_artifacts SET finalized_by_rename = 1 WHERE artifact_id = ?`, artifactID)
+		return err
+	})
+	if err != nil {
+		if errors.Is(err, os.ErrExist) {
+			if verifyErr := verifyBlobFile(newPath, hash, originalSize); verifyErr == nil {
+				return nil
+			} else {
+				return fmt.Errorf("concurrent destination blob %q is invalid: %w", hash, verifyErr)
+			}
+		}
+		return fmt.Errorf("finalize staged blob %q: %w", hash, err)
+	}
+	return nil
 }
 
 // openBlobFile anchors the final path component to its containing directory.

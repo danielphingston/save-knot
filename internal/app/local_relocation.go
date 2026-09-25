@@ -27,6 +27,15 @@ func (c *Coordinator) prepareLocalBlobRelocation(ctx context.Context, root strin
 		}
 		return receipt, nil, nil
 	}
+	if preparer, ok := c.repository.(interface {
+		PrepareLocalBlobRelocation(context.Context, string) (localBlobRelocation, error)
+	}); ok {
+		receipt, err := preparer.PrepareLocalBlobRelocation(ctx, root)
+		if err != nil {
+			return nil, nil, fmt.Errorf("prepare local backup relocation: %w", err)
+		}
+		return receipt, nil, nil
+	}
 	relocator, ok := c.repository.(legacyBlobRelocator)
 	if !ok {
 		return nil, nil, nil
