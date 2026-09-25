@@ -23,7 +23,7 @@ func TestSaveBlobRelocatesExistingHashWithoutForgettingUpload(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { _ = store.Close() })
+	cleanupStoreOnTestExit(t, store)
 	const hash = "same-content"
 	if err := store.SaveBlob(ctx, hash, "/old/blobs/same-content.zst", 12, 10); err != nil {
 		t.Fatal(err)
@@ -52,7 +52,7 @@ func TestDeleteSnapshotReclaimsOnlyUnreferencedLocalBlobs(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { _ = store.Close() })
+	cleanupStoreOnTestExit(t, store)
 	game := core.Game{ID: "game", DisplayName: "Game", Store: "custom", Enabled: true}
 	if err := store.UpsertGame(ctx, game); err != nil {
 		t.Fatal(err)
@@ -102,7 +102,7 @@ func TestRelocateBlobsRejectsMismatchedDestinationBeforeSwitchingPath(t *testing
 	if err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { _ = store.Close() })
+	cleanupStoreOnTestExit(t, store)
 	payload := []byte("verified save payload")
 	digest := sha256.Sum256(payload)
 	hash := strings.ToUpper(hex.EncodeToString(digest[:]))
@@ -111,7 +111,9 @@ func TestRelocateBlobsRejectsMismatchedDestinationBeforeSwitchingPath(t *testing
 		t.Fatal(err)
 	}
 	compressed := encoder.EncodeAll(payload, nil)
-	encoder.Close()
+	if err := encoder.Close(); err != nil {
+		t.Fatal(err)
+	}
 	source := filepath.Join(root, "source", "blob.zst")
 	if err := os.MkdirAll(filepath.Dir(source), 0o700); err != nil {
 		t.Fatal(err)
@@ -123,7 +125,7 @@ func TestRelocateBlobsRejectsMismatchedDestinationBeforeSwitchingPath(t *testing
 		t.Fatal(err)
 	}
 	newRoot := filepath.Join(root, "new")
-	destination := filepath.Join(newRoot, "blobs", hash[:2], hash+".zst")
+	destination := filepath.Join(newRoot, hash[:2], hash+".zst")
 	if err := os.MkdirAll(filepath.Dir(destination), 0o700); err != nil {
 		t.Fatal(err)
 	}
@@ -163,7 +165,7 @@ func TestRelocateBlobsBoundsDecompressionToDeclaredSize(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { _ = store.Close() })
+	cleanupStoreOnTestExit(t, store)
 	payload := []byte("larger than declared")
 	digest := sha256.Sum256(payload)
 	hash := hex.EncodeToString(digest[:])
@@ -172,7 +174,9 @@ func TestRelocateBlobsBoundsDecompressionToDeclaredSize(t *testing.T) {
 		t.Fatal(err)
 	}
 	compressed := encoder.EncodeAll(payload, nil)
-	encoder.Close()
+	if err := encoder.Close(); err != nil {
+		t.Fatal(err)
+	}
 	source := filepath.Join(root, "source.zst")
 	if err := os.WriteFile(source, compressed, 0o600); err != nil {
 		t.Fatal(err)

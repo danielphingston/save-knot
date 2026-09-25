@@ -45,7 +45,11 @@ func TestApplyTargetsRemovesObsoleteDirectoryWatches(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { _ = m.Close() })
+	t.Cleanup(func() {
+		if err := m.Close(); err != nil {
+			t.Errorf("close watcher: %v", err)
+		}
+	})
 	m.applyTargets([]Target{{GameID: "first", Path: first}})
 	m.applyTargets([]Target{{GameID: "second", Path: second}})
 	watched := make(map[string]bool)

@@ -18,7 +18,11 @@ func TestRestoreDoesNotChangeEarlierFilesWhenLaterBlobIsMissing(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { _ = store.Close() })
+	t.Cleanup(func() {
+		if err := store.Close(); err != nil {
+			t.Error(err)
+		}
+	})
 	saves := filepath.Join(root, "saves")
 	if err := os.Mkdir(saves, 0o700); err != nil {
 		t.Fatal(err)
@@ -58,7 +62,12 @@ func TestRestoreDoesNotChangeEarlierFilesWhenLaterBlobIsMissing(t *testing.T) {
 	if _, err := service.Restore(ctx, game, target.ID); err == nil {
 		t.Fatal("restore unexpectedly succeeded despite missing target blob")
 	}
-	for name, want := range map[string]string{"a.dat": "current a", "b.dat": "current b"} {
+	assertSaveFiles(t, saves, map[string]string{"a.dat": "current a", "b.dat": "current b"})
+}
+
+func assertSaveFiles(t *testing.T, saves string, expected map[string]string) {
+	t.Helper()
+	for name, want := range expected {
 		got, err := os.ReadFile(filepath.Join(saves, name))
 		if err != nil {
 			t.Fatal(err)

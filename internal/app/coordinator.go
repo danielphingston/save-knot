@@ -78,25 +78,32 @@ type registryRepository interface {
 }
 
 type Coordinator struct {
-	repository      repository
-	diagnosticCache diagnosticsRepository
-	gameState       gameStateRepository
-	pending         pendingRepository
-	periodic        periodicPendingRepository
-	registry        registryRepository
-	snapshots       *snapshot.Service
-	syncer          *remote.Syncer
-	reconciler      *remote.Reconciler
-	settings        *settings.Manager
-	paths           config.Paths
-	events          *events.Bus
-	watcher         *watcher.Manager
-	backupMu        sync.Mutex
-	syncMu          sync.Mutex
-	syncNowActive   atomic.Bool
-	reconcileMu     sync.Mutex
-	diagnosticsMu   sync.RWMutex
-	diagnostics     core.Diagnostics
+	repository          repository
+	diagnosticCache     diagnosticsRepository
+	gameState           gameStateRepository
+	pending             pendingRepository
+	periodic            periodicPendingRepository
+	registry            registryRepository
+	snapshots           *snapshot.Service
+	syncer              *remote.Syncer
+	reconciler          *remote.Reconciler
+	settings            *settings.Manager
+	paths               config.Paths
+	events              *events.Bus
+	watcher             *watcher.Manager
+	backupMu            sync.Mutex
+	syncMu              sync.Mutex
+	automaticSyncMu     sync.Mutex
+	automaticSyncWake   chan struct{}
+	automaticSyncGames  map[string]struct{}
+	automaticSyncDone   chan struct{}
+	automaticSyncStop   context.CancelFunc
+	lifecycleMu         sync.Mutex
+	syncNowActive       atomic.Bool
+	reconcileMu         sync.Mutex
+	activeSyncSnapshots map[string]struct{}
+	diagnosticsMu       sync.RWMutex
+	diagnostics         core.Diagnostics
 }
 
 func (c *Coordinator) Diagnostics() core.Diagnostics {
@@ -142,31 +149,105 @@ func NewCoordinator(
 	return &Coordinator{
 		repository: repository, diagnosticCache: diagnosticCache, gameState: gameState, pending: pending, periodic: periodic, registry: registry, snapshots: snapshots, syncer: syncer, reconciler: reconciler, settings: settings,
 		paths: paths, events: eventBus, watcher: watchManager,
+		automaticSyncWake:   make(chan struct{}, 1),
+		automaticSyncGames:  make(map[string]struct{}),
+		activeSyncSnapshots: make(map[string]struct{}),
 	}
 }
 
 func (c *Coordinator) Start(ctx context.Context) {
-	c.watcher.Start(ctx, c.automaticBackup)
+	c.lifecycleMu.Lock()
+	if c.automaticSyncStop != nil {
+		c.lifecycleMu.Unlock()
+		return
+	}
+	syncCtx, cancel := context.WithCancel(ctx)
+	c.automaticSyncStop = cancel
+	c.automaticSyncDone = make(chan struct{})
+	done := c.automaticSyncDone
+	c.lifecycleMu.Unlock()
+	go c.runAutomaticSync(syncCtx, done)
+	c.queuePendingAutomaticSync(ctx)
+	c.watcher.Start(syncCtx, c.automaticBackup)
 	c.ReconcileWatches(ctx)
 	go c.run(ctx)
 }
 
+func (c *Coordinator) runAutomaticSync(ctx context.Context, done chan struct{}) {
+	defer close(done)
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-c.automaticSyncWake:
+			for {
+				gameID, ok := c.takeAutomaticSyncGame()
+				if !ok {
+					break
+				}
+				if err := c.automaticSyncGame(ctx, gameID); err != nil {
+					c.events.PublishContext(ctx, core.Event{Type: "upload.failed", GameID: gameID, Message: err.Error()})
+					slog.Error("automatic R2 sync failed", "game_id", gameID, "error", err)
+				}
+			}
+		}
+	}
+}
+
 func (c *Coordinator) automaticBackup(ctx context.Context, gameID string) {
-	created, err := c.Backup(ctx, gameID)
+	_, err := c.Backup(ctx, gameID)
 	if err != nil {
 		if !errors.Is(err, snapshot.ErrNoFiles) && !errors.Is(err, snapshot.ErrUnchanged) {
 			slog.Error("automatic snapshot failed", "game_id", gameID, "error", err)
 		}
 		return
 	}
-	if syncErr := c.automaticSync(ctx, created); syncErr != nil {
-		c.events.PublishContext(ctx, core.Event{Type: "upload.failed", GameID: gameID, Message: syncErr.Error()})
-		slog.Error("automatic R2 sync failed", "game_id", gameID, "snapshot_id", created.ID, "error", syncErr)
+	c.queueAutomaticSync(gameID)
+}
+
+func (c *Coordinator) queueAutomaticSync(gameID string) {
+	c.automaticSyncMu.Lock()
+	c.automaticSyncGames[gameID] = struct{}{}
+	c.automaticSyncMu.Unlock()
+	select {
+	case c.automaticSyncWake <- struct{}{}:
+	default:
 	}
 }
 
+func (c *Coordinator) queuePendingAutomaticSync(ctx context.Context) {
+	pending, err := c.periodic.PendingSnapshotsForWatchedGames(ctx)
+	if err != nil {
+		slog.Warn("list pending snapshots for automatic sync", "error", err)
+		return
+	}
+	for _, target := range pending {
+		c.queueAutomaticSync(target.GameID)
+	}
+}
+
+func (c *Coordinator) takeAutomaticSyncGame() (string, bool) {
+	c.automaticSyncMu.Lock()
+	defer c.automaticSyncMu.Unlock()
+	for gameID := range c.automaticSyncGames {
+		delete(c.automaticSyncGames, gameID)
+		return gameID, true
+	}
+	return "", false
+}
+
 func (c *Coordinator) Close() error {
-	return c.watcher.Close()
+	c.lifecycleMu.Lock()
+	stop, done := c.automaticSyncStop, c.automaticSyncDone
+	c.lifecycleMu.Unlock()
+	if stop != nil {
+		stop()
+	}
+	err := c.watcher.Close()
+	if done != nil {
+		<-done
+	}
+	return err
 }
 
 func (c *Coordinator) run(ctx context.Context) {
@@ -488,7 +569,9 @@ func (c *Coordinator) ConfigureLocal(ctx context.Context, local config.Local) er
 		if relocator, ok := c.repository.(interface {
 			RelocateBlobs(context.Context, string) error
 		}); ok {
-			_ = relocator.RelocateBlobs(ctx, oldRoot)
+			if rollbackErr := relocator.RelocateBlobs(ctx, oldRoot); rollbackErr != nil {
+				return errors.Join(err, fmt.Errorf("restore previous local backup location: %w", rollbackErr))
+			}
 		}
 		return err
 	}
@@ -589,15 +672,13 @@ func (c *Coordinator) Backup(ctx context.Context, gameID string) (core.Snapshot,
 	}
 	c.backupMu.Unlock()
 	c.events.PublishContext(ctx, core.Event{Type: "snapshot.completed", GameID: gameID, Data: map[string]any{"snapshotId": created.ID, "remote": false}})
-	// Retention is serialized with remote sync and other mutations. Snapshot
-	// creation has already committed locally, so network I/O never holds its lock.
-	c.syncMu.Lock()
+	// Retention only mutates local snapshot state. backupMu serializes it with
+	// backup, restore, deletion, and relocation without waiting for network sync.
 	c.backupMu.Lock()
 	if err := c.applyLocalRetention(ctx, gameID); err != nil {
 		slog.Error("apply snapshot retention", "game_id", gameID, "error", err)
 	}
 	c.backupMu.Unlock()
-	c.syncMu.Unlock()
 	return created, nil
 }
 
@@ -626,6 +707,9 @@ func (c *Coordinator) applyLocalRetention(ctx context.Context, gameID string) er
 		return err
 	}
 	for _, target := range excess {
+		if _, active := c.activeSyncSnapshots[target.ID]; active {
+			continue
+		}
 		if target.RemoteState == "synced" {
 			continue
 		}
@@ -790,7 +874,14 @@ func (c *Coordinator) syncPending(ctx context.Context, load func(context.Context
 		c.settings.RecordR2Failure(err)
 		return core.SyncResult{}, err
 	}
+	c.backupMu.Lock()
 	pending, err := load(ctx)
+	if err == nil {
+		for _, target := range pending {
+			c.activeSyncSnapshots[target.ID] = struct{}{}
+		}
+	}
+	c.backupMu.Unlock()
 	if err != nil {
 		return core.SyncResult{}, err
 	}
@@ -799,6 +890,11 @@ func (c *Coordinator) syncPending(ctx context.Context, load func(context.Context
 	}, func(event core.Event) { c.events.PublishContext(ctx, event) }, func(completed, total int) {
 		c.publishSyncProgress(ctx, "uploading", completed, total)
 	})
+	c.backupMu.Lock()
+	for _, target := range pending {
+		delete(c.activeSyncSnapshots, target.ID)
+	}
+	c.backupMu.Unlock()
 	for gameID := range games {
 		if err := c.applyRetention(ctx, gameID); err != nil {
 			uploadErr = errors.Join(uploadErr, err)
@@ -855,36 +951,74 @@ func (c *Coordinator) SyncGame(ctx context.Context, gameID string) error {
 		c.settings.RecordR2Failure(err)
 		return err
 	}
+	c.backupMu.Lock()
 	pending, err := c.pending.PendingSnapshotsForGame(ctx, gameID)
+	if err == nil {
+		for _, target := range pending {
+			c.activeSyncSnapshots[target.ID] = struct{}{}
+		}
+	}
+	c.backupMu.Unlock()
 	if err != nil {
 		return err
 	}
 	if err := c.uploadAll(ctx, r2, pending); err != nil {
+		c.backupMu.Lock()
+		for _, target := range pending {
+			delete(c.activeSyncSnapshots, target.ID)
+		}
+		c.backupMu.Unlock()
+		c.settings.RecordR2Failure(err)
+		return err
+	}
+	c.backupMu.Lock()
+	for _, target := range pending {
+		delete(c.activeSyncSnapshots, target.ID)
+	}
+	c.backupMu.Unlock()
+	return c.applyRetention(ctx, gameID)
+}
+
+func (c *Coordinator) automaticSyncGame(ctx context.Context, gameID string) error {
+	c.syncMu.Lock()
+	defer c.syncMu.Unlock()
+	game, err := c.repository.Game(ctx, gameID)
+	if err != nil {
+		return err
+	}
+	if game.Hidden || !game.SyncEnabled {
+		return nil
+	}
+	r2, err := c.settings.R2(ctx)
+	if errors.Is(err, settings.ErrR2NotConfigured) {
+		return nil
+	}
+	if err != nil {
+		c.settings.RecordR2Failure(err)
+		return err
+	}
+	c.backupMu.Lock()
+	pending, err := c.pending.PendingSnapshotsForGame(ctx, gameID)
+	if err == nil {
+		for _, target := range pending {
+			c.activeSyncSnapshots[target.ID] = struct{}{}
+		}
+	}
+	c.backupMu.Unlock()
+	if err != nil {
+		return err
+	}
+	err = c.uploadAll(ctx, r2, pending)
+	c.backupMu.Lock()
+	for _, target := range pending {
+		delete(c.activeSyncSnapshots, target.ID)
+	}
+	c.backupMu.Unlock()
+	if err != nil {
 		c.settings.RecordR2Failure(err)
 		return err
 	}
 	return c.applyRetention(ctx, gameID)
-}
-
-func (c *Coordinator) automaticSync(ctx context.Context, target core.Snapshot) error {
-	c.syncMu.Lock()
-	defer c.syncMu.Unlock()
-	game, err := c.repository.Game(ctx, target.GameID)
-	if err != nil {
-		return err
-	}
-	if game.Hidden {
-		return nil
-	}
-	if !game.SyncEnabled {
-		return nil
-	}
-	if err := c.syncOne(ctx, target); errors.Is(err, settings.ErrR2NotConfigured) {
-		return nil
-	} else if err != nil {
-		return err
-	}
-	return c.applyRetention(ctx, target.GameID)
 }
 
 func (c *Coordinator) applyRetention(ctx context.Context, gameID string) error {
@@ -938,20 +1072,6 @@ func (c *Coordinator) retentionRemote(ctx context.Context, snapshots []core.Snap
 		return r2, err
 	}
 	return nil, settings.ErrR2NotConfigured
-}
-
-func (c *Coordinator) syncOne(ctx context.Context, target core.Snapshot) error {
-	r2, err := c.settings.R2(ctx)
-	if err != nil {
-		return err
-	}
-	if err := c.syncer.Upload(ctx, r2, target); err != nil {
-		c.settings.RecordR2Failure(err)
-		return err
-	}
-	c.settings.RecordR2Sync()
-	c.events.PublishContext(ctx, core.Event{Type: "upload.completed", GameID: target.GameID, Data: map[string]any{"snapshotId": target.ID}})
-	return nil
 }
 
 func (c *Coordinator) uploadAll(ctx context.Context, r2 *remote.R2, snapshots []core.Snapshot) error {

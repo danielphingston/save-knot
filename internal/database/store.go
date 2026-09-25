@@ -139,40 +139,23 @@ func (s *Store) initialize(ctx context.Context) error {
 	return nil
 }
 
-func (s *Store) backfillSnapshotBlobs(ctx context.Context) error {
-	rows, err := s.db.QueryContext(ctx, `SELECT id, manifest FROM snapshots`)
+type snapshotBlobReference struct{ snapshotID, hash string }
+
+func (s *Store) backfillSnapshotBlobs(ctx context.Context) (err error) {
+	refs, err := s.snapshotBlobReferences(ctx)
 	if err != nil {
-		return fmt.Errorf("list snapshots for blob reference migration: %w", err)
-	}
-	type reference struct{ snapshotID, hash string }
-	var refs []reference
-	for rows.Next() {
-		var id string
-		var data []byte
-		if err := rows.Scan(&id, &data); err != nil {
-			return fmt.Errorf("scan snapshot for blob migration: %w", errors.Join(err, rows.Close()))
-		}
-		var snapshot core.Snapshot
-		if err := json.Unmarshal(data, &snapshot); err != nil {
-			return fmt.Errorf("decode snapshot %q for blob migration: %w", id, errors.Join(err, rows.Close()))
-		}
-		for _, file := range snapshot.Files {
-			if file.Hash != "" {
-				refs = append(refs, reference{id, file.Hash})
-			}
-		}
-		if snapshot.Registry != nil && snapshot.Registry.Hash != "" {
-			refs = append(refs, reference{id, snapshot.Registry.Hash})
-		}
-	}
-	if err := errors.Join(rows.Err(), rows.Close()); err != nil {
-		return fmt.Errorf("read snapshots for blob migration: %w", err)
+		return err
 	}
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return fmt.Errorf("begin blob reference migration: %w", err)
 	}
-	defer tx.Rollback()
+	committed := false
+	defer func() {
+		if !committed {
+			err = errors.Join(err, tx.Rollback())
+		}
+	}()
 	for _, ref := range refs {
 		if _, err := tx.ExecContext(ctx, `INSERT OR IGNORE INTO snapshot_blobs (snapshot_id, hash) VALUES (?, ?)`, ref.snapshotID, ref.hash); err != nil {
 			return fmt.Errorf("backfill blob reference: %w", err)
@@ -181,7 +164,39 @@ func (s *Store) backfillSnapshotBlobs(ctx context.Context) error {
 	if err := tx.Commit(); err != nil {
 		return fmt.Errorf("commit blob reference migration: %w", err)
 	}
+	committed = true
 	return nil
+}
+
+func (s *Store) snapshotBlobReferences(ctx context.Context) ([]snapshotBlobReference, error) {
+	rows, err := s.db.QueryContext(ctx, `SELECT id, manifest FROM snapshots`)
+	if err != nil {
+		return nil, fmt.Errorf("list snapshots for blob reference migration: %w", err)
+	}
+	var refs []snapshotBlobReference
+	for rows.Next() {
+		var id string
+		var data []byte
+		if err := rows.Scan(&id, &data); err != nil {
+			return nil, fmt.Errorf("scan snapshot for blob migration: %w", errors.Join(err, rows.Close()))
+		}
+		var snapshot core.Snapshot
+		if err := json.Unmarshal(data, &snapshot); err != nil {
+			return nil, fmt.Errorf("decode snapshot %q for blob migration: %w", id, errors.Join(err, rows.Close()))
+		}
+		for _, file := range snapshot.Files {
+			if file.Hash != "" {
+				refs = append(refs, snapshotBlobReference{id, file.Hash})
+			}
+		}
+		if snapshot.Registry != nil && snapshot.Registry.Hash != "" {
+			refs = append(refs, snapshotBlobReference{id, snapshot.Registry.Hash})
+		}
+	}
+	if err := errors.Join(rows.Err(), rows.Close()); err != nil {
+		return nil, fmt.Errorf("read snapshots for blob migration: %w", err)
+	}
+	return refs, nil
 }
 
 func (s *Store) SaveDiagnostics(ctx context.Context, diagnostics core.Diagnostics) error {
@@ -408,35 +423,8 @@ func (s *Store) SaveGameRelations(ctx context.Context, game core.Game, paths []c
 	if _, err = tx.ExecContext(ctx, `INSERT INTO games (id,catalog_id,catalog_name,display_name,store,store_id,install_path,image,notes,enabled,sync_enabled,last_seen) VALUES (?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET catalog_id=excluded.catalog_id,catalog_name=excluded.catalog_name,store=excluded.store,store_id=excluded.store_id,install_path=excluded.install_path,last_seen=excluded.last_seen`, game.ID, game.CatalogID, game.CatalogName, game.DisplayName, game.Store, game.StoreID, game.InstallPath, game.Image, game.Notes, game.Enabled, game.SyncEnabled, timeValue(game.LastSeen)); err != nil {
 		return fmt.Errorf("upsert game %q: %w", game.ID, err)
 	}
-	desired := make(map[string]struct{}, len(paths))
-	for _, item := range paths {
-		desired[item.ID] = struct{}{}
-		if _, err = tx.ExecContext(ctx, `INSERT INTO game_paths (id,game_id,source,template,resolved,enabled) VALUES (?,?,?,?,?,?) ON CONFLICT(game_id,template,resolved) DO UPDATE SET id=excluded.id`, item.ID, game.ID, item.Source, item.Template, filepath.Clean(item.Resolved), item.Enabled); err != nil {
-			return fmt.Errorf("add path for %q: %w", game.ID, err)
-		}
-	}
-	rows, queryErr := tx.QueryContext(ctx, `SELECT id FROM game_paths WHERE game_id=? AND source='catalog'`, game.ID)
-	if queryErr != nil {
-		return queryErr
-	}
-	var stale []string
-	for rows.Next() {
-		var id string
-		if scanErr := rows.Scan(&id); scanErr != nil {
-			_ = rows.Close()
-			return scanErr
-		}
-		if _, ok := desired[id]; !ok {
-			stale = append(stale, id)
-		}
-	}
-	if err = errors.Join(rows.Err(), rows.Close()); err != nil {
+	if err = saveGamePaths(ctx, tx, game.ID, paths); err != nil {
 		return err
-	}
-	for _, id := range stale {
-		if _, err = tx.ExecContext(ctx, `DELETE FROM game_paths WHERE id=?`, id); err != nil {
-			return err
-		}
 	}
 	if replaceRegistry {
 		if _, err = tx.ExecContext(ctx, `DELETE FROM game_registry WHERE game_id=? AND source='catalog'`, game.ID); err != nil {
@@ -450,6 +438,39 @@ func (s *Store) SaveGameRelations(ctx context.Context, game core.Game, paths []c
 	}
 	if err = tx.Commit(); err != nil {
 		return fmt.Errorf("commit game relation update: %w", err)
+	}
+	return nil
+}
+
+func saveGamePaths(ctx context.Context, tx *sql.Tx, gameID string, paths []core.GamePath) error {
+	desired := make(map[string]struct{}, len(paths))
+	for _, item := range paths {
+		desired[item.ID] = struct{}{}
+		if _, err := tx.ExecContext(ctx, `INSERT INTO game_paths (id,game_id,source,template,resolved,enabled) VALUES (?,?,?,?,?,?) ON CONFLICT(game_id,template,resolved) DO UPDATE SET id=excluded.id`, item.ID, gameID, item.Source, item.Template, filepath.Clean(item.Resolved), item.Enabled); err != nil {
+			return fmt.Errorf("add path for %q: %w", gameID, err)
+		}
+	}
+	rows, err := tx.QueryContext(ctx, `SELECT id FROM game_paths WHERE game_id=? AND source='catalog'`, gameID)
+	if err != nil {
+		return err
+	}
+	var stale []string
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			return errors.Join(err, rows.Close())
+		}
+		if _, ok := desired[id]; !ok {
+			stale = append(stale, id)
+		}
+	}
+	if err := errors.Join(rows.Err(), rows.Close()); err != nil {
+		return err
+	}
+	for _, id := range stale {
+		if _, err := tx.ExecContext(ctx, `DELETE FROM game_paths WHERE id=?`, id); err != nil {
+			return err
+		}
 	}
 	return nil
 }
@@ -733,7 +754,7 @@ func (s *Store) SaveSnapshot(ctx context.Context, snapshot core.Snapshot) (err e
 	return nil
 }
 
-func (s *Store) ImportSnapshot(ctx context.Context, snapshot core.Snapshot) error {
+func (s *Store) ImportSnapshot(ctx context.Context, snapshot core.Snapshot) (err error) {
 	snapshot.RemoteState = "synced"
 	manifest, err := json.Marshal(snapshot)
 	if err != nil {
@@ -743,7 +764,12 @@ func (s *Store) ImportSnapshot(ctx context.Context, snapshot core.Snapshot) erro
 	if err != nil {
 		return fmt.Errorf("begin remote snapshot import: %w", err)
 	}
-	defer tx.Rollback()
+	committed := false
+	defer func() {
+		if !committed {
+			err = errors.Join(err, tx.Rollback())
+		}
+	}()
 	_, err = tx.ExecContext(ctx, `INSERT INTO snapshots
 		(id, game_id, device_id, created_at, file_count, original_size, stored_size, remote_state, manifest)
 		VALUES (?, ?, ?, ?, ?, ?, ?, 'synced', ?)
@@ -765,6 +791,7 @@ func (s *Store) ImportSnapshot(ctx context.Context, snapshot core.Snapshot) erro
 	if err := tx.Commit(); err != nil {
 		return fmt.Errorf("commit remote snapshot import: %w", err)
 	}
+	committed = true
 	return nil
 }
 
@@ -864,12 +891,17 @@ func (s *Store) scanPendingSnapshots(ctx context.Context, query string, argument
 	return snapshots, nil
 }
 
-func (s *Store) DeleteSnapshot(ctx context.Context, id string) error {
+func (s *Store) DeleteSnapshot(ctx context.Context, id string) (err error) {
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return fmt.Errorf("begin snapshot delete: %w", err)
 	}
-	defer tx.Rollback()
+	committed := false
+	defer func() {
+		if !committed {
+			err = errors.Join(err, tx.Rollback())
+		}
+	}()
 	result, err := tx.ExecContext(ctx, `DELETE FROM snapshots WHERE id = ?`, id)
 	if err != nil {
 		return fmt.Errorf("delete snapshot %q: %w", id, err)
@@ -897,23 +929,58 @@ func (s *Store) DeleteSnapshot(ctx context.Context, id string) error {
 	if err := errors.Join(rows.Err(), rows.Close()); err != nil {
 		return fmt.Errorf("read orphaned blobs: %w", err)
 	}
-	for _, item := range orphans {
-		if _, err := tx.ExecContext(ctx, `DELETE FROM blobs WHERE hash = ? AND NOT EXISTS (SELECT 1 FROM snapshot_blobs WHERE hash = ?)`, item.hash, item.hash); err != nil {
-			return fmt.Errorf("delete orphan blob row %q: %w", item.hash, err)
-		}
-	}
 	if err := tx.Commit(); err != nil {
 		return fmt.Errorf("commit snapshot delete: %w", err)
 	}
+	committed = true
 	var removeErr error
 	for _, item := range orphans {
-		if item.path != "" {
-			if err := os.Remove(item.path); err != nil && !errors.Is(err, os.ErrNotExist) {
-				removeErr = errors.Join(removeErr, fmt.Errorf("remove orphan blob %q: %w", item.hash, err))
-			}
+		if err := s.removeOrphanBlob(ctx, item.hash, item.path); err != nil {
+			removeErr = errors.Join(removeErr, err)
 		}
 	}
 	return removeErr
+}
+
+// removeOrphanBlob holds a SQLite write transaction while checking references
+// and removing the file. That prevents another snapshot from acquiring a
+// reference between the orphan check and physical removal. The blob row stays
+// available for retries whenever removal fails.
+func (s *Store) removeOrphanBlob(ctx context.Context, hash, path string) (err error) {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("begin orphan cleanup for blob %q: %w", hash, err)
+	}
+	committed := false
+	defer func() {
+		if !committed {
+			err = errors.Join(err, tx.Rollback())
+		}
+	}()
+	result, err := tx.ExecContext(ctx, `UPDATE blobs SET local_path = local_path WHERE hash = ? AND NOT EXISTS (SELECT 1 FROM snapshot_blobs WHERE hash = ?)`, hash, hash)
+	if err != nil {
+		return fmt.Errorf("claim orphan blob %q: %w", hash, err)
+	}
+	count, err := result.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("check orphan blob %q: %w", hash, err)
+	}
+	if count == 0 {
+		return nil
+	}
+	if path != "" {
+		if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
+			return fmt.Errorf("remove orphan blob %q: %w", hash, err)
+		}
+	}
+	if _, err := tx.ExecContext(ctx, `DELETE FROM blobs WHERE hash = ? AND NOT EXISTS (SELECT 1 FROM snapshot_blobs WHERE hash = ?)`, hash, hash); err != nil {
+		return fmt.Errorf("delete orphan blob row %q: %w", hash, err)
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("commit orphan cleanup for blob %q: %w", hash, err)
+	}
+	committed = true
+	return nil
 }
 
 func (s *Store) Snapshot(ctx context.Context, id string) (core.Snapshot, error) {
@@ -997,7 +1064,7 @@ func (s *Store) InvalidateBlobUploads(ctx context.Context, target string) error 
 }
 
 // RelocateBlobs copies indexed data and updates paths only after all copies succeed.
-func (s *Store) RelocateBlobs(ctx context.Context, root string) error {
+func (s *Store) RelocateBlobs(ctx context.Context, root string) (err error) {
 	rows, err := s.db.QueryContext(ctx, `SELECT hash, local_path, original_size FROM blobs`)
 	if err != nil {
 		return fmt.Errorf("list blobs for relocation: %w", err)
@@ -1016,69 +1083,132 @@ func (s *Store) RelocateBlobs(ctx context.Context, root string) error {
 		if len(hash) < 2 {
 			return errors.Join(fmt.Errorf("invalid blob hash %q", hash), rows.Close())
 		}
-		items = append(items, relocation{hash: hash, oldPath: oldPath, newPath: filepath.Join(root, "blobs", hash[:2], hash+".zst"), originalSize: originalSize})
+		items = append(items, relocation{hash: hash, oldPath: oldPath, newPath: filepath.Join(root, hash[:2], hash+".zst"), originalSize: originalSize})
 	}
 	if err := errors.Join(rows.Err(), rows.Close()); err != nil {
 		return err
 	}
 	for _, item := range items {
-		if item.oldPath == item.newPath {
-			if err := verifyBlobFile(item.newPath, item.hash, item.originalSize); err != nil {
-				return fmt.Errorf("indexed blob %q is invalid: %w", item.hash, err)
-			}
-			continue
-		}
-		if err := ctx.Err(); err != nil {
+		if err := relocateBlob(ctx, item.hash, item.oldPath, item.newPath, item.originalSize); err != nil {
 			return err
-		}
-		if err := os.MkdirAll(filepath.Dir(item.newPath), 0o700); err != nil {
-			return err
-		}
-		if err := verifyBlobFile(item.newPath, item.hash, item.originalSize); err == nil {
-			continue
-		} else if !errors.Is(err, os.ErrNotExist) {
-			return fmt.Errorf("destination blob %q is invalid: %w", item.hash, err)
-		}
-		if err := verifyBlobFile(item.oldPath, item.hash, item.originalSize); err != nil {
-			return fmt.Errorf("source blob %q is invalid: %w", item.hash, err)
-		}
-		source, err := os.Open(item.oldPath)
-		if err != nil {
-			return fmt.Errorf("open source blob %q: %w", item.hash, err)
-		}
-		destination, err := os.OpenFile(item.newPath, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o600)
-		if err != nil {
-			_ = source.Close()
-			if errors.Is(err, os.ErrExist) {
-				if verifyErr := verifyBlobFile(item.newPath, item.hash, item.originalSize); verifyErr != nil {
-					return fmt.Errorf("concurrent destination blob %q is invalid: %w", item.hash, verifyErr)
-				}
-				continue
-			}
-			return err
-		}
-		_, copyErr := io.Copy(destination, source)
-		closeErr := errors.Join(source.Close(), destination.Close())
-		if err := errors.Join(copyErr, closeErr); err != nil {
-			_ = os.Remove(item.newPath)
-			return err
-		}
-		if err := verifyBlobFile(item.newPath, item.hash, item.originalSize); err != nil {
-			_ = os.Remove(item.newPath)
-			return fmt.Errorf("copied blob %q failed verification: %w", item.hash, err)
 		}
 	}
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return err
 	}
-	defer tx.Rollback()
+	committed := false
+	defer func() {
+		if !committed {
+			err = errors.Join(err, tx.Rollback())
+		}
+	}()
 	for _, item := range items {
 		if _, err := tx.ExecContext(ctx, `UPDATE blobs SET local_path = ? WHERE hash = ?`, item.newPath, item.hash); err != nil {
 			return err
 		}
 	}
-	return tx.Commit()
+	err = tx.Commit()
+	committed = err == nil
+	return err
+}
+
+func relocateBlob(ctx context.Context, hash, oldPath, newPath string, originalSize int64) error {
+	if oldPath == newPath {
+		if err := verifyBlobFile(newPath, hash, originalSize); err != nil {
+			return fmt.Errorf("indexed blob %q is invalid: %w", hash, err)
+		}
+		return nil
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if err := os.MkdirAll(filepath.Dir(newPath), 0o700); err != nil {
+		return err
+	}
+	if err := verifyBlobFile(newPath, hash, originalSize); err == nil {
+		return nil
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return fmt.Errorf("destination blob %q is invalid: %w", hash, err)
+	}
+	if err := verifyBlobFile(oldPath, hash, originalSize); err != nil {
+		return fmt.Errorf("source blob %q is invalid: %w", hash, err)
+	}
+	source, err := openBlobFile(oldPath)
+	if err != nil {
+		return fmt.Errorf("open source blob %q: %w", hash, err)
+	}
+	destination, err := createBlobFile(newPath)
+	if err != nil {
+		closeErr := source.Close()
+		if errors.Is(err, os.ErrExist) && closeErr == nil {
+			if verifyErr := verifyBlobFile(newPath, hash, originalSize); verifyErr != nil {
+				return fmt.Errorf("concurrent destination blob %q is invalid: %w", hash, verifyErr)
+			}
+			return nil
+		}
+		return errors.Join(err, closeErr)
+	}
+	_, copyErr := io.Copy(destination, source)
+	closeErr := errors.Join(source.Close(), destination.Close())
+	if err := errors.Join(copyErr, closeErr); err != nil {
+		return errors.Join(err, removePartialBlob(newPath))
+	}
+	if err := verifyBlobFile(newPath, hash, originalSize); err != nil {
+		return errors.Join(fmt.Errorf("copied blob %q failed verification: %w", hash, err), removePartialBlob(newPath))
+	}
+	return nil
+}
+
+// openBlobFile anchors the final path component to its containing directory.
+// os.Root prevents the blob filename from escaping through traversal or symlinks.
+func openBlobFile(path string) (*os.File, error) {
+	cleanPath := filepath.Clean(path)
+	name := filepath.Base(cleanPath)
+	if name == "." || name == ".." || name == string(filepath.Separator) {
+		return nil, fmt.Errorf("invalid blob file path %q", path)
+	}
+	root, err := os.OpenRoot(filepath.Dir(cleanPath))
+	if err != nil {
+		return nil, err
+	}
+	file, openErr := root.Open(name)
+	rootErr := root.Close()
+	if openErr != nil {
+		return nil, errors.Join(openErr, rootErr)
+	}
+	if rootErr != nil {
+		return nil, errors.Join(rootErr, file.Close())
+	}
+	return file, nil
+}
+
+func createBlobFile(path string) (*os.File, error) {
+	cleanPath := filepath.Clean(path)
+	name := filepath.Base(cleanPath)
+	if name == "." || name == ".." || name == string(filepath.Separator) {
+		return nil, fmt.Errorf("invalid blob file path %q", path)
+	}
+	root, err := os.OpenRoot(filepath.Dir(cleanPath))
+	if err != nil {
+		return nil, err
+	}
+	file, openErr := root.OpenFile(name, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o600)
+	rootErr := root.Close()
+	if openErr != nil {
+		return nil, errors.Join(openErr, rootErr)
+	}
+	if rootErr != nil {
+		return nil, errors.Join(rootErr, file.Close())
+	}
+	return file, nil
+}
+
+func removePartialBlob(path string) error {
+	if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return fmt.Errorf("remove incomplete blob %q: %w", path, err)
+	}
+	return nil
 }
 
 func verifyBlobFile(path, expectedHash string, expectedSize int64) error {
@@ -1089,7 +1219,7 @@ func verifyBlobFile(path, expectedHash string, expectedSize int64) error {
 	if err != nil || len(decoded) != sha256.Size {
 		return fmt.Errorf("invalid blob hash %q", expectedHash)
 	}
-	file, err := os.Open(path)
+	file, err := openBlobFile(path)
 	if err != nil {
 		return err
 	}

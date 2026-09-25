@@ -234,7 +234,14 @@ func (m *Manager) addTree(root string) error {
 
 func collectTargetWatches(target, nearest string, directories map[string]struct{}) error {
 	info, err := os.Stat(target)
-	if err != nil || !info.IsDir() {
+	if err != nil {
+		if !errors.Is(err, os.ErrNotExist) {
+			return err
+		}
+		directories[nearest] = struct{}{}
+		return nil
+	}
+	if !info.IsDir() {
 		directories[nearest] = struct{}{}
 		return nil
 	}
