@@ -65,6 +65,7 @@ func Build(ctx context.Context, dataDir, listenOverride string) (*Application, e
 	if err != nil {
 		return nil, err
 	}
+	settingsManager.SetUploadStateInvalidator(repository)
 	watchManager, err := watcher.New()
 	if err != nil {
 		closeErr := repository.Close()

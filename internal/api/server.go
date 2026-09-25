@@ -421,20 +421,32 @@ func (s *Server) addGame(writer http.ResponseWriter, request *http.Request) {
 		return
 	}
 	game := core.Game{ID: gameID, DisplayName: input.Name, Store: "custom", Image: input.Image, Enabled: true, SyncEnabled: true, LastSeen: &now}
-	if err := s.writer.UpsertGame(request.Context(), game); err != nil {
-		writeError(writer, http.StatusInternalServerError, err)
-		return
-	}
+	paths := make([]core.GamePath, 0, len(resolvedPaths))
 	for _, resolved := range resolvedPaths {
 		pathID, err := core.NewID(time.Now().UTC())
 		if err != nil {
 			writeError(writer, http.StatusInternalServerError, err)
 			return
 		}
-		path := core.GamePath{ID: pathID, GameID: gameID, Source: "custom", Template: resolved, Resolved: resolved, Enabled: true}
-		if err := s.writer.AddPath(request.Context(), path); err != nil {
+		paths = append(paths, core.GamePath{ID: pathID, GameID: gameID, Source: "custom", Template: resolved, Resolved: resolved, Enabled: true})
+	}
+	if repository, ok := s.writer.(interface {
+		CreateManualGame(context.Context, core.Game, []core.GamePath) error
+	}); ok {
+		if err := repository.CreateManualGame(request.Context(), game, paths); err != nil {
 			writeError(writer, http.StatusInternalServerError, err)
 			return
+		}
+	} else {
+		if err := s.writer.UpsertGame(request.Context(), game); err != nil {
+			writeError(writer, http.StatusInternalServerError, err)
+			return
+		}
+		for _, path := range paths {
+			if err := s.writer.AddPath(request.Context(), path); err != nil {
+				writeError(writer, http.StatusInternalServerError, err)
+				return
+			}
 		}
 	}
 	s.backups.ReconcileWatches(request.Context())

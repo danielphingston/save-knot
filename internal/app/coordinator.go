@@ -32,6 +32,26 @@ type repository interface {
 	GamePaths(context.Context, string) ([]core.GamePath, error)
 }
 
+type atomicGameRelationsRepository interface {
+	SaveGameRelations(context.Context, core.Game, []core.GamePath, []core.RegistryPath, bool) error
+}
+
+func (c *Coordinator) saveGameRelations(ctx context.Context, game core.Game, paths []core.GamePath, registry []core.RegistryPath, replaceRegistry bool) error {
+	if repo, ok := c.repository.(atomicGameRelationsRepository); ok {
+		return repo.SaveGameRelations(ctx, game, paths, registry, replaceRegistry)
+	}
+	if err := c.repository.UpsertGame(ctx, game); err != nil {
+		return err
+	}
+	if err := c.repository.ReplaceCatalogPaths(ctx, game.ID, paths); err != nil {
+		return err
+	}
+	if replaceRegistry {
+		return c.registry.ReplaceCatalogRegistry(ctx, game.ID, registry)
+	}
+	return nil
+}
+
 type diagnosticsRepository interface {
 	SaveDiagnostics(context.Context, core.Diagnostics) error
 	LoadDiagnostics(context.Context) (core.Diagnostics, bool, error)
@@ -72,6 +92,7 @@ type Coordinator struct {
 	events          *events.Bus
 	watcher         *watcher.Manager
 	backupMu        sync.Mutex
+	syncMu          sync.Mutex
 	syncNowActive   atomic.Bool
 	reconcileMu     sync.Mutex
 	diagnosticsMu   sync.RWMutex
@@ -289,22 +310,14 @@ func (c *Coordinator) registerSteamGame(ctx context.Context, installation discov
 		slog.Warn("resolve Ludusavi save paths", "game", definition.Name, "app_id", installation.AppID, "error", err)
 		return false
 	}
-	isNew := c.gameIsNew(ctx, game.ID)
-	if err := c.repository.UpsertGame(ctx, game); err != nil {
-		slog.Error("register discovered game", "game", definition.Name, "app_id", installation.AppID, "error", err)
-		return false
-	}
-	if err := c.repository.ReplaceCatalogPaths(ctx, game.ID, paths); err != nil {
-		slog.Error("store discovered save paths", "game", definition.Name, "app_id", installation.AppID, "error", err)
-		return false
-	}
 	registryPaths, err := discovery.RegistryPaths(game.ID, "steam", installation.AppID, game.InstallPath, definition)
 	if err != nil {
 		slog.Warn("resolve Ludusavi registry paths", "game", definition.Name, "error", err)
 		return false
 	}
-	if err := c.registry.ReplaceCatalogRegistry(ctx, game.ID, registryPaths); err != nil {
-		slog.Error("store discovered registry paths", "game", definition.Name, "error", err)
+	isNew := c.gameIsNew(ctx, game.ID)
+	if err := c.saveGameRelations(ctx, game, paths, registryPaths, true); err != nil {
+		slog.Error("register discovered game and paths", "game", definition.Name, "app_id", installation.AppID, "error", err)
 		return false
 	}
 	if isNew {
@@ -323,12 +336,8 @@ func (c *Coordinator) registerLocalSaves(ctx context.Context, index catalog.Inde
 	registered := 0
 	for _, found := range localGames {
 		isNew := c.gameIsNew(ctx, found.Game.ID)
-		if err := c.repository.UpsertGame(ctx, found.Game); err != nil {
-			slog.Error("register local save game", "game", found.Game.DisplayName, "error", err)
-			continue
-		}
-		if err := c.repository.ReplaceCatalogPaths(ctx, found.Game.ID, found.Paths); err != nil {
-			slog.Error("store local save paths", "game", found.Game.DisplayName, "error", err)
+		if err := c.saveGameRelations(ctx, found.Game, found.Paths, nil, false); err != nil {
+			slog.Error("register local save game and paths", "game", found.Game.DisplayName, "error", err)
 			continue
 		}
 		registered++
@@ -361,22 +370,14 @@ func (c *Coordinator) registerInstalledGames(ctx context.Context, index catalog.
 			slog.Warn("resolve store save paths", "store", installation.Store, "game", definition.Name, "error", err)
 			continue
 		}
-		isNew := c.gameIsNew(ctx, game.ID)
-		if err := c.repository.UpsertGame(ctx, game); err != nil {
-			slog.Error("register store game", "store", installation.Store, "game", definition.Name, "error", err)
-			continue
-		}
-		if err := c.repository.ReplaceCatalogPaths(ctx, game.ID, paths); err != nil {
-			slog.Error("store discovered game paths", "store", installation.Store, "game", definition.Name, "error", err)
-			continue
-		}
 		registryPaths, err := discovery.RegistryPaths(game.ID, installation.Store, game.StoreID, game.InstallPath, definition)
 		if err != nil {
 			slog.Warn("resolve store registry paths", "store", installation.Store, "game", definition.Name, "error", err)
 			continue
 		}
-		if err := c.registry.ReplaceCatalogRegistry(ctx, game.ID, registryPaths); err != nil {
-			slog.Error("store discovered registry paths", "store", installation.Store, "game", definition.Name, "error", err)
+		isNew := c.gameIsNew(ctx, game.ID)
+		if err := c.saveGameRelations(ctx, game, paths, registryPaths, true); err != nil {
+			slog.Error("register store game and paths", "store", installation.Store, "game", definition.Name, "error", err)
 			continue
 		}
 		registered++
@@ -437,7 +438,7 @@ func (c *Coordinator) RemapGame(ctx context.Context, gameID, catalogID string) e
 		// would require a detected installation to resolve safely.
 		game.CatalogID = definition.Name
 		game.CatalogName = definition.Name
-		return c.repository.UpsertGame(ctx, game)
+		return c.saveGameRelations(ctx, game, nil, nil, false)
 	}
 	root := filepath.Dir(game.InstallPath)
 	if game.Store == "steam" {
@@ -453,17 +454,11 @@ func (c *Coordinator) RemapGame(ctx context.Context, gameID, catalogID string) e
 	}
 	remapped.ID = game.ID
 	remapped.DisplayName = game.DisplayName
-	if err := c.repository.UpsertGame(ctx, remapped); err != nil {
-		return err
-	}
-	if err := c.repository.ReplaceCatalogPaths(ctx, game.ID, paths); err != nil {
-		return err
-	}
 	registryPaths, err := discovery.RegistryPaths(game.ID, game.Store, game.StoreID, game.InstallPath, definition)
 	if err != nil {
 		return err
 	}
-	if err := c.registry.ReplaceCatalogRegistry(ctx, game.ID, registryPaths); err != nil {
+	if err := c.saveGameRelations(ctx, remapped, paths, registryPaths, true); err != nil {
 		return err
 	}
 	c.ReconcileWatches(ctx)
@@ -471,13 +466,30 @@ func (c *Coordinator) RemapGame(ctx context.Context, gameID, catalogID string) e
 }
 
 func (c *Coordinator) ConfigureLocal(ctx context.Context, local config.Local) error {
+	c.syncMu.Lock()
+	defer c.syncMu.Unlock()
+	c.backupMu.Lock()
+	defer c.backupMu.Unlock()
 	if !filepath.IsAbs(filepath.Clean(local.LocalBackupDir)) {
 		return errors.New("local backup location must be an absolute path")
 	}
 	if err := os.MkdirAll(local.LocalBackupDir, 0o700); err != nil {
 		return fmt.Errorf("create local backup location: %w", err)
 	}
+	oldRoot := c.snapshots.BlobRoot()
+	if relocator, ok := c.repository.(interface {
+		RelocateBlobs(context.Context, string) error
+	}); ok {
+		if err := relocator.RelocateBlobs(ctx, filepath.Clean(local.LocalBackupDir)); err != nil {
+			return fmt.Errorf("move local backup blobs: %w", err)
+		}
+	}
 	if err := c.settings.ConfigureLocal(local); err != nil {
+		if relocator, ok := c.repository.(interface {
+			RelocateBlobs(context.Context, string) error
+		}); ok {
+			_ = relocator.RelocateBlobs(ctx, oldRoot)
+		}
 		return err
 	}
 	c.snapshots.SetBlobRoot(filepath.Clean(local.LocalBackupDir))
@@ -555,17 +567,19 @@ func errorMessage(err error) string {
 
 func (c *Coordinator) Backup(ctx context.Context, gameID string) (core.Snapshot, error) {
 	c.backupMu.Lock()
-	defer c.backupMu.Unlock()
 	game, err := c.repository.Game(ctx, gameID)
 	if err != nil {
+		c.backupMu.Unlock()
 		return core.Snapshot{}, err
 	}
 	if game.Hidden {
+		c.backupMu.Unlock()
 		return core.Snapshot{}, core.ErrGameNotFound
 	}
 	c.events.PublishContext(ctx, core.Event{Type: "snapshot.started", GameID: gameID})
 	created, err := c.snapshots.Create(ctx, game)
 	if err != nil {
+		c.backupMu.Unlock()
 		eventType := "snapshot.failed"
 		if errors.Is(err, snapshot.ErrNoFiles) || errors.Is(err, snapshot.ErrUnchanged) {
 			eventType = "snapshot.skipped"
@@ -573,10 +587,17 @@ func (c *Coordinator) Backup(ctx context.Context, gameID string) (core.Snapshot,
 		c.events.PublishContext(ctx, core.Event{Type: eventType, GameID: gameID, Message: err.Error()})
 		return core.Snapshot{}, err
 	}
+	c.backupMu.Unlock()
 	c.events.PublishContext(ctx, core.Event{Type: "snapshot.completed", GameID: gameID, Data: map[string]any{"snapshotId": created.ID, "remote": false}})
+	// Retention is serialized with remote sync and other mutations. Snapshot
+	// creation has already committed locally, so network I/O never holds its lock.
+	c.syncMu.Lock()
+	c.backupMu.Lock()
 	if err := c.applyLocalRetention(ctx, gameID); err != nil {
 		slog.Error("apply snapshot retention", "game_id", gameID, "error", err)
 	}
+	c.backupMu.Unlock()
+	c.syncMu.Unlock()
 	return created, nil
 }
 
@@ -616,8 +637,8 @@ func (c *Coordinator) applyLocalRetention(ctx context.Context, gameID string) er
 }
 
 func (c *Coordinator) Restore(ctx context.Context, gameID, snapshotID string) (core.Snapshot, error) {
-	c.backupMu.Lock()
-	defer c.backupMu.Unlock()
+	c.syncMu.Lock()
+	defer c.syncMu.Unlock()
 	game, err := c.repository.Game(ctx, gameID)
 	if err != nil {
 		return core.Snapshot{}, err
@@ -642,6 +663,8 @@ func (c *Coordinator) Restore(ctx context.Context, gameID, snapshotID string) (c
 		}
 		c.settings.RecordR2Success()
 	}
+	c.backupMu.Lock()
+	defer c.backupMu.Unlock()
 	c.events.PublishContext(ctx, core.Event{Type: "restore.started", GameID: gameID})
 	preRestore, err := c.snapshots.Restore(ctx, game, snapshotID)
 	if err != nil {
@@ -760,8 +783,8 @@ func (c *Coordinator) syncWatchedPending(ctx context.Context) (core.SyncResult, 
 }
 
 func (c *Coordinator) syncPending(ctx context.Context, load func(context.Context) ([]core.Snapshot, error)) (core.SyncResult, error) {
-	c.backupMu.Lock()
-	defer c.backupMu.Unlock()
+	c.syncMu.Lock()
+	defer c.syncMu.Unlock()
 	r2, err := c.settings.R2(ctx)
 	if err != nil {
 		c.settings.RecordR2Failure(err)
@@ -815,8 +838,8 @@ func syncSnapshotBatch(snapshots []core.Snapshot, upload func(core.Snapshot) err
 }
 
 func (c *Coordinator) SyncGame(ctx context.Context, gameID string) error {
-	c.backupMu.Lock()
-	defer c.backupMu.Unlock()
+	c.syncMu.Lock()
+	defer c.syncMu.Unlock()
 	game, err := c.repository.Game(ctx, gameID)
 	if err != nil {
 		return err
@@ -844,8 +867,8 @@ func (c *Coordinator) SyncGame(ctx context.Context, gameID string) error {
 }
 
 func (c *Coordinator) automaticSync(ctx context.Context, target core.Snapshot) error {
-	c.backupMu.Lock()
-	defer c.backupMu.Unlock()
+	c.syncMu.Lock()
+	defer c.syncMu.Unlock()
 	game, err := c.repository.Game(ctx, target.GameID)
 	if err != nil {
 		return err
@@ -892,9 +915,12 @@ func (c *Coordinator) applyRetention(ctx context.Context, gameID string) error {
 			}
 			c.settings.RecordR2Success()
 		}
+		c.backupMu.Lock()
 		if err := c.pending.DeleteSnapshot(ctx, target.ID); err != nil {
+			c.backupMu.Unlock()
 			return err
 		}
+		c.backupMu.Unlock()
 		c.events.PublishContext(ctx, core.Event{Type: "snapshot.retained", GameID: gameID, Data: map[string]any{"deletedSnapshotId": target.ID}})
 	}
 	return nil
@@ -947,8 +973,8 @@ func (c *Coordinator) uploadAll(ctx context.Context, r2 *remote.R2, snapshots []
 }
 
 func (c *Coordinator) DeleteSnapshot(ctx context.Context, gameID, snapshotID string, remoteToo bool) error {
-	c.backupMu.Lock()
-	defer c.backupMu.Unlock()
+	c.syncMu.Lock()
+	defer c.syncMu.Unlock()
 	target, err := c.pending.Snapshot(ctx, snapshotID)
 	if err != nil {
 		return err
@@ -969,9 +995,12 @@ func (c *Coordinator) DeleteSnapshot(ctx context.Context, gameID, snapshotID str
 		}
 		c.settings.RecordR2Success()
 	}
+	c.backupMu.Lock()
 	if err := c.pending.DeleteSnapshot(ctx, snapshotID); err != nil {
+		c.backupMu.Unlock()
 		return err
 	}
+	c.backupMu.Unlock()
 	c.events.PublishContext(ctx, core.Event{Type: "snapshot.deleted", GameID: gameID, Data: map[string]any{"snapshotId": snapshotID, "remote": remoteToo}})
 	return nil
 }

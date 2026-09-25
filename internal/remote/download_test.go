@@ -71,7 +71,7 @@ func TestEnsureLocalDownloadsAndVerifiesBlob(t *testing.T) {
 	if repository.path == "" || filepath.Ext(repository.path) != ".zst" {
 		t.Fatalf("downloaded blob was not indexed: %q", repository.path)
 	}
-	if err := verifyCompressedBlob(repository.path, hashValue); err != nil {
+	if err := verifyCompressedBlob(repository.path, hashValue, int64(len(raw))); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := os.Stat(repository.path); err != nil {

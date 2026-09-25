@@ -400,6 +400,14 @@ func (s *Service) Restore(ctx context.Context, game core.Game, snapshotID string
 	if err != nil && !errors.Is(err, ErrNoFiles) && !errors.Is(err, ErrUnchanged) {
 		return core.Snapshot{}, fmt.Errorf("create pre-restore snapshot: %w", err)
 	}
+	rollbackSnapshot := preRestore
+	if errors.Is(err, ErrUnchanged) {
+		if latest, latestErr := s.sources.LatestSnapshot(ctx, game.ID); latestErr == nil {
+			rollbackSnapshot = latest
+		} else if !errors.Is(latestErr, sql.ErrNoRows) {
+			return core.Snapshot{}, fmt.Errorf("load pre-restore snapshot for rollback: %w", latestErr)
+		}
+	}
 	paths, err := s.repository.GamePaths(ctx, game.ID)
 	if err != nil {
 		return core.Snapshot{}, err
@@ -410,6 +418,12 @@ func (s *Service) Restore(ctx context.Context, game core.Game, snapshotID string
 			sources[sourceKey(path)] = path
 		}
 	}
+	staged := make([]stagedRestoreFile, 0, len(target.Files))
+	defer func() {
+		for _, item := range staged {
+			_ = removeTemporary(item.temporary)
+		}
+	}()
 	for _, file := range target.Files {
 		if err := ctx.Err(); err != nil {
 			return core.Snapshot{}, err
@@ -422,18 +436,116 @@ func (s *Service) Restore(ctx context.Context, game core.Game, snapshotID string
 		if err != nil {
 			return core.Snapshot{}, err
 		}
-		if err := s.restoreFile(ctx, destination, file); err != nil {
+		item, err := s.stageRestoreFile(ctx, destination, file)
+		if err != nil {
+			return core.Snapshot{}, err
+		}
+		staged = append(staged, item)
+	}
+	var registryData []byte
+	if target.Registry != nil {
+		blobPath, err := s.repository.BlobPath(ctx, target.Registry.Hash)
+		if err != nil {
+			return core.Snapshot{}, err
+		}
+		registryData, err = readCompressedBlob(blobPath, target.Registry.Hash, target.Registry.Size)
+		if err != nil {
 			return core.Snapshot{}, err
 		}
 	}
+	backups, err := activateRestoredFiles(staged)
+	if err != nil {
+		return core.Snapshot{}, err
+	}
 	if target.Registry != nil {
-		if err := s.restoreRegistry(ctx, target.Registry); err != nil {
-			return core.Snapshot{}, err
+		if err := (registrybackup.Service{}).Restore(ctx, registryData); err != nil {
+			rollbackRegistryErr := s.restorePreviousRegistry(context.WithoutCancel(ctx), rollbackSnapshot)
+			return core.Snapshot{}, errors.Join(fmt.Errorf("restore Windows registry: %w", err), rollbackRegistryErr, rollbackRestoredFiles(backups))
 		}
+	}
+	var cleanupErr error
+	for _, item := range backups {
+		cleanupErr = errors.Join(cleanupErr, removeTemporary(item.backup))
+	}
+	if cleanupErr != nil {
+		return preRestore, fmt.Errorf("remove preserved saves after restore: %w", cleanupErr)
 	}
 	return preRestore, nil
 }
 
+type stagedRestoreFile struct {
+	destination string
+	temporary   string
+}
+
+type restoreBackup struct {
+	activated   bool
+	destination string
+	backup      string
+}
+
+func activateRestoredFiles(staged []stagedRestoreFile) ([]restoreBackup, error) {
+	backups := make([]restoreBackup, 0, len(staged))
+	rollback := func() error { return rollbackRestoredFiles(backups) }
+	for _, item := range staged {
+		backupID, err := core.NewID(time.Now().UTC())
+		if err != nil {
+			return nil, errors.Join(err, rollback())
+		}
+		backup := item.destination + ".saveknot-old-" + backupID
+		if _, err := os.Stat(item.destination); err == nil {
+			if err := os.Rename(item.destination, backup); err != nil {
+				return nil, errors.Join(fmt.Errorf("preserve current save: %w", err), rollback())
+			}
+			backups = append(backups, restoreBackup{destination: item.destination, backup: backup})
+		} else if !errors.Is(err, os.ErrNotExist) {
+			return nil, errors.Join(fmt.Errorf("inspect restore destination: %w", err), rollback())
+		} else {
+			backups = append(backups, restoreBackup{destination: item.destination})
+		}
+		if err := os.Rename(item.temporary, item.destination); err != nil {
+			return nil, errors.Join(fmt.Errorf("activate restored save: %w", err), rollback())
+		}
+		backups[len(backups)-1].activated = true
+	}
+	return backups, nil
+}
+
+func rollbackRestoredFiles(backups []restoreBackup) error {
+	var result error
+	for index := len(backups) - 1; index >= 0; index-- {
+		item := backups[index]
+		if item.activated {
+			if err := os.Remove(item.destination); err != nil && !errors.Is(err, os.ErrNotExist) {
+				result = errors.Join(result, err)
+			}
+		}
+		if item.backup != "" {
+			if err := os.Rename(item.backup, item.destination); err != nil && !errors.Is(err, os.ErrNotExist) {
+				result = errors.Join(result, err)
+			}
+		}
+	}
+	return result
+}
+
+func (s *Service) restorePreviousRegistry(ctx context.Context, snapshot core.Snapshot) error {
+	if snapshot.Registry == nil {
+		return nil
+	}
+	blobPath, err := s.repository.BlobPath(ctx, snapshot.Registry.Hash)
+	if err != nil {
+		return fmt.Errorf("load pre-restore registry blob: %w", err)
+	}
+	data, err := readCompressedBlob(blobPath, snapshot.Registry.Hash, snapshot.Registry.Size)
+	if err != nil {
+		return fmt.Errorf("verify pre-restore registry blob: %w", err)
+	}
+	if err := (registrybackup.Service{}).Restore(ctx, data); err != nil {
+		return fmt.Errorf("roll back Windows registry: %w", err)
+	}
+	return nil
+}
 func (s *Service) restoreRegistry(ctx context.Context, registrySnapshot *core.SnapshotRegistry) error {
 	blobPath, err := s.repository.BlobPath(ctx, registrySnapshot.Hash)
 	if err != nil {
@@ -472,6 +584,51 @@ func readCompressedBlob(path, expectedHash string, size int64) ([]byte, error) {
 		return nil, errors.New("registry blob failed SHA-256 verification")
 	}
 	return data, nil
+}
+func (s *Service) stageRestoreFile(ctx context.Context, destination string, file core.SnapshotFile) (stagedRestoreFile, error) {
+	blobPath, err := s.repository.BlobPath(ctx, file.Hash)
+	if err != nil {
+		return stagedRestoreFile{}, err
+	}
+	//nolint:gosec // blobPath is retrieved from SaveKnot's private blob index.
+	input, err := os.Open(blobPath)
+	if err != nil {
+		return stagedRestoreFile{}, fmt.Errorf("open blob %q: %w", file.Hash, err)
+	}
+	decoder, err := zstd.NewReader(input)
+	if err != nil {
+		return stagedRestoreFile{}, fmt.Errorf("decode blob %q: %w", file.Hash, errors.Join(err, input.Close()))
+	}
+	if err := os.MkdirAll(filepath.Dir(destination), 0o700); err != nil {
+		decoder.Close()
+		return stagedRestoreFile{}, fmt.Errorf("create restore directory: %w", errors.Join(err, input.Close()))
+	}
+	temporary, err := os.CreateTemp(filepath.Dir(destination), ".saveknot-restore-*")
+	if err != nil {
+		decoder.Close()
+		return stagedRestoreFile{}, fmt.Errorf("create restore file: %w", errors.Join(err, input.Close()))
+	}
+	temporaryPath := temporary.Name()
+	digest := sha256.New()
+	written, copyErr := io.Copy(io.MultiWriter(temporary, digest), io.LimitReader(decoder, file.Size+1))
+	decoder.Close()
+	closeErr := errors.Join(input.Close(), temporary.Close())
+	if err := errors.Join(copyErr, closeErr); err != nil {
+		return stagedRestoreFile{}, fmt.Errorf("write restored file: %w", errors.Join(err, removeTemporary(temporaryPath)))
+	}
+	if written != file.Size {
+		return stagedRestoreFile{}, errors.Join(errors.New("restored blob size did not match the snapshot"), removeTemporary(temporaryPath))
+	}
+	if !strings.EqualFold(hex.EncodeToString(digest.Sum(nil)), file.Hash) {
+		return stagedRestoreFile{}, errors.Join(errors.New("restored blob failed hash verification"), removeTemporary(temporaryPath))
+	}
+	if err := os.Chmod(temporaryPath, fs.FileMode(file.Mode)); err != nil {
+		return stagedRestoreFile{}, fmt.Errorf("restore file permissions: %w", errors.Join(err, removeTemporary(temporaryPath)))
+	}
+	if err := os.Chtimes(temporaryPath, file.Modified, file.Modified); err != nil {
+		return stagedRestoreFile{}, fmt.Errorf("restore file timestamp: %w", errors.Join(err, removeTemporary(temporaryPath)))
+	}
+	return stagedRestoreFile{destination: destination, temporary: temporaryPath}, nil
 }
 
 func restoreDestination(source core.GamePath, file core.SnapshotFile) (string, error) {
