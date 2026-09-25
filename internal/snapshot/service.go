@@ -413,7 +413,11 @@ func (s *Service) Restore(ctx context.Context, game core.Game, snapshotID string
 	if err != nil {
 		return core.Snapshot{}, err
 	}
-	backups, err := s.activateAndRestore(ctx, target.Registry != nil, registryData, rollbackSnapshot, staged)
+	var registryRoots []string
+	if target.Registry != nil {
+		registryRoots = target.Registry.Keys
+	}
+	backups, err := s.activateAndRestore(ctx, target.Registry != nil, registryData, registryRoots, rollbackSnapshot, staged)
 	if err != nil {
 		return core.Snapshot{}, err
 	}
@@ -509,7 +513,7 @@ func (s *Service) loadRestoreRegistry(ctx context.Context, registrySnapshot *cor
 	return readCompressedBlob(blobPath, registrySnapshot.Hash, registrySnapshot.Size)
 }
 
-func (s *Service) activateAndRestore(ctx context.Context, hasRegistry bool, registryData []byte, rollbackSnapshot core.Snapshot, staged []stagedRestoreFile) ([]restoreBackup, error) {
+func (s *Service) activateAndRestore(ctx context.Context, hasRegistry bool, registryData []byte, registryRoots []string, rollbackSnapshot core.Snapshot, staged []stagedRestoreFile) ([]restoreBackup, error) {
 	backups, err := activateRestoredFiles(staged)
 	if err != nil {
 		return nil, err
@@ -517,7 +521,7 @@ func (s *Service) activateAndRestore(ctx context.Context, hasRegistry bool, regi
 	if !hasRegistry {
 		return backups, nil
 	}
-	if err := (registrybackup.Service{}).Restore(ctx, registryData); err != nil {
+	if err := (registrybackup.Service{}).Restore(ctx, registryData, registryRoots); err != nil {
 		rollbackRegistryErr := s.restorePreviousRegistry(context.WithoutCancel(ctx), rollbackSnapshot)
 		return nil, errors.Join(fmt.Errorf("restore Windows registry: %w", err), rollbackRegistryErr, rollbackRestoredFiles(backups))
 	}
@@ -591,7 +595,7 @@ func (s *Service) restorePreviousRegistry(ctx context.Context, snapshot core.Sna
 	if err != nil {
 		return fmt.Errorf("verify pre-restore registry blob: %w", err)
 	}
-	if err := (registrybackup.Service{}).Restore(ctx, data); err != nil {
+	if err := (registrybackup.Service{}).Restore(ctx, data, snapshot.Registry.Keys); err != nil {
 		return fmt.Errorf("roll back Windows registry: %w", err)
 	}
 	return nil

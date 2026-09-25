@@ -558,24 +558,33 @@ func (c *Coordinator) ConfigureLocal(ctx context.Context, local config.Local) er
 		return fmt.Errorf("create local backup location: %w", err)
 	}
 	oldRoot := c.snapshots.BlobRoot()
-	if relocator, ok := c.repository.(interface {
-		RelocateBlobs(context.Context, string) error
-	}); ok {
-		if err := relocator.RelocateBlobs(ctx, filepath.Clean(local.LocalBackupDir)); err != nil {
-			return fmt.Errorf("move local backup blobs: %w", err)
+	newRoot := filepath.Clean(local.LocalBackupDir)
+	receipt, fallbackRelocator, err := c.prepareLocalBlobRelocation(ctx, newRoot)
+	if err != nil {
+		return err
+	}
+	if receipt != nil {
+		if err := receipt.Switch(ctx, true); err != nil {
+			return errors.Join(fmt.Errorf("switch local backup blob paths: %w", err), receipt.Rollback(ctx))
 		}
 	}
 	if err := c.settings.ConfigureLocal(local); err != nil {
-		if relocator, ok := c.repository.(interface {
-			RelocateBlobs(context.Context, string) error
-		}); ok {
-			if rollbackErr := relocator.RelocateBlobs(ctx, oldRoot); rollbackErr != nil {
+		if receipt != nil {
+			return errors.Join(err, receipt.Rollback(ctx))
+		}
+		if fallbackRelocator != nil {
+			if rollbackErr := fallbackRelocator.RelocateBlobs(ctx, oldRoot); rollbackErr != nil {
 				return errors.Join(err, fmt.Errorf("restore previous local backup location: %w", rollbackErr))
 			}
 		}
 		return err
 	}
-	c.snapshots.SetBlobRoot(filepath.Clean(local.LocalBackupDir))
+	c.snapshots.SetBlobRoot(newRoot)
+	if receipt != nil {
+		if err := receipt.CleanupSources(ctx); err != nil {
+			return fmt.Errorf("remove obsolete local backup blobs: %w", err)
+		}
+	}
 	c.ReconcileWatches(ctx)
 	return nil
 }

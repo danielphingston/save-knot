@@ -8,6 +8,6 @@ func backup(context.Context, []string) ([]byte, error) {
 	return nil, ErrUnsupported
 }
 
-func restore(context.Context, []byte) error {
+func restore(context.Context, []byte, []string) error {
 	return ErrUnsupported
 }
