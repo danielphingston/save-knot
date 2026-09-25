@@ -66,7 +66,7 @@ func (s *Syncer) NeedsDownload(ctx context.Context, snapshot core.Snapshot) (boo
 		}
 		seen[file.Hash] = struct{}{}
 		blobPath, err := s.repository.BlobPath(ctx, file.Hash)
-		if err == nil && verifyCompressedBlob(blobPath, file.Hash) != nil {
+		if err == nil && verifyCompressedBlob(blobPath, file.Hash, file.Size) != nil {
 			needsDownload = true
 			continue
 		}
@@ -79,7 +79,7 @@ func (s *Syncer) NeedsDownload(ctx context.Context, snapshot core.Snapshot) (boo
 	}
 	if snapshot.Registry != nil {
 		blobPath, err := s.repository.BlobPath(ctx, snapshot.Registry.Hash)
-		if err == nil && verifyCompressedBlob(blobPath, snapshot.Registry.Hash) != nil {
+		if err == nil && verifyCompressedBlob(blobPath, snapshot.Registry.Hash, snapshot.Registry.Size) != nil {
 			needsDownload = true
 		}
 		if err != nil && !errors.Is(err, sql.ErrNoRows) {
@@ -95,7 +95,7 @@ func (s *Syncer) NeedsDownload(ctx context.Context, snapshot core.Snapshot) (boo
 func (s *Syncer) ensureLocalBlob(ctx context.Context, reader objectReader, hashValue string, originalSize int64, blobRoot string) error {
 	existing, err := s.repository.BlobPath(ctx, hashValue)
 	if err == nil {
-		if verifyErr := verifyCompressedBlob(existing, hashValue); verifyErr == nil {
+		if verifyErr := verifyCompressedBlob(existing, hashValue, originalSize); verifyErr == nil {
 			return nil
 		}
 	} else if !errors.Is(err, sql.ErrNoRows) {
@@ -126,7 +126,7 @@ func (s *Syncer) ensureLocalBlob(ctx context.Context, reader objectReader, hashV
 	if size > 0 && written != size {
 		return errors.Join(fmt.Errorf("remote blob %q was truncated: expected %d bytes, received %d", hashValue, size, written), removeFile(temporaryPath))
 	}
-	if err := verifyCompressedBlob(temporaryPath, hashValue); err != nil {
+	if err := verifyCompressedBlob(temporaryPath, hashValue, originalSize); err != nil {
 		return errors.Join(err, removeFile(temporaryPath))
 	}
 	directory := filepath.Join(blobRoot, hashValue[:2])
@@ -148,7 +148,10 @@ func (s *Syncer) ensureLocalBlob(ctx context.Context, reader objectReader, hashV
 	return s.repository.SaveBlob(ctx, hashValue, destination, originalSize, written)
 }
 
-func verifyCompressedBlob(blobPath, expectedHash string) error {
+func verifyCompressedBlob(blobPath, expectedHash string, expectedSize int64) error {
+	if expectedSize < 0 {
+		return errors.New("compressed blob has an invalid original size")
+	}
 	//nolint:gosec // The path comes from SaveKnot's private blob index or staging directory.
 	file, err := os.Open(blobPath)
 	if err != nil {
@@ -159,10 +162,13 @@ func verifyCompressedBlob(blobPath, expectedHash string) error {
 		return errors.Join(fmt.Errorf("decode downloaded blob: %w", err), file.Close())
 	}
 	digest := sha256.New()
-	_, copyErr := io.Copy(digest, decoder)
+	written, copyErr := io.Copy(digest, io.LimitReader(decoder, expectedSize+1))
 	decoder.Close()
 	if err := errors.Join(copyErr, file.Close()); err != nil {
 		return fmt.Errorf("verify downloaded blob: %w", err)
+	}
+	if written != expectedSize {
+		return errors.New("downloaded blob size did not match the snapshot")
 	}
 	if !strings.EqualFold(hex.EncodeToString(digest.Sum(nil)), expectedHash) {
 		return errors.New("downloaded blob failed SHA-256 verification")

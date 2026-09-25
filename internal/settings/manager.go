@@ -124,11 +124,22 @@ func (m *Manager) ConfigureLocal(local config.Local) error {
 	return nil
 }
 
+type uploadStateInvalidator interface {
+	InvalidateBlobUploads(context.Context, string) error
+}
+
 type Manager struct {
-	mu     sync.RWMutex
-	path   string
-	config config.Config
-	vault  vault
+	mu          sync.RWMutex
+	path        string
+	config      config.Config
+	vault       vault
+	uploadState uploadStateInvalidator
+}
+
+func (m *Manager) SetUploadStateInvalidator(invalidator uploadStateInvalidator) {
+	m.mu.Lock()
+	m.uploadState = invalidator
+	m.mu.Unlock()
 }
 
 func New(path string, cfg config.Config, credentialVault vault) (*Manager, error) {
@@ -176,6 +187,15 @@ func (m *Manager) ConfigureR2(ctx context.Context, settings config.R2, secret st
 	}
 	if err := client.Test(ctx); err != nil {
 		return err
+	}
+	m.mu.RLock()
+	invalidator := m.uploadState
+	m.mu.RUnlock()
+	if invalidator != nil {
+		identity := strings.Join([]string{settings.AccountID, settings.Bucket, settings.ObjectPrefix()}, "/")
+		if err := invalidator.InvalidateBlobUploads(ctx, identity); err != nil {
+			return err
+		}
 	}
 	credentialID := "r2-default"
 	if err := m.vault.Set(credentialID, secret); err != nil {

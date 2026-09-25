@@ -65,6 +65,10 @@ func Build(ctx context.Context, dataDir, listenOverride string) (*Application, e
 	if err != nil {
 		return nil, err
 	}
+	if err := repository.CleanupPendingBlobSources(ctx, settingsManager.Config().LocalBackupDir); err != nil {
+		slog.Warn("retry obsolete local backup blob cleanup", "error", err)
+	}
+	settingsManager.SetUploadStateInvalidator(repository)
 	watchManager, err := watcher.New()
 	if err != nil {
 		closeErr := repository.Close()

@@ -33,7 +33,29 @@ func backup(ctx context.Context, roots []string) ([]byte, error) {
 			return nil, fmt.Errorf("back up registry key %q: %w", rootPath, err)
 		}
 	}
+	if err := deduplicateKeys(&document); err != nil {
+		return nil, err
+	}
 	return json.Marshal(document)
+}
+
+func deduplicateKeys(document *Document) error {
+	seen := make(map[string]struct{}, len(document.Keys))
+	unique := document.Keys[:0]
+	for _, key := range document.Keys {
+		normalized, err := normalizePath(key.Path)
+		if err != nil {
+			return fmt.Errorf("invalid registry key path %q: %w", key.Path, err)
+		}
+		folded := strings.ToLower(normalized)
+		if _, exists := seen[folded]; exists {
+			continue
+		}
+		seen[folded] = struct{}{}
+		unique = append(unique, key)
+	}
+	document.Keys = unique
+	return nil
 }
 
 func readKey(ctx context.Context, key registry.Key, fullPath string, document *Document) error {
@@ -99,7 +121,7 @@ func readValue(key registry.Key, name string) (ValueData, error) {
 	}
 }
 
-func restore(ctx context.Context, data []byte) error {
+func restore(ctx context.Context, data []byte, roots []string) error {
 	var document Document
 	if err := json.Unmarshal(data, &document); err != nil {
 		return fmt.Errorf("decode registry backup: %w", err)
@@ -107,28 +129,188 @@ func restore(ctx context.Context, data []byte) error {
 	if document.Version != 1 {
 		return fmt.Errorf("unsupported registry backup version %d", document.Version)
 	}
-	for _, keyData := range document.Keys {
+	if err := validateDocument(document, roots); err != nil {
+		return err
+	}
+	before, err := backup(ctx, roots)
+	if err != nil {
+		return fmt.Errorf("capture registry state before restore: %w", err)
+	}
+	if err := applyDocument(ctx, document, roots); err != nil {
+		var previous Document
+		decodeErr := json.Unmarshal(before, &previous)
+		if decodeErr != nil {
+			return errors.Join(err, fmt.Errorf("decode captured registry state: %w", decodeErr))
+		}
+		rollbackErr := applyDocument(context.WithoutCancel(ctx), previous, roots)
+		return errors.Join(err, wrapError("roll back registry restore", rollbackErr))
+	}
+	return nil
+}
+
+func applyDocument(ctx context.Context, document Document, roots []string) error {
+	for _, rootPath := range roots {
 		if err := ctx.Err(); err != nil {
 			return err
 		}
-		root, relative, err := splitRoot(keyData.Path)
+		root, relative, err := splitRoot(rootPath)
+		if err != nil {
+			return fmt.Errorf("invalid configured registry root %q: %w", rootPath, err)
+		}
+		rootNormalized, err := normalizePath(rootPath)
 		if err != nil {
 			return err
 		}
-		key, _, err := registry.CreateKey(root, relative, registry.SET_VALUE)
-		if err != nil {
-			return fmt.Errorf("create registry key %q: %w", keyData.Path, err)
-		}
-		for _, value := range keyData.Values {
-			if err := writeValue(key, value); err != nil {
-				return fmt.Errorf("restore registry value %q in %q: %w", value.Name, keyData.Path, errors.Join(err, key.Close()))
+		desired := newKeyNode("")
+		for index := range document.Keys {
+			keyData := &document.Keys[index]
+			keyNormalized, err := normalizePath(keyData.Path)
+			if err != nil {
+				return err
 			}
+			if !strings.EqualFold(keyNormalized, rootNormalized) && !strings.HasPrefix(strings.ToLower(keyNormalized), strings.ToLower(rootNormalized)+"/") {
+				continue
+			}
+			relativeKey := strings.TrimPrefix(keyNormalized[len(rootNormalized):], "/")
+			insertKeyData(desired, relativeKey, keyData)
 		}
-		if err := key.Close(); err != nil {
+		if desired.data == nil && len(desired.children) == 0 {
+			if err := deleteTree(ctx, root, relative); err != nil {
+				return fmt.Errorf("remove absent registry root %q: %w", rootPath, err)
+			}
+			continue
+		}
+		if err := reconcileKey(ctx, root, relative, desired); err != nil {
+			return fmt.Errorf("reconcile registry root %q: %w", rootPath, err)
+		}
+	}
+	return nil
+}
+
+type keyNode struct {
+	name     string
+	data     *KeyData
+	children map[string]*keyNode
+}
+
+func newKeyNode(name string) *keyNode {
+	return &keyNode{name: name, children: make(map[string]*keyNode)}
+}
+
+func insertKeyData(root *keyNode, relative string, data *KeyData) {
+	node := root
+	if relative != "" {
+		for _, name := range strings.Split(relative, "/") {
+			folded := strings.ToLower(name)
+			child := node.children[folded]
+			if child == nil {
+				child = newKeyNode(name)
+				node.children[folded] = child
+			}
+			node = child
+		}
+	}
+	node.data = data
+}
+
+func reconcileKey(ctx context.Context, root registry.Key, path string, desired *keyNode) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	key, _, err := registry.CreateKey(root, path, registry.READ|registry.SET_VALUE)
+	if err != nil {
+		return fmt.Errorf("create registry key %q: %w", path, err)
+	}
+	var result error
+	valueNames, readErr := key.ReadValueNames(-1)
+	if errors.Is(readErr, io.EOF) {
+		readErr = nil
+	}
+	result = errors.Join(result, readErr)
+	expectedValues := make(map[string]ValueData)
+	if desired.data != nil {
+		for _, value := range desired.data.Values {
+			expectedValues[strings.ToLower(value.Name)] = value
+		}
+	}
+	for _, name := range valueNames {
+		if _, exists := expectedValues[strings.ToLower(name)]; !exists {
+			result = errors.Join(result, key.DeleteValue(name))
+		}
+	}
+	for _, value := range expectedValues {
+		result = errors.Join(result, writeValue(key, value))
+	}
+	children, childErr := key.ReadSubKeyNames(-1)
+	if errors.Is(childErr, io.EOF) {
+		childErr = nil
+	}
+	result = errors.Join(result, childErr)
+	if closeErr := key.Close(); closeErr != nil {
+		return errors.Join(result, closeErr)
+	}
+	if result != nil {
+		return result
+	}
+	seenChildren := make(map[string]struct{}, len(children))
+	for _, child := range children {
+		folded := strings.ToLower(child)
+		childNode := desired.children[folded]
+		childPath := path + `\` + child
+		if childNode == nil {
+			if err := deleteTree(ctx, root, childPath); err != nil {
+				return fmt.Errorf("delete extra registry key %q: %w", childPath, err)
+			}
+			continue
+		}
+		seenChildren[folded] = struct{}{}
+		if err := reconcileKey(ctx, root, childPath, childNode); err != nil {
+			return err
+		}
+	}
+	for folded, childNode := range desired.children {
+		if _, exists := seenChildren[folded]; exists {
+			continue
+		}
+		childPath := path + `\` + childNode.name
+		if err := reconcileKey(ctx, root, childPath, childNode); err != nil {
 			return err
 		}
 	}
 	return nil
+}
+
+func deleteTree(ctx context.Context, root registry.Key, path string) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	key, err := registry.OpenKey(root, path, registry.READ)
+	if errors.Is(err, registry.ErrNotExist) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	children, readErr := key.ReadSubKeyNames(-1)
+	if errors.Is(readErr, io.EOF) {
+		readErr = nil
+	}
+	if err := errors.Join(readErr, key.Close()); err != nil {
+		return err
+	}
+	for _, child := range children {
+		if err := deleteTree(ctx, root, path+`\`+child); err != nil {
+			return err
+		}
+	}
+	return registry.DeleteKey(root, path)
+}
+
+func wrapError(prefix string, err error) error {
+	if err == nil {
+		return nil
+	}
+	return fmt.Errorf("%s: %w", prefix, err)
 }
 
 func writeValue(key registry.Key, value ValueData) error {

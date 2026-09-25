@@ -90,6 +90,39 @@ func TestBuildNormalizesRelativeDataAndBackupPaths(t *testing.T) {
 	}
 }
 
+func TestConfigureLocalWaitsForSyncMutationLock(t *testing.T) {
+	application, paths := buildBackupTestApplication(t)
+	oldRoot := application.coordinator.snapshots.BlobRoot()
+	newRoot := filepath.Join(paths.Root, "relocated-backups")
+	done := make(chan error, 1)
+	application.coordinator.syncMu.Lock()
+	started := make(chan struct{})
+	go func() {
+		close(started)
+		done <- application.coordinator.ConfigureLocal(context.Background(), config.Local{LocalBackupDir: newRoot})
+	}()
+	<-started
+	select {
+	case err := <-done:
+		application.coordinator.syncMu.Unlock()
+		t.Fatalf("local configuration bypassed the sync mutation lock: %v", err)
+	case <-time.After(100 * time.Millisecond):
+	}
+	if got := application.coordinator.snapshots.BlobRoot(); got != oldRoot {
+		application.coordinator.syncMu.Unlock()
+		t.Fatalf("blob root changed while remote mutation was active: %q", got)
+	}
+	application.coordinator.syncMu.Unlock()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("local configuration remained blocked after releasing sync lock")
+	}
+}
+
 func TestBackupPublishesSkippedWhenNoFilesExist(t *testing.T) {
 	application, _ := buildBackupTestApplication(t)
 	game := core.Game{ID: "empty", DisplayName: "Empty", Store: "custom", Enabled: true, SyncEnabled: true}

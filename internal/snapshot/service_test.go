@@ -96,3 +96,58 @@ func TestCreateReturnsNoFilesForMissingPath(t *testing.T) {
 		t.Fatalf("expected ErrNoFiles, got %v", err)
 	}
 }
+
+func TestRestoreSucceedsWhenCurrentSaveIsMissing(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	root := t.TempDir()
+	store, err := database.Open(ctx, filepath.Join(root, "state.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if err := store.Close(); err != nil {
+			t.Error(err)
+		}
+	})
+	savePath := filepath.Join(root, "slot.dat")
+	if err := os.WriteFile(savePath, []byte("target version"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	game := core.Game{ID: "game-a", DisplayName: "Game A", Store: "custom", Enabled: true}
+	if err := store.UpsertGame(ctx, game); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.AddPath(ctx, core.GamePath{ID: "path-a", GameID: game.ID, Source: "custom", Template: savePath, Resolved: savePath, Enabled: true}); err != nil {
+		t.Fatal(err)
+	}
+	service := New(store, store, filepath.Join(root, "blobs"), "device-a")
+	target, err := service.Create(ctx, game)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if target.Registry != nil {
+		t.Fatalf("target unexpectedly includes registry state: %#v", target.Registry)
+	}
+	if err := os.Remove(savePath); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := service.Create(ctx, game); !errors.Is(err, ErrNoFiles) {
+		t.Fatalf("create with missing current save = %v, want ErrNoFiles", err)
+	}
+
+	preRestore, err := service.Restore(ctx, game, target.ID)
+	if err != nil {
+		t.Fatalf("restore with missing current save failed: %v", err)
+	}
+	if preRestore.ID != "" {
+		t.Fatalf("pre-restore snapshot = %q, want zero snapshot after ErrNoFiles", preRestore.ID)
+	}
+	got, err := os.ReadFile(savePath)
+	if err != nil {
+		t.Fatalf("restored save file was not recreated: %v", err)
+	}
+	if string(got) != "target version" {
+		t.Fatalf("restored save = %q, want %q", got, "target version")
+	}
+}

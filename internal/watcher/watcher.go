@@ -160,9 +160,9 @@ func (m *Manager) flushPending(now time.Time, pending map[string]pendingChange, 
 		select {
 		case m.jobs <- gameID:
 			lastQueued[gameID] = now
+			delete(pending, gameID)
 		default:
 		}
-		delete(pending, gameID)
 	}
 }
 
@@ -179,6 +179,7 @@ func snapshotDue(now, first, lastQueued time.Time, policy core.BackupPolicy) tim
 
 func (m *Manager) applyTargets(revised []Target) map[string][]Target {
 	targets := make(map[string][]Target)
+	desired := make(map[string]struct{})
 	for _, target := range revised {
 		root, err := nearestExistingDirectory(target.Path)
 		if err != nil {
@@ -187,6 +188,17 @@ func (m *Manager) applyTargets(revised []Target) map[string][]Target {
 		targets[root] = append(targets[root], target)
 		if err := m.addTarget(root, target.Path); err != nil {
 			slog.Warn("watch save directory", "path", root, "error", err)
+		}
+		if err := collectTargetWatches(target.Path, root, desired); err != nil {
+			slog.Warn("collect save directory watches", "path", target.Path, "error", err)
+		}
+	}
+	for _, path := range m.watcher.WatchList() {
+		if _, keep := desired[path]; keep {
+			continue
+		}
+		if err := m.watcher.Remove(path); err != nil && !errors.Is(err, fsnotify.ErrNonExistentWatch) {
+			slog.Warn("remove obsolete filesystem watch", "path", path, "error", err)
 		}
 	}
 	return targets
@@ -215,6 +227,33 @@ func (m *Manager) addTree(root string) error {
 			if err := m.watcher.Add(path); err != nil && !errors.Is(err, os.ErrNotExist) {
 				return err
 			}
+		}
+		return nil
+	})
+}
+
+func collectTargetWatches(target, nearest string, directories map[string]struct{}) error {
+	info, err := os.Stat(target)
+	if err != nil {
+		if !errors.Is(err, os.ErrNotExist) {
+			return err
+		}
+		directories[nearest] = struct{}{}
+		return nil
+	}
+	if !info.IsDir() {
+		directories[nearest] = struct{}{}
+		return nil
+	}
+	return filepath.WalkDir(target, func(path string, entry fs.DirEntry, walkErr error) error {
+		if walkErr != nil {
+			if errors.Is(walkErr, fs.ErrPermission) {
+				return fs.SkipDir
+			}
+			return walkErr
+		}
+		if entry.IsDir() {
+			directories[path] = struct{}{}
 		}
 		return nil
 	})
