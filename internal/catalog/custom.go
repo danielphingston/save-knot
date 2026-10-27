@@ -52,28 +52,29 @@ func LoadCustomManifests(ctx context.Context, client *http.Client, sources []str
 	return manifests, errors.Join(failures...)
 }
 
-func readCustomManifest(ctx context.Context, client *http.Client, source string) ([]byte, error) {
-	var reader io.ReadCloser
-	if IsManifestURL(source) {
-		request, err := http.NewRequestWithContext(ctx, http.MethodGet, source, nil)
-		if err != nil {
-			return nil, err
-		}
-		response, err := client.Do(request)
-		if err != nil {
-			return nil, err
-		}
-		if response.StatusCode != http.StatusOK {
-			return nil, errors.Join(fmt.Errorf("unexpected HTTP status %s", response.Status), response.Body.Close())
-		}
-		reader = response.Body
-	} else {
+func openCustomManifest(ctx context.Context, client *http.Client, source string) (io.ReadCloser, error) {
+	if !IsManifestURL(source) {
 		//nolint:gosec // The user configured this manifest path in their own settings.
-		file, err := os.Open(source)
-		if err != nil {
-			return nil, err
-		}
-		reader = file
+		return os.Open(source)
+	}
+	request, err := http.NewRequestWithContext(ctx, http.MethodGet, source, nil)
+	if err != nil {
+		return nil, err
+	}
+	response, err := client.Do(request)
+	if err != nil {
+		return nil, err
+	}
+	if response.StatusCode != http.StatusOK {
+		return nil, errors.Join(fmt.Errorf("unexpected HTTP status %s", response.Status), response.Body.Close())
+	}
+	return response.Body, nil
+}
+
+func readCustomManifest(ctx context.Context, client *http.Client, source string) ([]byte, error) {
+	reader, err := openCustomManifest(ctx, client, source)
+	if err != nil {
+		return nil, err
 	}
 	data, err := io.ReadAll(io.LimitReader(reader, maxManifestSize+1))
 	if err := errors.Join(err, reader.Close()); err != nil {

@@ -73,21 +73,8 @@ func Compile(ctx context.Context, source io.Reader, destination string, custom .
 		return err
 	}
 	defer func() { err = errors.Join(err, writer.Close()) }()
-	if err := scanManifestEntries(ctx, source, writer.Add); err != nil {
+	if err := fillIndex(ctx, source, transaction, writer, custom); err != nil {
 		return err
-	}
-	if writer.count == 0 {
-		return errors.New("ludusavi manifest did not contain any games")
-	}
-	for _, manifest := range custom {
-		if err := mergeCustomManifest(ctx, transaction, writer, manifest); err != nil {
-			return err
-		}
-	}
-	if fingerprint := customFingerprint(custom); fingerprint != "" {
-		if _, err := transaction.ExecContext(ctx, `INSERT INTO meta (key, value) VALUES ('custom', ?)`, fingerprint); err != nil {
-			return fmt.Errorf("record custom manifests in catalog index: %w", err)
-		}
 	}
 	if err := writer.Close(); err != nil {
 		return err
@@ -113,6 +100,30 @@ var catalogSchema = []string{
 	`CREATE TABLE IF NOT EXISTS gog_ids (id TEXT PRIMARY KEY, game_name TEXT NOT NULL)`,
 	`CREATE TABLE IF NOT EXISTS install_dirs (normalized_dir TEXT PRIMARY KEY, game_name TEXT NOT NULL)`,
 	`CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)`,
+}
+
+// fillIndex writes the primary manifest's games, then merges each custom
+// manifest and records their fingerprint so EnsureIndex can tell when they change.
+func fillIndex(ctx context.Context, source io.Reader, transaction *sql.Tx, writer *indexWriter, custom []CustomManifest) error {
+	if err := scanManifestEntries(ctx, source, writer.Add); err != nil {
+		return err
+	}
+	if writer.count == 0 {
+		return errors.New("ludusavi manifest did not contain any games")
+	}
+	for _, manifest := range custom {
+		if err := mergeCustomManifest(ctx, transaction, writer, manifest); err != nil {
+			return err
+		}
+	}
+	fingerprint := customFingerprint(custom)
+	if fingerprint == "" {
+		return nil
+	}
+	if _, err := transaction.ExecContext(ctx, `INSERT INTO meta (key, value) VALUES ('custom', ?)`, fingerprint); err != nil {
+		return fmt.Errorf("record custom manifests in catalog index: %w", err)
+	}
+	return nil
 }
 
 // mergeCustomManifest adds the manifest's new games and extends games the
