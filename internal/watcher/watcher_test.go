@@ -76,7 +76,11 @@ func TestReconcileConcurrentCallersNeverBlock(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer manager.Close()
+	t.Cleanup(func() {
+		if err := manager.Close(); err != nil {
+			t.Error(err)
+		}
+	})
 	var wg sync.WaitGroup
 	for range 64 {
 		wg.Add(1)

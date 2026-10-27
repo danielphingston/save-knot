@@ -6,6 +6,7 @@ import (
 	"crypto/sha256"
 	"database/sql"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -94,7 +95,10 @@ func TestEnsureLocalRejectsBodyLargerThanDeclared(t *testing.T) {
 	if err := syncer.EnsureLocal(context.Background(), oversizedReader{}, snapshot, root); err == nil {
 		t.Fatal("oversized blob body was accepted")
 	}
-	entries, _ := os.ReadDir(filepath.Join(root, ".staging"))
+	entries, err := os.ReadDir(filepath.Join(root, ".staging"))
+	if err != nil && !errors.Is(err, os.ErrNotExist) {
+		t.Fatal(err)
+	}
 	if len(entries) != 0 {
 		t.Fatalf("staged file was left behind: %d", len(entries))
 	}

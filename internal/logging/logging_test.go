@@ -40,7 +40,11 @@ func TestRotateFailureKeepsLogWritable(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer file.Close()
+	t.Cleanup(func() {
+		if err := file.Close(); err != nil {
+			t.Error(err)
+		}
+	})
 	// A directory at the backup name makes renaming the active log fail.
 	if err := os.MkdirAll(filepath.Join(dir, "saveknot.log.1", "x"), 0o700); err != nil {
 		t.Fatal(err)
