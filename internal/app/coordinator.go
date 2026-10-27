@@ -99,6 +99,7 @@ type Coordinator struct {
 	automaticSyncDone   chan struct{}
 	automaticSyncStop   context.CancelFunc
 	lifecycleMu         sync.Mutex
+	background          sync.WaitGroup
 	syncNowActive       atomic.Bool
 	reconcileMu         sync.Mutex
 	activeSyncSnapshots map[string]struct{}
@@ -170,7 +171,11 @@ func (c *Coordinator) Start(ctx context.Context) {
 	c.queuePendingAutomaticSync(ctx)
 	c.watcher.Start(syncCtx, c.automaticBackup)
 	c.ReconcileWatches(ctx)
-	go c.run(ctx)
+	c.background.Add(1)
+	go func() {
+		defer c.background.Done()
+		c.run(syncCtx)
+	}()
 }
 
 func (c *Coordinator) runAutomaticSync(ctx context.Context, done chan struct{}) {
@@ -247,6 +252,7 @@ func (c *Coordinator) Close() error {
 	if done != nil {
 		<-done
 	}
+	c.background.Wait()
 	return err
 }
 
@@ -415,7 +421,9 @@ func (c *Coordinator) registerLocalSaves(ctx context.Context, index catalog.Inde
 		return 0, 0, duration, err
 	}
 	registered := 0
+	foundIDs := make(map[string]struct{}, len(localGames))
 	for _, found := range localGames {
+		foundIDs[found.Game.ID] = struct{}{}
 		isNew := c.gameIsNew(ctx, found.Game.ID)
 		if err := c.saveGameRelations(ctx, found.Game, found.Paths, nil, false); err != nil {
 			slog.Error("register local save game and paths", "game", found.Game.DisplayName, "error", err)
@@ -426,7 +434,27 @@ func (c *Coordinator) registerLocalSaves(ctx context.Context, index catalog.Inde
 			c.events.PublishContext(ctx, core.Event{Type: "game.discovered", GameID: found.Game.ID})
 		}
 	}
+	c.clearStaleLocalPaths(ctx, foundIDs)
 	return len(localGames), registered, duration, nil
+}
+
+// clearStaleLocalPaths drops catalog paths of local games the latest scan no
+// longer resolves, such as config-only folders registered by older versions,
+// so they stop being backed up. Manual paths are kept.
+func (c *Coordinator) clearStaleLocalPaths(ctx context.Context, found map[string]struct{}) {
+	games, err := c.repository.ListGames(ctx)
+	if err != nil {
+		slog.Error("list games for stale local paths", "error", err)
+		return
+	}
+	for _, game := range games {
+		if _, ok := found[game.ID]; ok || game.Store != "local" {
+			continue
+		}
+		if err := c.repository.ReplaceCatalogPaths(ctx, game.ID, nil); err != nil {
+			slog.Error("clear stale local save paths", "game", game.DisplayName, "error", err)
+		}
+	}
 }
 
 func (c *Coordinator) registerInstalledGames(ctx context.Context, index catalog.Index, installed []discovery.InstalledGame, now time.Time, matchedNames map[string]struct{}, unmatched *[]string) (int, int) {

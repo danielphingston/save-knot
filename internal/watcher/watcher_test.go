@@ -3,6 +3,7 @@ package watcher
 import (
 	"os"
 	"path/filepath"
+	"sync"
 	"testing"
 	"time"
 
@@ -67,5 +68,28 @@ func TestPrunePendingDropsGamesRemovedFromWatchTargets(t *testing.T) {
 	}
 	if _, present := pending["active"]; !present {
 		t.Fatal("active game lost its queued backup")
+	}
+}
+
+func TestReconcileConcurrentCallersNeverBlock(t *testing.T) {
+	manager, err := New()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer manager.Close()
+	var wg sync.WaitGroup
+	for range 64 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			manager.Reconcile(nil)
+		}()
+	}
+	done := make(chan struct{})
+	go func() { wg.Wait(); close(done) }()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("concurrent Reconcile calls blocked")
 	}
 }
