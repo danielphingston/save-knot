@@ -340,7 +340,7 @@ func resolveDefinitionPaths(gameID, store, root, gameDir, storeGameID string, de
 	replacements["<storeGameId>"] = storeGameID
 	var paths []core.GamePath
 	for template, rule := range definition.Files {
-		if !ruleApplies(rule, store) {
+		if !holdsSaves(rule) || !ruleApplies(rule, store) {
 			continue
 		}
 		resolved := filepath.FromSlash(strings.ReplaceAll(template, "<storeUserId>", "*"))
@@ -366,7 +366,7 @@ func resolveDefinitionPaths(gameID, store, root, gameDir, storeGameID string, de
 			})
 		}
 	}
-	return paths, nil
+	return append(paths, ubisoftPaths(gameID, definition, UbisoftRoots(), paths)...), nil
 }
 
 func firstNonEmpty(values ...string) string {

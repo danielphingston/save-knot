@@ -38,7 +38,7 @@ func DiscoverLocalSaves(ctx context.Context, definitions definitionSource, exclu
 		return nil, err
 	}
 	replacements := userPathReplacements(home)
-	jobs, results := startLocalWorkers(ctx, replacements, now)
+	jobs, results := startLocalWorkers(ctx, replacements, UbisoftRoots(), now)
 	feedResult := make(chan error, 1)
 	go func() {
 		feedResult <- feedLocalCandidates(ctx, definitions, excluded, jobs)
@@ -57,13 +57,13 @@ func DiscoverLocalSaves(ctx context.Context, definitions definitionSource, exclu
 	return found, nil
 }
 
-func startLocalWorkers(ctx context.Context, replacements map[string]string, now time.Time) (chan<- localCandidate, <-chan LocalResult) {
+func startLocalWorkers(ctx context.Context, replacements map[string]string, ubisoftRoots []string, now time.Time) (chan<- localCandidate, <-chan LocalResult) {
 	jobs := make(chan localCandidate)
 	results := make(chan LocalResult)
 	var wait sync.WaitGroup
 	wait.Add(localScanWorkers)
 	for range localScanWorkers {
-		go localWorker(ctx, jobs, results, replacements, now, &wait)
+		go localWorker(ctx, jobs, results, replacements, ubisoftRoots, now, &wait)
 	}
 	go func() {
 		wait.Wait()
@@ -72,10 +72,10 @@ func startLocalWorkers(ctx context.Context, replacements map[string]string, now 
 	return jobs, results
 }
 
-func localWorker(ctx context.Context, jobs <-chan localCandidate, results chan<- LocalResult, replacements map[string]string, now time.Time, wait *sync.WaitGroup) {
+func localWorker(ctx context.Context, jobs <-chan localCandidate, results chan<- LocalResult, replacements map[string]string, ubisoftRoots []string, now time.Time, wait *sync.WaitGroup) {
 	defer wait.Done()
 	for candidate := range jobs {
-		result, ok := scanLocalCandidate(candidate, replacements, now)
+		result, ok := scanLocalCandidate(candidate, replacements, ubisoftRoots, now)
 		if !ok {
 			continue
 		}
@@ -102,7 +102,7 @@ func feedLocalCandidates(ctx context.Context, definitions definitionSource, excl
 	})
 }
 
-func scanLocalCandidate(candidate localCandidate, replacements map[string]string, now time.Time) (LocalResult, bool) {
+func scanLocalCandidate(candidate localCandidate, replacements map[string]string, ubisoftRoots []string, now time.Time) (LocalResult, bool) {
 	gameID := stableID("local", candidate.name)
 	seen := make(map[string]struct{})
 	var paths []core.GamePath
@@ -120,6 +120,7 @@ func scanLocalCandidate(candidate localCandidate, replacements map[string]string
 			})
 		}
 	}
+	paths = append(paths, ubisoftPaths(gameID, candidate.definition, ubisoftRoots, paths)...)
 	if len(paths) == 0 {
 		return LocalResult{}, false
 	}
@@ -131,7 +132,7 @@ func scanLocalCandidate(candidate localCandidate, replacements map[string]string
 }
 
 func localMatches(template string, rule catalog.FileRule, replacements map[string]string) []string {
-	if !localRuleApplies(rule) || !userAnchored(template) {
+	if !holdsSaves(rule) || !localRuleApplies(rule) || !userAnchored(template) {
 		return nil
 	}
 	resolved := filepath.FromSlash(template)
