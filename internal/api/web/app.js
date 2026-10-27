@@ -204,6 +204,8 @@ async function gamePage(id, snapshotPage = 0) {
   root.innerHTML = '<p class="loading" role="status">Loading game…</p>';
   const [{ game, paths, registry, exclusions, policy }, snapshots] = await Promise.all([api(`/api/games/${encodeURIComponent(id)}`), api(`/api/games/${encodeURIComponent(id)}/snapshots`)]);
   if (version !== detailVersion || routeVersion !== pageVersion) return;
+  // Registry-only snapshots can serialize without a file list.
+  for (const snapshot of snapshots) snapshot.files ||= [];
   const page = pageItems(snapshots, snapshotPage, 25);
   const snapshotOffset = page.page * 25;
   const canSync = state.status.r2Configured && game.syncEnabled && game.pendingSnapshotCount > 0;
