@@ -118,7 +118,13 @@ func (s *Syncer) ensureLocalBlob(ctx context.Context, reader objectReader, hashV
 		return errors.Join(fmt.Errorf("create staged remote blob: %w", err), body.Close())
 	}
 	temporaryPath := temporary.Name()
-	written, copyErr := io.Copy(temporary, body)
+	// Bound the download by the length the server declared so a misbehaving
+	// endpoint cannot fill the disk before verification runs.
+	var source io.Reader = body
+	if size > 0 {
+		source = io.LimitReader(body, size+1)
+	}
+	written, copyErr := io.Copy(temporary, source)
 	closeErr := errors.Join(body.Close(), temporary.Close())
 	if err := errors.Join(copyErr, closeErr); err != nil {
 		return fmt.Errorf("download remote blob %q: %w", hashValue, errors.Join(err, removeFile(temporaryPath)))

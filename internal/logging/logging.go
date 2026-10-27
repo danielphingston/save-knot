@@ -71,7 +71,8 @@ func (r *rotatingFile) Write(data []byte) (int, error) {
 	defer r.mu.Unlock()
 	if r.size+int64(len(data)) > maxLogSize {
 		if err := r.rotate(); err != nil {
-			return 0, err
+			// Keep logging to a usable file; rotate leaves one open.
+			fmt.Fprintf(os.Stderr, "rotate log file: %v\n", err)
 		}
 	}
 	written, err := r.file.Write(data)
@@ -86,9 +87,24 @@ func (r *rotatingFile) Close() error {
 }
 
 func (r *rotatingFile) rotate() error {
-	if err := r.file.Close(); err != nil {
-		return fmt.Errorf("close full log file: %w", err)
+	closeErr := r.file.Close()
+	renameErr := r.renameBackups()
+	file, err := os.OpenFile(r.path, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o600)
+	if err != nil {
+		return errors.Join(closeErr, renameErr, fmt.Errorf("open rotated log file: %w", err))
 	}
+	r.file = file
+	r.size = 0
+	if renameErr != nil {
+		// The full file is still the active log; keep its real size.
+		if info, statErr := file.Stat(); statErr == nil {
+			r.size = info.Size()
+		}
+	}
+	return errors.Join(closeErr, renameErr)
+}
+
+func (r *rotatingFile) renameBackups() error {
 	for index := logBackups - 1; index >= 1; index-- {
 		older := fmt.Sprintf("%s.%d", r.path, index)
 		newer := fmt.Sprintf("%s.%d", r.path, index+1)
@@ -99,11 +115,5 @@ func (r *rotatingFile) rotate() error {
 	if err := os.Rename(r.path, r.path+".1"); err != nil && !errors.Is(err, os.ErrNotExist) {
 		return fmt.Errorf("rotate active log file: %w", err)
 	}
-	file, err := os.OpenFile(r.path, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o600)
-	if err != nil {
-		return fmt.Errorf("open rotated log file: %w", err)
-	}
-	r.file = file
-	r.size = 0
 	return nil
 }

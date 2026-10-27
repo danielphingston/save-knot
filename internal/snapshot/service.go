@@ -285,9 +285,31 @@ func (s *Service) addPath(ctx context.Context, path core.GamePath, exclusions []
 	return nil
 }
 
+// disposablePatterns match regenerated caches, logs and crash dumps that
+// games keep next to their saves. They are never save data, can be very large,
+// and restoring a stale copy can break the game, so snapshots always skip them.
+var disposablePatterns = []string{
+	"**/*.cache", "**/*pipelinecache*", "**/*shadercache*", "**/*.log", "**/*.dmp", "**/*.tmp",
+	"**/cache/**", "**/caches/**", "**/shadercache/**", "**/gpucache/**", "**/logs/**",
+	"**/crashes/**", "**/crashdumps/**",
+}
+
+func disposable(relative string) bool {
+	lowered := strings.ToLower(relative)
+	for _, pattern := range disposablePatterns {
+		if matched, err := doublestar.Match(pattern, lowered); err == nil && matched {
+			return true
+		}
+	}
+	return false
+}
+
 func excluded(file scannedFile, exclusions []core.GameExclusion) bool {
 	relative := filepath.ToSlash(file.relative)
 	absolute := filepath.ToSlash(file.absolute)
+	if disposable(relative) {
+		return true
+	}
 	for _, exclusion := range exclusions {
 		pattern := filepath.ToSlash(exclusion.Pattern)
 		if matched, err := doublestar.Match(pattern, relative); err == nil && matched {

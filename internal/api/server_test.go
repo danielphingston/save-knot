@@ -425,6 +425,7 @@ func TestServerRejectsDNSRebindingAndCrossSiteRequests(t *testing.T) {
 		"dns rebinding host": {"attacker.example", ""},
 		"cross-site origin":  {"127.0.0.1:32147", "https://attacker.example"},
 		"opaque origin":      {"127.0.0.1:32147", "null"},
+		"other local server": {"127.0.0.1:32147", "http://localhost:3000"},
 	} {
 		t.Run(name, func(t *testing.T) {
 			request := httptest.NewRequestWithContext(context.Background(), http.MethodPost, "/api/sync", nil)
@@ -436,5 +437,30 @@ func TestServerRejectsDNSRebindingAndCrossSiteRequests(t *testing.T) {
 				t.Fatalf("unsafe request returned %d", response.Code)
 			}
 		})
+	}
+}
+
+func TestUploadImageRejectsUnknownGameAndUnknownAPIRoutes(t *testing.T) {
+	t.Parallel()
+	directory := t.TempDir()
+	manager, err := settings.New(filepath.Join(directory, "config.json"), config.Config{Listen: "127.0.0.1:32147", DeviceID: "device-a"}, &vaultFake{values: make(map[string]string)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	repository := &repositoryFake{}
+	coordinator := &coordinatorFake{repository: repository}
+	artwork := filepath.Join(directory, "artwork")
+	server, err := New("127.0.0.1:32147", repository, repository, repository, repository, coordinator, coordinator, coordinator, manager, events.New(), artwork)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if response := serveRequest(server, http.MethodPost, "/api/games/missing/image", "x"); response.Code != http.StatusNotFound {
+		t.Fatalf("upload for unknown game returned %d", response.Code)
+	}
+	if _, err := os.Stat(artwork); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("artwork directory was touched for an unknown game: %v", err)
+	}
+	if response := serveRequest(server, http.MethodGet, "/api/nope", ""); response.Code != http.StatusNotFound {
+		t.Fatalf("unknown API route returned %d", response.Code)
 	}
 }

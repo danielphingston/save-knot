@@ -33,6 +33,7 @@ type Manager struct {
 	jobs    chan string
 	done    chan struct{}
 	once    sync.Once
+	workers sync.WaitGroup
 }
 
 func New() (*Manager, error) {
@@ -49,23 +50,34 @@ func New() (*Manager, error) {
 }
 
 func (m *Manager) Reconcile(targets []Target) {
-	select {
-	case m.update <- targets:
-	default:
+	// Replace any unconsumed revision. Loop because a concurrent caller can
+	// refill the single slot between the drain and the send.
+	for {
+		select {
+		case m.update <- targets:
+			return
+		default:
+		}
 		select {
 		case <-m.update:
 		default:
 		}
-		m.update <- targets
 	}
 }
 
 func (m *Manager) Start(ctx context.Context, backup func(context.Context, string)) {
-	go m.run(ctx)
+	m.workers.Add(2)
 	go func() {
+		defer m.workers.Done()
+		m.run(ctx)
+	}()
+	go func() {
+		defer m.workers.Done()
 		for {
 			select {
 			case <-ctx.Done():
+				return
+			case <-m.done:
 				return
 			case gameID := <-m.jobs:
 				backup(ctx, gameID)
@@ -79,6 +91,7 @@ func (m *Manager) Close() error {
 	m.once.Do(func() {
 		close(m.done)
 		err = m.watcher.Close()
+		m.workers.Wait()
 	})
 	return err
 }

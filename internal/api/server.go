@@ -840,6 +840,19 @@ func (s *Server) eventStream(writer http.ResponseWriter, request *http.Request) 
 }
 
 func (s *Server) uploadImage(writer http.ResponseWriter, request *http.Request) {
+	gameID := request.PathValue("id")
+	if !safeIDPattern.MatchString(gameID) {
+		writeError(writer, http.StatusBadRequest, errors.New("invalid game ID"))
+		return
+	}
+	if _, err := s.reader.Game(request.Context(), gameID); err != nil {
+		if errors.Is(err, core.ErrGameNotFound) {
+			writeError(writer, http.StatusNotFound, core.ErrGameNotFound)
+		} else {
+			writeError(writer, http.StatusInternalServerError, err)
+		}
+		return
+	}
 	request.Body = http.MaxBytesReader(writer, request.Body, maxImage)
 	file, header, err := request.FormFile("image")
 	if err != nil {
@@ -858,11 +871,6 @@ func (s *Server) uploadImage(writer http.ResponseWriter, request *http.Request) 
 	}
 	if err := os.MkdirAll(s.artworkDir, 0o700); err != nil {
 		writeError(writer, http.StatusInternalServerError, fmt.Errorf("create artwork directory: %w", err))
-		return
-	}
-	gameID := request.PathValue("id")
-	if !safeIDPattern.MatchString(gameID) {
-		writeError(writer, http.StatusBadRequest, errors.New("invalid game ID"))
 		return
 	}
 	filename := gameID + extension
@@ -1045,7 +1053,7 @@ func securityHeaders(next http.Handler) http.Handler {
 
 func localRequestsOnly(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
-		if !loopbackHost(request.Host) || !localOrigin(request.Header.Get("Origin")) {
+		if !loopbackHost(request.Host) || !localOrigin(request.Header.Get("Origin"), request.Host) {
 			http.Error(writer, "SaveKnot only accepts requests from its local UI", http.StatusForbidden)
 			return
 		}
@@ -1053,12 +1061,14 @@ func localRequestsOnly(next http.Handler) http.Handler {
 	})
 }
 
-func localOrigin(origin string) bool {
+// localOrigin accepts requests without an Origin header and requests whose
+// Origin is this server's own origin; other local web servers are cross-site.
+func localOrigin(origin, host string) bool {
 	if origin == "" {
 		return true
 	}
 	parsed, err := url.Parse(origin)
-	return err == nil && (parsed.Scheme == "http" || parsed.Scheme == "https") && loopbackHost(parsed.Host)
+	return err == nil && (parsed.Scheme == "http" || parsed.Scheme == "https") && loopbackHost(parsed.Host) && strings.EqualFold(parsed.Host, host)
 }
 
 func loopbackHost(hostPort string) bool {
@@ -1080,6 +1090,10 @@ func spaHandler(assets fs.FS) http.Handler {
 		path := strings.TrimPrefix(request.URL.Path, "/")
 		if path == "" {
 			path = "index.html"
+		}
+		if strings.HasPrefix(path, "api/") {
+			http.NotFound(writer, request)
+			return
 		}
 		if _, err := fs.Stat(assets, path); err != nil {
 			request.URL.Path = "/"

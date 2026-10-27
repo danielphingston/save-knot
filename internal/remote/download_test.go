@@ -6,6 +6,7 @@ import (
 	"crypto/sha256"
 	"database/sql"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -76,5 +77,29 @@ func TestEnsureLocalDownloadsAndVerifiesBlob(t *testing.T) {
 	}
 	if _, err := os.Stat(repository.path); err != nil {
 		t.Fatal(fmt.Errorf("inspect downloaded blob: %w", err))
+	}
+}
+
+type oversizedReader struct{}
+
+func (oversizedReader) Get(context.Context, string) (io.ReadCloser, int64, error) {
+	return io.NopCloser(bytes.NewReader(make([]byte, 1<<20))), 16, nil
+}
+
+func TestEnsureLocalRejectsBodyLargerThanDeclared(t *testing.T) {
+	t.Parallel()
+	hashValue := hex.EncodeToString(make([]byte, 32))
+	syncer := NewSyncer(&downloadRepoFake{})
+	snapshot := core.Snapshot{Files: []core.SnapshotFile{{Hash: hashValue, Size: 4}}}
+	root := t.TempDir()
+	if err := syncer.EnsureLocal(context.Background(), oversizedReader{}, snapshot, root); err == nil {
+		t.Fatal("oversized blob body was accepted")
+	}
+	entries, err := os.ReadDir(filepath.Join(root, ".staging"))
+	if err != nil && !errors.Is(err, os.ErrNotExist) {
+		t.Fatal(err)
+	}
+	if len(entries) != 0 {
+		t.Fatalf("staged file was left behind: %d", len(entries))
 	}
 }

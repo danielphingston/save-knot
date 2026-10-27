@@ -151,3 +151,21 @@ func TestRestoreSucceedsWhenCurrentSaveIsMissing(t *testing.T) {
 		t.Fatalf("restored save = %q, want %q", got, "target version")
 	}
 }
+
+func TestDisposableSkipsCachesButKeepsSaves(t *testing.T) {
+	t.Parallel()
+	for path, want := range map[string]bool{
+		"PersistentStorage/1640742881.cache": true,
+		"scimitar_vkpipelinecache.bin":       true,
+		"Logs/session.txt":                   true,
+		"GPUCache/data_0":                    true,
+		"crash.dmp":                          true,
+		"1.save":                             false,
+		"GRB.ini":                            false,
+		"profiles/slot1/data.bin":            false,
+	} {
+		if got := disposable(path); got != want {
+			t.Errorf("disposable(%q) = %v, want %v", path, got, want)
+		}
+	}
+}
