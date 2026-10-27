@@ -1,87 +1,163 @@
-name: Publish release
+name: release
 
+# Every push to master runs the quality checks and, when the app changed since
+# the last release, publishes the next patch version. Run it manually to bump
+# the minor or major version or to publish a prerelease.
 on:
   push:
-    tags:
-      - "v*"
+    branches: [master]
+  workflow_dispatch:
+    inputs:
+      bump:
+        description: Version part to increment
+        type: choice
+        options: [patch, minor, major]
+        default: patch
+      prerelease:
+        description: Optional prerelease suffix, for example rc.1
+        type: string
+        default: ""
 
 permissions:
   contents: read
 
+# Releases are numbered from the latest tag, so two runs must never plan at the
+# same time. Queued runs wait instead of being cancelled mid-publish.
 concurrency:
-  group: release-${{ github.ref }}
+  group: release
   cancel-in-progress: false
 
 jobs:
-  release:
-    name: Build and publish
+  quality:
+    uses: ./.github/workflows/quality.yml
+
+  plan:
+    needs: quality
     runs-on: ubuntu-latest
-    timeout-minutes: 20
-    permissions:
-      contents: write
-
+    timeout-minutes: 5
+    outputs:
+      publish: ${{ steps.version.outputs.publish }}
+      tag: ${{ steps.version.outputs.tag }}
+      previous: ${{ steps.version.outputs.previous }}
     steps:
-      - name: Check out repository
-        uses: actions/checkout@v6
-
-      - name: Set up Go
-        uses: actions/setup-go@v5
+      - uses: actions/checkout@v7
         with:
-          go-version-file: go.mod
-          cache: true
+          fetch-depth: 0
+          fetch-tags: true
 
-      - name: Set up Node.js
-        uses: actions/setup-node@v6
-        with:
-          node-version: 22
-
-      - name: Validate release tag
+      - name: Choose version
+        id: version
         shell: bash
+        env:
+          EVENT: ${{ github.event_name }}
+          BUMP: ${{ inputs.bump || 'patch' }}
+          PRERELEASE: ${{ inputs.prerelease }}
+          GH_TOKEN: ${{ github.token }}
         run: |
-          if [[ ! "${GITHUB_REF_NAME}" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-[0-9A-Za-z.-]+)?(\+[0-9A-Za-z.-]+)?$ ]]; then
-            echo "Release tags must use semantic versioning, for example v1.2.3 or v1.2.3-rc.1."
+          set -euo pipefail
+          skip() {
+            echo "::notice::$1"
+            echo "publish=false" >> "${GITHUB_OUTPUT}"
+            exit 0
+          }
+
+          # A prerelease commit can still be promoted to a stable release.
+          pattern='^v[0-9]+\.[0-9]+\.[0-9]+$'
+          [[ -z "${PRERELEASE}" ]] || pattern='^v'
+          released=$(git tag --points-at HEAD --list 'v*' | grep -E "${pattern}" | head -n1 || true)
+          [[ -z "${released}" ]] || skip "${GITHUB_SHA} is already released as ${released}."
+
+          previous=$(git tag --list 'v*' --sort=-v:refname | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' | head -n1 || true)
+          if [[ "${EVENT}" == push && -n "${previous}" ]] &&
+            git diff --quiet "${previous}" HEAD -- cmd internal go.mod go.sum; then
+            skip "No application changes since ${previous}."
+          fi
+
+          IFS=. read -r major minor patch <<< "${previous#v}"
+          major=${major:-0} minor=${minor:-0} patch=${patch:-0}
+          case "${BUMP}" in
+            major) tag="v$((major + 1)).0.0" ;;
+            minor) tag="v${major}.$((minor + 1)).0" ;;
+            *) tag="v${major}.${minor}.$((patch + 1))" ;;
+          esac
+          if [[ -n "${PRERELEASE}" ]]; then
+            [[ "${PRERELEASE}" =~ ^[0-9A-Za-z.-]+$ ]] || { echo "Invalid prerelease suffix: ${PRERELEASE}"; exit 1; }
+            tag="${tag}-${PRERELEASE}"
+          fi
+
+          if git ls-remote --exit-code --tags origin "refs/tags/${tag}" > /dev/null; then
+            echo "Tag ${tag} already exists."
+            exit 1
+          fi
+          if gh release view "${tag}" > /dev/null 2>&1; then
+            echo "Release ${tag} already exists."
             exit 1
           fi
 
-      - name: Test
-        run: |
-          make ui-check
-          go test ./...
+          echo "Publishing ${tag} (previous: ${previous:-none})."
+          {
+            echo "publish=true"
+            echo "tag=${tag}"
+            echo "previous=${previous}"
+          } >> "${GITHUB_OUTPUT}"
+
+  publish:
+    needs: plan
+    if: needs.plan.outputs.publish == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+          cache: false
+
+      # Cross-compiled Windows objects never appear in the Linux test cache, so
+      # the release build keeps its own cache and refreshes it on every release.
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cache/go-build
+            ~/go/pkg/mod
+          key: go-release-windows-amd64-${{ hashFiles('go.sum') }}-${{ github.sha }}
+          restore-keys: |
+            go-release-windows-amd64-${{ hashFiles('go.sum') }}-
+            go-release-windows-amd64-
 
       - name: Build Windows package
+        id: package
         shell: bash
+        env:
+          TAG: ${{ needs.plan.outputs.tag }}
         run: |
           make build-windows-amd64
-
-          version="${GITHUB_REF_NAME#v}"
-          archive="saveknot_${version}_windows_amd64.zip"
-
+          archive="saveknot_${TAG#v}_windows_amd64.zip"
           (
             cd dist
             zip "${archive}" saveknot-windows-amd64.exe
             sha256sum "${archive}" > SHA256SUMS.txt
           )
-
           echo "archive=${archive}" >> "${GITHUB_OUTPUT}"
-        id: package
 
+      # Creating the release also creates the tag at this exact commit and fails
+      # if the tag appeared after planning, so a version is never published twice.
       - name: Publish GitHub release
+        shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.plan.outputs.tag }}
+          PREVIOUS: ${{ needs.plan.outputs.previous }}
           ARCHIVE: ${{ steps.package.outputs.archive }}
-        shell: bash
         run: |
-          release_options=(
-            --verify-tag
-            --generate-notes
-            --title "SaveKnot ${GITHUB_REF_NAME}"
-          )
-
-          if [[ "${GITHUB_REF_NAME}" == *-* ]]; then
-            release_options+=(--prerelease)
+          options=(--target "${GITHUB_SHA}" --generate-notes --title "SaveKnot ${TAG}")
+          if [[ -n "${PREVIOUS}" ]]; then
+            options+=(--notes-start-tag "${PREVIOUS}")
           fi
-
-          gh release create "${GITHUB_REF_NAME}" \
-            "dist/${ARCHIVE}" \
-            "dist/SHA256SUMS.txt" \
-            "${release_options[@]}"
+          if [[ "${TAG}" == *-* ]]; then
+            options+=(--prerelease)
+          fi
+          gh release create "${TAG}" "dist/${ARCHIVE}" dist/SHA256SUMS.txt "${options[@]}"

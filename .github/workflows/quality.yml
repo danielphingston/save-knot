@@ -1,9 +1,9 @@
 name: quality
 
+# Pushes to master run these checks through the release workflow.
 on:
-  push:
-    branches: [master]
   pull_request:
+  workflow_call:
 
 permissions:
   contents: read
@@ -22,10 +22,11 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
+      # The test job owns the shared Go cache; golangci-lint keeps its own.
       - uses: actions/setup-go@v7
         with:
           go-version-file: go.mod
-          cache-dependency-path: go.sum
+          cache: false
       - uses: golangci/golangci-lint-action@v9
         with:
           version: v2.12
@@ -40,7 +41,6 @@ jobs:
         with:
           go-version-file: go.mod
           cache-dependency-path: go.sum
-      - run: go test ./...
-      - run: go test -race ./...
       - run: go test -cover ./...
+      - run: go test -race ./...
       - run: git diff --check

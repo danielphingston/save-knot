@@ -60,14 +60,9 @@ SaveKnot deliberately rejects non-loopback listen addresses.
 
 ## Publish a release
 
-Push a semantic-version tag to build and publish a Windows AMD64 package through GitHub Actions:
+Releases are published by the `release` GitHub Actions workflow; no tags are pushed by hand. Every push to `master` runs the quality checks and, when `cmd/`, `internal/`, `go.mod` or `go.sum` changed since the latest release, publishes the next patch version (for example `v0.1.4` → `v0.1.5`). To bump the minor or major version, or to publish a prerelease such as `v0.2.0-rc.1`, run the workflow manually from the Actions tab and choose the bump and optional suffix.
 
-```sh
-git tag -a v0.1.0 -m "SaveKnot v0.1.0"
-git push origin v0.1.0
-```
-
-The workflow runs the tests, creates `saveknot_0.1.0_windows_amd64.zip` and `SHA256SUMS.txt`, and attaches them to a GitHub Release with generated release notes. A tag with a suffix such as `v0.2.0-rc.1` creates a prerelease. The workflow uses the repository's built-in `GITHUB_TOKEN`; no publishing secret is required.
+The workflow never publishes the same commit or version twice. It skips commits that already carry a release tag and docs-only changes, refuses a version whose tag or release already exists, and creates the tag together with the release so a concurrent run cannot reuse it. It attaches `saveknot_<version>_windows_amd64.zip` and `SHA256SUMS.txt` with generated release notes, using the repository's built-in `GITHUB_TOKEN`.
 
 ## If your game list is empty
 
