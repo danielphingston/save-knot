@@ -21,25 +21,27 @@ type Index struct {
 	Path string
 }
 
-func CompileFile(ctx context.Context, manifestPath, indexPath string) error {
+func CompileFile(ctx context.Context, manifestPath, indexPath string, custom ...CustomManifest) error {
 	//nolint:gosec // Both paths are application-owned catalog cache locations.
 	manifest, err := os.Open(manifestPath)
 	if err != nil {
 		return fmt.Errorf("open Ludusavi manifest for indexing: %w", err)
 	}
-	compileErr := Compile(ctx, manifest, indexPath)
+	compileErr := Compile(ctx, manifest, indexPath, custom...)
 	return errors.Join(compileErr, manifest.Close())
 }
 
-func EnsureIndex(ctx context.Context, manifestPath, indexPath string) error {
+// EnsureIndex rebuilds the index when it is missing, unreadable, or was built
+// with different custom manifests.
+func EnsureIndex(ctx context.Context, manifestPath, indexPath string, custom ...CustomManifest) error {
 	index := Index{Path: indexPath}
-	if _, err := index.Count(ctx); err == nil {
+	if _, err := index.Count(ctx); err == nil && index.customFingerprint(ctx) == customFingerprint(custom) {
 		return nil
 	}
-	return CompileFile(ctx, manifestPath, indexPath)
+	return CompileFile(ctx, manifestPath, indexPath, custom...)
 }
 
-func Compile(ctx context.Context, source io.Reader, destination string) (err error) {
+func Compile(ctx context.Context, source io.Reader, destination string, custom ...CustomManifest) (err error) {
 	database, err := sql.Open("sqlite", destination)
 	if err != nil {
 		return fmt.Errorf("open catalog index: %w", err)
@@ -61,7 +63,7 @@ func Compile(ctx context.Context, source io.Reader, destination string) (err err
 			err = errors.Join(err, transaction.Rollback())
 		}
 	}()
-	for _, table := range []string{"steam_ids", "gog_ids", "install_dirs", "games"} {
+	for _, table := range []string{"steam_ids", "gog_ids", "install_dirs", "games", "meta"} {
 		if _, err := transaction.ExecContext(ctx, "DELETE FROM "+table); err != nil { //nolint:gosec // Table names are fixed above.
 			return fmt.Errorf("clear catalog table %q: %w", table, err)
 		}
@@ -76,6 +78,16 @@ func Compile(ctx context.Context, source io.Reader, destination string) (err err
 	}
 	if writer.count == 0 {
 		return errors.New("ludusavi manifest did not contain any games")
+	}
+	for _, manifest := range custom {
+		if err := mergeCustomManifest(ctx, transaction, writer, manifest); err != nil {
+			return err
+		}
+	}
+	if fingerprint := customFingerprint(custom); fingerprint != "" {
+		if _, err := transaction.ExecContext(ctx, `INSERT INTO meta (key, value) VALUES ('custom', ?)`, fingerprint); err != nil {
+			return fmt.Errorf("record custom manifests in catalog index: %w", err)
+		}
 	}
 	if err := writer.Close(); err != nil {
 		return err
@@ -100,6 +112,42 @@ var catalogSchema = []string{
 	`CREATE TABLE IF NOT EXISTS steam_ids (id TEXT PRIMARY KEY, game_name TEXT NOT NULL)`,
 	`CREATE TABLE IF NOT EXISTS gog_ids (id TEXT PRIMARY KEY, game_name TEXT NOT NULL)`,
 	`CREATE TABLE IF NOT EXISTS install_dirs (normalized_dir TEXT PRIMARY KEY, game_name TEXT NOT NULL)`,
+	`CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)`,
+}
+
+// mergeCustomManifest adds the manifest's new games and extends games the
+// catalog already defines. Its store IDs and install folders take precedence.
+func mergeCustomManifest(ctx context.Context, transaction *sql.Tx, writer *indexWriter, manifest CustomManifest) error {
+	parsed, err := Parse(manifest.Data)
+	if err != nil {
+		return fmt.Errorf("custom manifest %q: %w", manifest.Source, err)
+	}
+	for name, addition := range parsed.Games {
+		var encoded []byte
+		err := transaction.QueryRowContext(ctx, `SELECT definition FROM games WHERE name = ?`, name).Scan(&encoded)
+		if errors.Is(err, sql.ErrNoRows) {
+			if err := writer.Add(name, addition); err != nil {
+				return err
+			}
+			continue
+		}
+		if err != nil {
+			return fmt.Errorf("load catalog game %q for custom manifest: %w", name, err)
+		}
+		var existing Definition
+		if err := json.Unmarshal(encoded, &existing); err != nil {
+			return fmt.Errorf("decode indexed catalog game %q: %w", name, err)
+		}
+		if _, err := transaction.ExecContext(ctx, `DELETE FROM games WHERE name = ?`, name); err != nil {
+			return fmt.Errorf("replace catalog game %q: %w", name, err)
+		}
+		merged := MergeDefinition(existing, addition)
+		merged.Alias = addition.Alias
+		if err := writer.Add(name, merged); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 type indexWriter struct {
@@ -225,6 +273,21 @@ func flushCatalogEntry(entry *strings.Builder, consume func(string, Definition) 
 		return consume(name, definition)
 	}
 	return nil
+}
+
+func (i Index) customFingerprint(ctx context.Context) string {
+	database, err := i.open()
+	if err != nil {
+		return ""
+	}
+	var fingerprint string
+	// Indexes built before custom manifests existed have no meta table, and an
+	// index built without them has no row; both read as no custom manifests.
+	queryErr := database.QueryRowContext(ctx, `SELECT value FROM meta WHERE key = 'custom'`).Scan(&fingerprint)
+	if err := errors.Join(queryErr, database.Close()); err != nil {
+		return ""
+	}
+	return fingerprint
 }
 
 func (i Index) Count(ctx context.Context) (count int, err error) {

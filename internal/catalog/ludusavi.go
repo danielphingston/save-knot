@@ -189,6 +189,7 @@ type Fetcher struct {
 	Path      string
 	IndexPath string
 	ETagPath  string
+	Custom    []CustomManifest
 }
 
 func (f Fetcher) Update(ctx context.Context) (bool, error) {
@@ -215,7 +216,7 @@ func (f Fetcher) Update(ctx context.Context) (bool, error) {
 		if err := response.Body.Close(); err != nil {
 			return false, fmt.Errorf("close manifest response: %w", err)
 		}
-		if err := EnsureIndex(ctx, f.Path, f.IndexPath); err != nil {
+		if err := EnsureIndex(ctx, f.Path, f.IndexPath, f.Custom...); err != nil {
 			return false, err
 		}
 		return false, nil
@@ -232,7 +233,7 @@ func (f Fetcher) Update(ctx context.Context) (bool, error) {
 	if len(data) > maxManifestSize {
 		return false, fmt.Errorf("ludusavi manifest exceeds %d bytes", maxManifestSize)
 	}
-	if err := Compile(ctx, bytes.NewReader(data), f.IndexPath); err != nil {
+	if err := Compile(ctx, bytes.NewReader(data), f.IndexPath, f.Custom...); err != nil {
 		return false, err
 	}
 	if err := writeAtomic(f.Path, data, 0o600); err != nil {
