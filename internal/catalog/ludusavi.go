@@ -72,8 +72,8 @@ type Manifest struct {
 }
 
 func Parse(data []byte) (*Manifest, error) {
-	definitions := make(map[string]Definition)
-	if err := yaml.Unmarshal(data, &definitions); err != nil {
+	definitions, err := decodeDefinitions(data)
+	if err != nil {
 		return nil, fmt.Errorf("decode Ludusavi manifest: %w", err)
 	}
 	bySteam := make(map[string]string)
@@ -101,6 +101,39 @@ func Parse(data []byte) (*Manifest, error) {
 		}
 	}
 	return &Manifest{Games: definitions, BySteam: bySteam, ByGOG: byGOG, ByName: byName, ByDir: byDir}, nil
+}
+
+// decodeDefinitions reads a manifest's games, merging repeated entries for the
+// same game instead of rejecting the file. Hand-written manifests, such as
+// community emulator manifests, often repeat a game.
+func decodeDefinitions(data []byte) (map[string]Definition, error) {
+	var document yaml.Node
+	if err := yaml.Unmarshal(data, &document); err != nil {
+		return nil, err
+	}
+	definitions := make(map[string]Definition)
+	root := &document
+	if root.Kind == yaml.DocumentNode && len(root.Content) == 1 {
+		root = root.Content[0]
+	}
+	if root.Kind == 0 || root.Kind == yaml.DocumentNode {
+		return definitions, nil
+	}
+	if root.Kind != yaml.MappingNode {
+		return nil, errors.New("manifest must map game names to definitions")
+	}
+	for index := 0; index+1 < len(root.Content); index += 2 {
+		name := root.Content[index].Value
+		var definition Definition
+		if err := root.Content[index+1].Decode(&definition); err != nil {
+			return nil, fmt.Errorf("game %q: %w", name, err)
+		}
+		if existing, ok := definitions[name]; ok {
+			definition = MergeDefinition(existing, definition)
+		}
+		definitions[name] = definition
+	}
+	return definitions, nil
 }
 
 func (m *Manifest) MatchName(candidates ...string) (Definition, bool) {

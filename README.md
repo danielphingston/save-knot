@@ -71,7 +71,9 @@ My Homebrew Game:
     Homebrew: {}
 ```
 
-New games are added to the catalog. Entries for a game the catalog already lists extend it with their files, registry keys, install folders and store IDs. Where both define the same entry, the custom manifest wins. Saving the setting starts a new game search, and the manifests are read again on every catalog refresh. A manifest that cannot be loaded is skipped and shown as a catalog error; the rest of the catalog keeps working.
+New games are added to the catalog. Entries for a game the catalog already lists extend it with their files, registry keys, install folders and store IDs. Where both define the same entry, the custom manifest wins. Saving the setting starts a new game search, and the manifests are read again on every catalog refresh. A manifest that cannot be loaded is skipped and shown as a catalog error; the rest of the catalog keeps working. Repeated entries for the same game are merged rather than rejected, and absolute paths such as `C:/GOG Games/**/UniverseLANData` are allowed.
+
+On Windows, SaveKnot also attaches Steam emulator save folders that are named by Steam app ID (for example `%PUBLIC%\Documents\Steam\RUNE\782330`) to the matching game, without any custom manifest. It checks the RUNE, CODEX, OnlineFix, EMPRESS, Goldberg, GSE, SmartSteamEmu, SKIDROW, FLT and Razor1911 folders.
 
 ## Publish a release
 

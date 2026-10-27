@@ -102,3 +102,21 @@ func TestLoadCustomManifestsSkipsBrokenSources(t *testing.T) {
 		t.Fatalf("error = %v, want both failures reported", err)
 	}
 }
+
+func TestParseMergesRepeatedGames(t *testing.T) {
+	t.Parallel()
+	manifest, err := Parse([]byte(`Razor1911 (Emulator):
+  files:
+    "<winAppData>/.1911": {}
+Razor1911 (Emulator):
+  files:
+    "<winPublic>/.1911": {}
+`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	definition, ok := manifest.Resolve("Razor1911 (Emulator)")
+	if !ok || len(definition.Files) != 2 {
+		t.Fatalf("definition = %#v, want both repeated entries merged", definition)
+	}
+}

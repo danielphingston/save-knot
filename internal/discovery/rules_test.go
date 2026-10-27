@@ -34,11 +34,11 @@ func TestLocalScanSkipsConfigOnlyRulesAndFindsUbisoftSaves(t *testing.T) {
 	}
 	definition, _ := manifest.Resolve("Breakpoint")
 	replacements := userPathReplacements(home)
-	result, ok := scanLocalCandidate(localCandidate{name: "Breakpoint", definition: definition}, replacements, []string{ubisoft}, time.Now())
+	result, ok := scanLocalCandidate(localCandidate{name: "Breakpoint", definition: definition}, localScan{replacements: replacements, ubisoftRoots: []string{ubisoft}, now: time.Now()})
 	if !ok || len(result.Paths) != 1 || result.Paths[0].Resolved != saves {
 		t.Fatalf("paths = %#v, want only Ubisoft save directory %q", result.Paths, saves)
 	}
-	if _, ok := scanLocalCandidate(localCandidate{name: "Breakpoint", definition: definition}, replacements, nil, time.Now()); ok {
+	if _, ok := scanLocalCandidate(localCandidate{name: "Breakpoint", definition: definition}, localScan{replacements: replacements, now: time.Now()}); ok {
 		t.Fatal("config-only match was registered as a save location")
 	}
 }

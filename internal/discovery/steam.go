@@ -366,7 +366,8 @@ func resolveDefinitionPaths(gameID, store, root, gameDir, storeGameID string, de
 			})
 		}
 	}
-	return append(paths, ubisoftPaths(gameID, definition, UbisoftRoots(), paths)...), nil
+	paths = append(paths, ubisoftPaths(gameID, definition, UbisoftRoots(), paths)...)
+	return append(paths, indexEmulatorSaves(replacements).paths(gameID, definition, paths)...), nil
 }
 
 func firstNonEmpty(values ...string) string {
