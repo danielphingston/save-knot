@@ -149,3 +149,25 @@ func TestR2HealthTracksVerificationAndFailure(t *testing.T) {
 		t.Fatalf("R2 sync time was not persisted: %#v", loaded.R2)
 	}
 }
+
+func TestConfigureLocalValidatesCustomManifests(t *testing.T) {
+	t.Parallel()
+	root := t.TempDir()
+	path := filepath.Join(root, "config.json")
+	manager, err := New(path, config.Config{DeviceID: "device-a"}, &memoryVault{values: make(map[string]string)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	manifest := filepath.Join(root, "custom.yaml")
+	local := config.Local{LocalBackupDir: root, CustomManifests: []string{" https://example.com/m.yaml ", manifest, "", manifest}}
+	if err := manager.ConfigureLocal(local); err != nil {
+		t.Fatal(err)
+	}
+	if got := manager.Config().CustomManifests; len(got) != 2 || got[0] != "https://example.com/m.yaml" || got[1] != manifest {
+		t.Fatalf("custom manifests = %#v", got)
+	}
+	local.CustomManifests = []string{"relative/custom.yaml"}
+	if err := manager.ConfigureLocal(local); err == nil {
+		t.Fatal("relative custom manifest path was accepted")
+	}
+}

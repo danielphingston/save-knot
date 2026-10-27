@@ -58,6 +58,21 @@ The Windows release is linked as a GUI/background executable, so it does not lea
 
 SaveKnot deliberately rejects non-loopback listen addresses.
 
+## Custom Ludusavi manifests
+
+SaveKnot reads save locations from the [Ludusavi manifest](https://github.com/mtkennerly/ludusavi-manifest). To add games it does not know, or extra save folders for games it does, list your own manifests under **Settings → Custom launcher locations → Custom Ludusavi manifests**, one absolute file path or `https://` URL per line. They use Ludusavi's manifest format, so Ludusavi secondary manifests work as-is:
+
+```yaml
+My Homebrew Game:
+  files:
+    "<home>/Saved Games/Homebrew":
+      tags: [save]
+  installDir:
+    Homebrew: {}
+```
+
+New games are added to the catalog. Entries for a game the catalog already lists extend it with their files, registry keys, install folders and store IDs. Where both define the same entry, the custom manifest wins. Saving the setting starts a new game search, and the manifests are read again on every catalog refresh. A manifest that cannot be loaded is skipped and shown as a catalog error; the rest of the catalog keeps working.
+
 ## Publish a release
 
 Releases are published by the `release` GitHub Actions workflow; no tags are pushed by hand. Every push to `master` runs the quality checks and, when `cmd/`, `internal/`, `go.mod` or `go.sum` changed since the latest release, publishes the next patch version (for example `v0.1.4` → `v0.1.5`). To bump the minor or major version, or to publish a prerelease such as `v0.2.0-rc.1`, run the workflow manually from the Actions tab and choose the bump and optional suffix.

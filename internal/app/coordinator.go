@@ -293,12 +293,16 @@ func (c *Coordinator) run(ctx context.Context) {
 func (c *Coordinator) refreshCatalog(ctx context.Context) {
 	checked := time.Now().UTC()
 	cfg := c.settings.Config()
-	fetcher := catalog.Fetcher{URL: cfg.ManifestURL, Path: c.paths.Catalog, IndexPath: c.paths.CatalogDB, ETagPath: c.paths.CatalogTag}
-	updated, err := fetcher.Update(ctx)
-	if err != nil {
+	custom, customErr := catalog.LoadCustomManifests(ctx, nil, cfg.CustomManifests)
+	if customErr != nil {
+		slog.Error("load custom Ludusavi manifests", "error", customErr)
+	}
+	fetcher := catalog.Fetcher{URL: cfg.ManifestURL, Path: c.paths.Catalog, IndexPath: c.paths.CatalogDB, ETagPath: c.paths.CatalogTag, Custom: custom}
+	updated, fetchErr := fetcher.Update(ctx)
+	if err := fetchErr; err != nil {
 		slog.Error("refresh Ludusavi catalog", "url", cfg.ManifestURL, "cache", c.paths.Catalog, "error", err)
 		c.setCatalogDiagnostics(ctx, checked, false, 0, err)
-		if indexErr := catalog.EnsureIndex(ctx, c.paths.Catalog, c.paths.CatalogDB); indexErr != nil {
+		if indexErr := catalog.EnsureIndex(ctx, c.paths.Catalog, c.paths.CatalogDB, custom...); indexErr != nil {
 			c.events.PublishContext(ctx, core.Event{Type: "catalog.failed", Message: err.Error()})
 			return
 		}
@@ -312,7 +316,9 @@ func (c *Coordinator) refreshCatalog(ctx context.Context) {
 		c.setCatalogDiagnostics(ctx, checked, false, 0, err)
 		return
 	}
-	c.setCatalogDiagnostics(ctx, checked, true, count, nil)
+	// A failed download or broken custom manifest is reported without
+	// discarding the usable catalog.
+	c.setCatalogDiagnostics(ctx, checked, true, count, errors.Join(fetchErr, customErr))
 }
 
 func (c *Coordinator) discover(ctx context.Context) {

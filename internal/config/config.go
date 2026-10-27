@@ -13,17 +13,20 @@ import (
 const DefaultManifestURL = "https://raw.githubusercontent.com/mtkennerly/ludusavi-manifest/master/data/manifest.yaml"
 
 type Config struct {
-	Listen         string     `json:"listen"`
-	ManifestURL    string     `json:"manifestUrl"`
-	SteamRoots     []string   `json:"steamRoots,omitempty"`
-	EpicManifests  []string   `json:"epicManifests,omitempty"`
-	GOGRoots       []string   `json:"gogRoots,omitempty"`
-	LocalBackupDir string     `json:"localBackupDir,omitempty"`
-	LaunchAtLogin  bool       `json:"launchAtLogin"`
-	RetentionKeep  int        `json:"retentionKeep"`
-	Automation     Automation `json:"automation"`
-	DeviceID       string     `json:"deviceId"`
-	R2             R2         `json:"r2"`
+	Listen        string   `json:"listen"`
+	ManifestURL   string   `json:"manifestUrl"`
+	SteamRoots    []string `json:"steamRoots,omitempty"`
+	EpicManifests []string `json:"epicManifests,omitempty"`
+	GOGRoots      []string `json:"gogRoots,omitempty"`
+	// CustomManifests are extra Ludusavi manifests (local files or HTTP(S)
+	// URLs) merged over the primary catalog, like Ludusavi's secondary manifests.
+	CustomManifests []string   `json:"customManifests,omitempty"`
+	LocalBackupDir  string     `json:"localBackupDir,omitempty"`
+	LaunchAtLogin   bool       `json:"launchAtLogin"`
+	RetentionKeep   int        `json:"retentionKeep"`
+	Automation      Automation `json:"automation"`
+	DeviceID        string     `json:"deviceId"`
+	R2              R2         `json:"r2"`
 }
 
 type Automation struct {
@@ -60,10 +63,11 @@ type R2 struct {
 }
 
 type Local struct {
-	LocalBackupDir string   `json:"localBackupDir"`
-	SteamRoots     []string `json:"steamRoots"`
-	EpicManifests  []string `json:"epicManifests"`
-	GOGRoots       []string `json:"gogRoots"`
+	LocalBackupDir  string   `json:"localBackupDir"`
+	SteamRoots      []string `json:"steamRoots"`
+	EpicManifests   []string `json:"epicManifests"`
+	GOGRoots        []string `json:"gogRoots"`
+	CustomManifests []string `json:"customManifests"`
 }
 
 type Paths struct {

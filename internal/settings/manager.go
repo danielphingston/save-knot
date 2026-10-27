@@ -11,6 +11,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/saveknot/saveknot/internal/catalog"
 	"github.com/saveknot/saveknot/internal/config"
 	"github.com/saveknot/saveknot/internal/core"
 	"github.com/saveknot/saveknot/internal/platform"
@@ -110,6 +111,10 @@ func (m *Manager) ConfigureLocal(local config.Local) error {
 	if err != nil {
 		return err
 	}
+	customManifests, err := cleanManifestSources(local.CustomManifests)
+	if err != nil {
+		return err
+	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	updated := m.config
@@ -117,11 +122,37 @@ func (m *Manager) ConfigureLocal(local config.Local) error {
 	updated.SteamRoots = steamRoots
 	updated.EpicManifests = epicManifests
 	updated.GOGRoots = gogRoots
+	updated.CustomManifests = customManifests
 	if err := config.Save(m.path, updated); err != nil {
 		return fmt.Errorf("save local settings: %w", err)
 	}
 	m.config = updated
 	return nil
+}
+
+// cleanManifestSources accepts HTTP(S) URLs and absolute file paths, dropping
+// blanks and duplicates.
+func cleanManifestSources(sources []string) ([]string, error) {
+	cleaned := make([]string, 0, len(sources))
+	seen := make(map[string]struct{}, len(sources))
+	for _, source := range sources {
+		source = strings.TrimSpace(source)
+		if source == "" {
+			continue
+		}
+		if !catalog.IsManifestURL(source) {
+			source = filepath.Clean(source)
+			if !filepath.IsAbs(source) {
+				return nil, fmt.Errorf("custom manifest %q must be an absolute file path or an http(s) URL", source)
+			}
+		}
+		if _, exists := seen[source]; exists {
+			continue
+		}
+		seen[source] = struct{}{}
+		cleaned = append(cleaned, source)
+	}
+	return cleaned, nil
 }
 
 type uploadStateInvalidator interface {
