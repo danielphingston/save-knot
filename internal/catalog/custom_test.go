@@ -102,3 +102,21 @@ func TestLoadCustomManifestsSkipsBrokenSources(t *testing.T) {
 		t.Fatalf("error = %v, want both failures reported", err)
 	}
 }
+
+func TestParseMergesRepeatedGames(t *testing.T) {
+	t.Parallel()
+	manifest, err := Parse([]byte(`Repeated Game:
+  files:
+    "<winAppData>/Repeated": {}
+Repeated Game:
+  files:
+    "<winDocuments>/Repeated": {}
+`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	definition, ok := manifest.Resolve("Repeated Game")
+	if !ok || len(definition.Files) != 2 {
+		t.Fatalf("definition = %#v, want both repeated entries merged", definition)
+	}
+}
