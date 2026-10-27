@@ -34,11 +34,11 @@ func TestLocalScanSkipsConfigOnlyRulesAndFindsUbisoftSaves(t *testing.T) {
 	}
 	definition, _ := manifest.Resolve("Breakpoint")
 	replacements := userPathReplacements(home)
-	result, ok := scanLocalCandidate(localCandidate{name: "Breakpoint", definition: definition}, replacements, []string{ubisoft}, time.Now())
+	result, ok := scanLocalCandidate(localCandidate{name: "Breakpoint", definition: definition}, localScan{replacements: replacements, ubisoftRoots: []string{ubisoft}, now: time.Now()})
 	if !ok || len(result.Paths) != 1 || result.Paths[0].Resolved != saves {
 		t.Fatalf("paths = %#v, want only Ubisoft save directory %q", result.Paths, saves)
 	}
-	if _, ok := scanLocalCandidate(localCandidate{name: "Breakpoint", definition: definition}, replacements, nil, time.Now()); ok {
+	if _, ok := scanLocalCandidate(localCandidate{name: "Breakpoint", definition: definition}, localScan{replacements: replacements, now: time.Now()}); ok {
 		t.Fatal("config-only match was registered as a save location")
 	}
 }
@@ -51,5 +51,24 @@ func TestHoldsSaves(t *testing.T) {
 		if got := holdsSaves(catalog.FileRule{Tags: test.tags}); got != test.want {
 			t.Errorf("holdsSaves(%v) = %v, want %v", test.tags, got, test.want)
 		}
+	}
+}
+
+func TestLocalScanAcceptsAbsoluteManifestPaths(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	saves := filepath.Join(t.TempDir(), "Games", "Example", "SaveData")
+	if err := os.MkdirAll(saves, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	pattern := filepath.ToSlash(filepath.Join(filepath.Dir(filepath.Dir(saves)), "**", "SaveData"))
+	manifest, err := catalog.Parse([]byte("Example:\n  files:\n    \"" + pattern + "\": {}\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	definition, _ := manifest.Resolve("Example")
+	result, ok := scanLocalCandidate(localCandidate{name: "Example", definition: definition}, localScan{replacements: userPathReplacements(home), now: time.Now()})
+	if !ok || len(result.Paths) != 1 || result.Paths[0].Resolved != saves {
+		t.Fatalf("paths = %#v, want %q", result.Paths, saves)
 	}
 }
